@@ -1,0 +1,1175 @@
+package com.local.assistant.memory.prompt
+
+import android.os.SystemClock
+import android.util.Log
+import com.local.assistant.data.db.MessageEntity
+import com.local.assistant.data.db.Role
+import com.local.assistant.data.prefs.SettingsStore
+import com.local.assistant.data.repo.ChatRepository
+import com.local.assistant.llm.BackendCapabilities
+import com.local.assistant.llm.ChatSession
+import com.local.assistant.llm.ChatSpec
+import com.local.assistant.llm.LlmBackend
+import com.local.assistant.llm.ContextWindow
+import com.local.assistant.llm.LlmService
+import com.local.assistant.llm.Sampling
+import com.local.assistant.llm.ToolReplay
+import com.local.assistant.memory.tools.ToolCatalog
+import com.local.assistant.memory.tools.ToolSteps
+import com.local.assistant.memory.db.MemoryRepository
+import com.local.assistant.memory.retrieval.QueryText
+import com.local.assistant.memory.db.NoteItem
+import com.local.assistant.memory.db.NoteKind
+import com.local.assistant.memory.retrieval.Recall
+import com.local.assistant.memory.retrieval.RecalledNote
+import com.local.assistant.memory.retrieval.Retriever
+import com.local.assistant.memory.summary.Summarizer
+import com.local.assistant.memory.work.ModelAccess
+import com.local.assistant.memory.work.ModelScheduler
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import java.time.Instant
+import java.time.ZoneId
+import java.time.ZonedDateTime
+
+/**
+ * Keeps one live conversation — the one for the chat in use — and decides when to rebuild it.
+ *
+ * A conversation holds its system prefix and history in the KV cache, so each turn only has to
+ * prefill the new message. Rebuilding means prefilling everything again, so it happens only at
+ * natural boundaries:
+ *
+ * - the first turn in a chat, or after the process or engine restarted;
+ * - when the conversation no longer matches what is stored (a turn was interrupted);
+ * - when the prefix has changed in a way the model has not seen (see [finishTurn]), and then only
+ *   right after a reply, while the model is idle — never on the send path;
+ * - when the next turn would not fit, as a last resort before sending.
+ *
+ * Only one conversation is ever open. Measured on the target phone (EngineProbeTest), a second
+ * conversation on the same engine costs about 1.1 GB more at 16K, prefills five times slower
+ * than the first, and leaves around 2 GB resident after both are closed. So a rebuild closes
+ * the old conversation first, and once started it runs to completion rather than being thrown
+ * away half-prefilled.
+ */
+class ConversationManager(
+    private val backend: LlmBackend,
+    private val chats: ChatRepository,
+    private val memory: MemoryRepository,
+    private val settings: SettingsStore,
+    private val scheduler: ModelScheduler,
+    private val scope: CoroutineScope,
+    private val estimator: MeasuredTokenEstimator,
+    /**
+     * OpenAPI declarations for the tools the model may call; part of the stable prefix, so read
+     * at each rebuild. They change when web search is set up or removed ([webSearch]).
+     */
+    private val tools: () -> List<String> = { emptyList() },
+    /** Whether web_search is among [tools], which adds its line to the instructions. */
+    private val webSearch: () -> Boolean = { false },
+    /** Whether find_photos is among [tools], likewise. */
+    private val photoSearch: () -> Boolean = { false },
+    /** Whether health_data is among [tools], likewise. */
+    private val healthData: () -> Boolean = { false },
+    /** Whether read_file is among [tools], likewise. */
+    private val fileSearch: () -> Boolean = { false },
+    /** Whether check_inbox is among [tools], likewise. */
+    private val inbox: () -> Boolean = { false },
+    /** Per-turn recall of facts and archived exchanges; none when null. */
+    private val retriever: Retriever? = null,
+    /** Per-turn photos from the gallery a question may be about; none when null. */
+    private val photos: PhotoSource? = null,
+    /** Folds older turns into the chat's rolling summary; without it they are simply dropped. */
+    private val summarizer: Summarizer? = null,
+    private val zone: () -> ZoneId = ZoneId::systemDefault,
+    private val clock: () -> Long = System::currentTimeMillis,
+    /** The user's notes and lists, named in the prefix; none when not wired in. */
+    private val noteIndex: suspend () -> List<NoteTitle> = { emptyList() },
+    /**
+     * Whether the app is in front, so the chat on screen ([showing]) may be made ready: away, the
+     * phone kills the app every 15–60 minutes (16 times in 23 h on the OnePlus), and preparing a
+     * conversation then was almost always work thrown away.
+     */
+    private val inSight: () -> Boolean = { false },
+) : ModelAccess {
+
+    /**
+     * A turn ready to send. [recalledImages] go with it when the user attached nothing themselves:
+     * a saved image the message is about, and photos from the gallery it may be about.
+     */
+    data class PreparedTurn(
+        val session: ChatSession,
+        val envelope: Envelope,
+        val budget: MemoryBudget,
+        val recalledImages: List<String> = emptyList(),
+        /** Photos to show under the reply, best first (media ids), unless a photo search shows its own. */
+        val relatedPhotos: List<Long> = emptyList(),
+        /** The system prefix the conversation holds: what the reply may read numbers out of. */
+        val prefix: String = "",
+        /** Built for this turn (rebuilt from what is stored, or made ready for a new chat), not one carried on. */
+        val fresh: Boolean = false,
+        /** The voice message's recording, to send with the envelope (which says its words are the phone's hearing). */
+        val recording: String? = null,
+        /** The user's message before this one, if it came just before ([ToolContext.earlierText]). */
+        val earlierText: String = "",
+    )
+
+    private class Live(
+        val chatId: Long,
+        val session: ChatSession,
+        val budget: MemoryBudget,
+        /**
+         * The prefix the model knows about: the one it was built with, updated when a tool result
+         * in its own history tells it about a change. A stored prefix that differs from this is a
+         * change the model has not seen, and is what makes a rebuild worthwhile.
+         */
+        var acknowledgedPrefix: String,
+        /** The newest stored message this conversation contains. */
+        var lastMessageId: Long,
+        /**
+         * The oldest message of this chat the conversation holds verbatim; everything from here on
+         * is already in front of the model, so recall leaves it out.
+         */
+        val windowStartId: Long,
+        /**
+         * What the conversation held before any of its turns: instructions, tools, profile,
+         * agenda, summary, as the runtime counted them when it opened. Compaction counts the
+         * turns after it ([MemoryBudget.compactionTrigger]).
+         */
+        val prefaceTokens: Int = 0,
+        var lastNowShown: ZonedDateTime? = null,
+        /** The runtime's count just before the turn in flight, to measure what the turn cost. */
+        var tokensBeforeTurn: Int? = null,
+        /** Stored turns this conversation left out that no summary covers yet. */
+        val unsummarizedDropped: Int = 0,
+        /** Built for the lock screen: none of the user's memory in it. */
+        val locked: Boolean = false,
+        /**
+         * Saved images already attached to a turn of this conversation. Stored history does not
+         * carry them, so a rebuild starts empty; until then, attaching one again only muddles the
+         * model's reading of it (a second copy garbled long numbers on the phone).
+         */
+        val attachedNotes: MutableSet<Long> = mutableSetOf(),
+        /** Gallery photos already attached to a turn of this conversation, likewise. */
+        val attachedPhotos: MutableSet<Long> = mutableSetOf(),
+        /** Notes shown to a turn of this conversation, by id, and the version shown (its updatedAt). */
+        val shownNotes: MutableMap<Long, Long> = mutableMapOf(),
+        /** Exchanges the app answered itself since this conversation's last turn: told with the next message ([answeredWithoutModel]). */
+        val doneByApp: MutableList<String> = mutableListOf(),
+    )
+
+    /** Plain turns' text and real cost, gathered until there is enough to learn from. */
+    private var turnSample = TurnSample()
+
+    private data class TurnSample(val counts: ScriptCounts = ScriptCounts.ZERO, val messages: Int = 0, val tokens: Int = 0)
+
+    private val mutex = Mutex()
+    private var live: Live? = null
+
+    /**
+     * Chats whose last turn was asked on the lock screen: their prefix has none of the user's
+     * memory ([prefixInputs]), and every rebuild of them, maintenance included, keeps it that way.
+     */
+    private val lockedChats = mutableSetOf<Long>()
+
+    /** The sampler seed conversations are built with; changes only to retry an unreadable answer. */
+    private var seed = 0
+    private var maintenance: Job? = null
+
+    /** A pending or running [prepareFresh]. */
+    private var freshJob: Job? = null
+
+    /** Turns started so far, so a [prepareFresh] can tell that a message went ahead of it. */
+    @Volatile
+    private var turnsStarted = 0L
+
+    /**
+     * A turn is between [prepareTurn] and [finishTurn]: its reply may not be stored yet, so its
+     * chat's conversation must not be rebuilt from what is stored.
+     */
+    @Volatile
+    private var turnOpen = false
+
+    /** Why the last live conversation was closed, for [TurnTimings]: "start" until one was. */
+    @Volatile
+    private var closedBy = "start"
+
+    /** What the screen in front shows ([showing]): a chat's id, [FRESH] for a new chat, or null. */
+    @Volatile
+    private var onScreen: Long? = null
+
+    /** A pending or running [warm]. */
+    private var warmJob: Job? = null
+
+    /** When typing last checked the conversation on screen was ready ([typing]). */
+    @Volatile
+    private var typingCheckedAt = 0L
+
+    private val _droppedFromContext = MutableStateFlow(0)
+
+    /** How many stored messages of the current chat did not fit its conversation. */
+    val droppedFromContext: StateFlow<Int> = _droppedFromContext.asStateFlow()
+
+    /** When compaction last failed per chat, so a model that will not summarise is not asked every turn. */
+    private val compactionFailedAt = mutableMapOf<Long, Long>()
+
+    private val _tidying = MutableStateFlow(false)
+
+    /** A send is waiting while the chat's older turns are summarised to make room. */
+    val tidying: StateFlow<Boolean> = _tidying.asStateFlow()
+
+    private val _contextUsage = MutableStateFlow<LlmService.ContextUsage?>(null)
+
+    /** Real context consumption of the current chat's conversation, as the runtime counts it. */
+    val contextUsage: StateFlow<LlmService.ContextUsage?> = _contextUsage.asStateFlow()
+
+    /**
+     * Readies the conversation for [chatId] and builds this turn's envelope. [userMessageId] is
+     * the user's message, already stored; everything before it is history.
+     */
+    /** [step]: told what is being done, for the user to see (a rebuild, recall). */
+    suspend fun prepareTurn(
+        chatId: Long,
+        userMessageId: Long,
+        userText: String,
+        locked: Boolean = false,
+        /** The screenshot of the screen the assistant was opened over goes with this message. */
+        screen: Boolean = false,
+        step: suspend (String) -> Unit = {},
+    ): PreparedTurn {
+        val timing = TurnTimings.current
+        val asked = SystemClock.elapsedRealtime()
+        return mutex.withLock { prepareLocked(chatId, userMessageId, userText, locked, screen, step, timing, asked) }
+    }
+
+    private suspend fun prepareLocked(
+        chatId: Long,
+        userMessageId: Long,
+        userText: String,
+        locked: Boolean,
+        screen: Boolean,
+        step: suspend (String) -> Unit,
+        timing: TurnTimings.Turn?,
+        asked: Long,
+    ): PreparedTurn {
+        // Waiting here means a preparation or background job was still using the model.
+        timing?.let { it.waitedMs = (it.waitedMs ?: 0L) + (SystemClock.elapsedRealtime() - asked) }
+        // Changing mode changes the prefix, so the conversation below won't match and is rebuilt.
+        if (locked) lockedChats += chatId else lockedChats -= chatId
+        val userMessage = chats.message(userMessageId)
+        // A rebuild still waiting for a quiet spell is moot now; one already running has finished
+        // by the time we hold the lock.
+        maintenance?.cancel()
+        turnsStarted++
+        turnOpen = true
+        val loading = backend.capabilities == null
+        val loadStarted = SystemClock.elapsedRealtime()
+        if (loading) step(ToolSteps.LOADING_MODEL)
+        check(backend.ensureReady()) { "The model is not loaded." }
+        if (loading) timing?.engineLoadMs = SystemClock.elapsedRealtime() - loadStarted
+        val capabilities = checkNotNull(backend.capabilities) { "The model is not loaded." }
+        val budget = MemoryBudget.forWindow(capabilities.maxContextTokens)
+        val assembler = assemblerFor(budget, capabilities)
+        var history = historyFor(chatId, userMessageId)
+        val now = now()
+
+        val before = live
+        val carriedOn = before?.takeIf {
+            it.chatId == chatId &&
+                it.locked == locked &&
+                it.lastMessageId == (history.lastOrNull()?.id ?: 0L) &&
+                it.budget == budget &&
+                it.session.isAlive
+        }
+        val adopted = if (carriedOn == null) adoptFresh(chatId, history, budget, capabilities) else null
+        val reusable = carriedOn ?: adopted
+        // Why this turn has to open its conversation itself, for the timing record.
+        val opening = if (reusable == null) whyOpened(before, chatId, history, locked, budget) else null
+        timing?.conversation = opening ?: if (carriedOn != null) "carried_on" else "adopted"
+
+        // A command (an alarm, a reminder, a call) is acted on, not answered from memory: nothing
+        // is recalled for it, which only slowed it down. Over the lock screen, nothing either.
+        val command = QueryText.isCommand(userText)
+        // The user's own attachment goes alone: nothing recalled is attached beside it. Nor beside
+        // the screen they're asking about.
+        val userAttached = screen || userMessage?.let { ContextWindow.sentAttachment(it.attachmentKind, it.text) } != null
+        // Recall runs beside the prefill when the conversation has to be opened: what it will hold
+        // is known before it is (all of the history, unless some has to be shed to fit).
+        val windowStartId = reusable?.windowStartId ?: (history.firstOrNull()?.id ?: ((history.lastOrNull()?.id ?: 0L) + 1))
+        val attachedBefore = reusable?.attachedPhotos?.toSet().orEmpty()
+        // About the messages that came in, with check_inbox there to read them: chat screenshots
+        // only look like the question ("do you have any latest messages", 14 Nov 2026).
+        val aboutMessages = inbox() && QueryText.asksAboutMessages(userText)
+        val (opened, recall, photos) = coroutineScope {
+            val recalled = if (locked || command) {
+                null
+            } else {
+                async {
+                    val started = SystemClock.elapsedRealtime()
+                    // The photo search runs beside memory's: its own model, on the CPU. About the
+                    // screen: what's on it, not something in the gallery.
+                    val search = async { if (screen || aboutMessages) RecalledPhotos.NONE else photosFor(userText, attachedBefore) }
+                    (recall(chatId, userText, windowStartId, budget) to search.await())
+                        .also { timing?.recallMs = SystemClock.elapsedRealtime() - started }
+                }
+            }
+            val ready = reusable ?: run {
+                _contextUsage.value = null
+                // A new chat has nothing to read but the instructions.
+                step(if (history.isEmpty()) ToolSteps.READING_INSTRUCTIONS else ToolSteps.READING_CONVERSATION)
+                val started = SystemClock.elapsedRealtime()
+                rebuild(chatId, history, budget, capabilities, why = opening.orEmpty())
+                    .also { timing?.openMs = SystemClock.elapsedRealtime() - started }
+            }
+            if (recalled != null && !recalled.isCompleted && !QueryText.isTrivial(userText)) step(ToolSteps.CHECKING_MEMORY)
+            val (memory, gallery) = recalled?.await() ?: (Recall.NONE to RecalledPhotos.NONE)
+            Triple(ready, memory, gallery)
+        }
+        var current: Live = opened
+        // Asked to see photos, find_photos shows them: sending recalled ones too (about 3 s each to
+        // read) would only slow the reply. They're told to search instead (PromptAssembler.SEARCH_PHOTOS).
+        val asksForPhotos = !locked && photoSearch() && QueryText.asksForPhotos(userText)
+        // Shown whatever is attached; sent only beside nothing of the user's own.
+        val found = if (userAttached || asksForPhotos) emptyList() else photos.sent
+        val image = recall.image?.takeIf { !userAttached }
+        // A voice message goes as its recording too, its words as the phone heard them, when no
+        // picture goes with it (ContextWindow.heard); beside the screen or a photo, as its words.
+        val recording = userMessage?.takeIf {
+            !screen && found.isEmpty() && image == null && ContextWindow.heard(it.attachmentKind, it.text, it.attachmentDurationMs)
+        }?.attachmentPath
+        // Two pictures at most: a saved image the user asked to keep comes first.
+        val photoLines = found.take(MAX_RECALLED_IMAGES - if (image != null && image.noteId !in current.attachedNotes) 1 else 0)
+        fun line(attach: Boolean) = image?.let { SavedImageLine(it.title, it.details, it.at, attached = attach) }
+        val noteLines = recall.notes.map { noteLine(it, shownAbove = current.shownNotes[it.note.id] == it.note.updatedAt) }
+        var inputs = EnvelopeInputs(
+            now = now,
+            showNow = assembler.shouldShowNow(current.lastNowShown, now),
+            facts = recall.facts,
+            snippets = recall.snippets,
+            notes = noteLines,
+            // Once in the conversation, the image is not attached again: a second copy garbled
+            // long numbers on the phone. The line still points the model back at it.
+            savedImage = line(attach = image != null && image.noteId !in current.attachedNotes),
+            photos = photoLines,
+            attachmentTokens = if (recording != null) {
+                ContextWindow.audioTokens(userMessage?.attachmentDurationMs)
+            } else {
+                userMessage?.let { ContextWindow.attachmentTokens(it, capabilities.visionTokensPerImage) } ?: 0
+            },
+            userText = userText,
+            asksForPhotos = asksForPhotos,
+            screen = screen,
+            heard = recording != null,
+            doneByApp = current.doneByApp.toList(),
+        )
+        val liveTokens = current.session.tokenCount() ?: 0
+        var envelope = withContext(Dispatchers.Default) { assembler.fitEnvelope(liveTokens, inputs) }
+        if (envelope == null) {
+            // Too full to take even this turn: the idle compaction after replies did not keep up.
+            // Summarise the older turns now, visibly, rather than drop them; if that fails, the
+            // rebuild sheds them instead.
+            Log.i(TAG, "Conversation at $liveTokens tokens cannot take the next turn; compacting first")
+            timing?.conversation = "${timing?.conversation}+compacted"
+            _tidying.value = true
+            val compacting = SystemClock.elapsedRealtime()
+            try {
+                if (compact(chatId, budget, capabilities, beforeId = userMessageId)) history = historyFor(chatId, userMessageId)
+            } finally {
+                _tidying.value = false
+                timing?.compactMs = SystemClock.elapsedRealtime() - compacting
+            }
+            // The new conversation holds no saved image, so it goes with this message after all. A
+            // photo it held has no file now; it goes, and those found for this message stay.
+            inputs = inputs.copy(savedImage = line(attach = true), photos = photoLines.filter { it.attached }, notes = noteLines.map { it.copy(shownAbove = false) })
+            val reopening = SystemClock.elapsedRealtime()
+            current = rebuild(chatId, history, budget, capabilities, next = inputs, why = "chat:too_full")
+            timing?.let { it.openMs = (it.openMs ?: 0L) + (SystemClock.elapsedRealtime() - reopening) }
+            envelope = assembler.buildEnvelope(inputs.copy(showNow = true))
+        }
+        if (envelope.showedNow) current.lastNowShown = now
+        current.doneByApp.clear()
+        envelope.notes.forEach { current.shownNotes[it.id] = it.updatedAt }
+        if (envelope.notes.isNotEmpty()) Log.i(TAG, "Notes for this message: ${envelope.notes.map { "${it.id}${if (it.shownAbove) " (above)" else ""}" }}")
+        val attached = image?.takeIf { envelope.savedImage?.attached == true }
+        if (attached != null) current.attachedNotes += attached.noteId
+        image?.let {
+            Log.i(TAG, when {
+                attached != null -> "Attaching saved image ${it.noteId}"
+                envelope.savedImage != null -> "Saved image ${it.noteId} already in the conversation"
+                else -> "Saved image ${it.noteId} shed to fit"
+            })
+        }
+        val photosSent = envelope.photos.filter { it.attached }
+        current.attachedPhotos += photosSent.map { it.mediaId }
+        if (found.isNotEmpty()) {
+            Log.i(TAG, "Photos for this message: ${envelope.photos.size} of ${found.size} kept, ${photosSent.size} attached")
+        }
+        current.tokensBeforeTurn = current.session.tokenCount()
+        return PreparedTurn(
+            current.session,
+            envelope,
+            budget,
+            recalledImages = listOfNotNull(attached?.path) + photosSent.map { it.path },
+            relatedPhotos = if (screen) emptyList() else photos.related,
+            prefix = current.acknowledgedPrefix,
+            fresh = carriedOn == null || current !== carriedOn,
+            recording = recording,
+            earlierText = history.lastOrNull { it.role == Role.USER }
+                ?.takeIf { earlier -> userMessage == null || userMessage.createdAt - earlier.createdAt <= EARLIER_MS }
+                ?.text.orEmpty(),
+        )
+    }
+
+    /** Recall is best-effort: a failure costs this turn its memory lines, never the turn. */
+    /** The gallery's photos for [userText]; none when the search fails, which mustn't fail the turn. */
+    private suspend fun photosFor(userText: String, attachedBefore: Set<Long>): RecalledPhotos {
+        val source = photos ?: return RecalledPhotos.NONE
+        return try {
+            source.photosFor(userText, MAX_RECALLED_IMAGES, attachedBefore)
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "Photo recall failed; sending without it", e)
+            RecalledPhotos.NONE
+        }
+    }
+
+    private suspend fun recall(chatId: Long, userText: String, windowStartId: Long, budget: MemoryBudget): Recall {
+        val retriever = retriever ?: return Recall.NONE
+        return try {
+            retriever.recall(chatId, userText, windowStartId, budget.maxEnvelopeFacts, budget.maxSnippets, maxNotes = budget.maxNotes)
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "Recall failed; sending without it", e)
+            Recall.NONE
+        }
+    }
+
+    /**
+     * Records how the turn ended. A turn that did not complete, or whose reply was not stored,
+     * leaves the conversation out of step with the database, so it is dropped and rebuilt from
+     * what was stored next time.
+     */
+    suspend fun finishTurn(chatId: Long, lastStoredMessageId: Long?, completed: Boolean) {
+        val inStep = mutex.withLock {
+            turnOpen = false
+            val current = live?.takeIf { it.chatId == chatId }
+            when {
+                current == null -> false
+                !completed || lastStoredMessageId == null -> {
+                    close(current, "turn_incomplete")
+                    false
+                }
+                else -> {
+                    current.lastMessageId = lastStoredMessageId
+                    publishUsage(current)
+                    true
+                }
+            }
+        }
+        // Closed during the turn (a reply finished without the runtime, a stopped one) or after:
+        // made again for the next message now, not when it is sent.
+        if (inStep) scheduleMaintenance() else restoreSoon(chatId)
+    }
+
+    /**
+     * The model has just seen a change to what the prefix renders — typically a tool result in
+     * its own history — so a rebuild for that change alone would buy nothing.
+     */
+    suspend fun acknowledgePrefixChange(chatId: Long) = mutex.withLock {
+        val current = live?.takeIf { it.chatId == chatId } ?: return@withLock
+        val capabilities = backend.capabilities ?: return@withLock
+        current.acknowledgedPrefix = assemblerFor(current.budget, capabilities)
+            .buildPrefix(prefixInputs(chatId, current.budget)).text
+    }
+
+    /**
+     * Something changed what the prefix would say, outside the conversation — an undo, an edit,
+     * a reminder done from its notification. Rebuild once the chat has gone quiet.
+     */
+    fun prefixMayHaveChanged() = scheduleMaintenance()
+
+    /** The user switched chats: the meter and notice should stop describing the old one. */
+    fun onChatSelected(chatId: Long?) {
+        if (live?.chatId != chatId) {
+            _contextUsage.value = null
+            _droppedFromContext.value = 0
+        }
+    }
+
+    /**
+     * Learns from a finished plain turn — no tools, no attachments — what text really costs: the
+     * runtime's count went up by exactly the envelope and the reply. Turns are pooled until there
+     * is enough text to say something (see [MeasuredTokenEstimator.MIN_LATIN_CHARS]).
+     */
+    suspend fun learnFromTurn(chatId: Long, envelope: String, reply: String) = mutex.withLock {
+        val current = live?.takeIf { it.chatId == chatId } ?: return@withLock
+        val before = current.tokensBeforeTurn ?: return@withLock
+        val after = current.session.tokenCount() ?: return@withLock
+        if (after <= before) return@withLock
+        val counts = HeuristicTokenEstimator.countScripts(envelope) + HeuristicTokenEstimator.countScripts(reply)
+        turnSample = TurnSample(turnSample.counts + counts, turnSample.messages + 2, turnSample.tokens + (after - before))
+        if (turnSample.counts.latin >= MeasuredTokenEstimator.MIN_LATIN_CHARS) {
+            estimator.observe(turnSample.counts, turnSample.messages, turnSample.tokens)
+            Log.i(TAG, "Learned from turns: ${turnSample.tokens} tokens for ${turnSample.counts.total} chars; Latin rate now ${"%.2f".format(estimator.latinCharsPerToken)}")
+            turnSample = TurnSample()
+        }
+    }
+
+    /**
+     * The runtime refused a turn as too long for the window. The estimate that planned the
+     * conversation was too hopeful: forget what was measured, and drop the conversation so the
+     * next attempt is planned again, conservatively.
+     */
+    suspend fun recoverFromOverflow(chatId: Long) = mutex.withLock {
+        Log.w(TAG, "Runtime rejected a turn as too long at ${estimator.latinCharsPerToken} chars/token")
+        estimator.onOverflow()
+        live?.takeIf { it.chatId == chatId }?.let { close(it, "overflow") }
+    }
+
+    /**
+     * The model's answer was a tool call the runtime couldn't read. The same conversation and seed
+     * would write it again, so the next one is built with a different seed.
+     */
+    suspend fun reseed(chatId: Long) = mutex.withLock {
+        seed++
+        Log.w(TAG, "Unreadable tool call; retrying with seed $seed")
+        live?.takeIf { it.chatId == chatId }?.let { close(it, "reseeded") }
+    }
+
+    /**
+     * The reply came out as token soup ([com.local.assistant.memory.tools.GarbledText]). On 14 Nov
+     * 2026 an engine that did it once did it in every chat after, until the app was restarted, so
+     * the engine goes as well: the next turn loads it again and rebuilds the chat from what is
+     * stored.
+     */
+    suspend fun recoverFromGarble(chatId: Long) = mutex.withLock {
+        Log.w(TAG, "Garbled reply in chat $chatId; loading the model again")
+        live?.let { close(it, "garbled") }
+        backend.release()
+    }
+
+    /**
+     * Opens a conversation for a chat not begun yet and prefills it, so that a new chat's first
+     * reply only has to read the message. The prefix — instructions, tool declarations, profile,
+     * agenda: ~3,560 tokens — takes 6–10 s to prefill on the phone, while the reply after it
+     * starts in under a second (AssistLatencyEvalTest).
+     *
+     * Called as the assistant overlay opens, since its first message always starts a new chat,
+     * so the prefill runs while the user is still talking, and after a new model is set up. The
+     * app's own blank chat is made ready by [showing] instead. It takes the place of the live
+     * conversation — there is only ever one — so a chat left open in the app is rebuilt when the
+     * user goes back to it. Loads the engine if it isn't loaded. The job is returned for evals
+     * to wait on.
+     */
+    fun prepareFresh(): Job {
+        freshJob?.cancel()
+        val askedAfter = turnsStarted
+        return scope.launch {
+            if (!backend.ensureReady()) return@launch
+            scheduler.runBackground(ModelScheduler.Priority.WARM_UP, yieldsToTyping = false) {
+                mutex.withLock {
+                    // A message went first — while the model loaded, say — and has its own
+                    // conversation now. Replacing it would only make the next message wait
+                    // (measured: a follow-up took 4.6 s instead of 0.8 s).
+                    if (turnsStarted != askedAfter || turnOpen) return@withLock
+                    val capabilities = backend.capabilities ?: return@withLock
+                    openFresh(MemoryBudget.forWindow(capabilities.maxContextTokens), capabilities, "asked")
+                }
+            }
+        }.also { freshJob = it }
+    }
+
+    /**
+     * The screen in front shows [chatId] (null: a new chat, not begun yet), and the model is
+     * loaded when [engineReady]. A new chat's conversation is made ready at once: four questions
+     * in five start one, and its first message then only has to read itself (0.6 s, not 6.6 s,
+     * on the phone). An existing chat's is made ready only once the user starts typing in it
+     * ([typing]): just looking at an old chat costs nothing.
+     */
+    fun showing(chatId: Long?, engineReady: Boolean) {
+        val target = chatId ?: FRESH
+        if (onScreen != target) typingCheckedAt = 0L
+        onScreen = target
+        if (target == FRESH && engineReady) warm(FRESH, why = "screen")
+    }
+
+    /** The app came to the front: a new chat on screen is made ready again if it has to be. */
+    fun cameIntoSight() {
+        if (onScreen == FRESH) warm(FRESH, why = "foreground")
+    }
+
+    /**
+     * The user is typing on the screen in front: what it shows is about to be asked, so its
+     * conversation is made ready now if it isn't — while they type, rather than after they send.
+     * Checked every few seconds at most. [draft], what they've typed so far, is embedded for
+     * recall once they pause ([Retriever.prepareQuery]).
+     */
+    fun typing(draft: String = "") {
+        draftRecall(draft)
+        val target = onScreen ?: return
+        val now = clock()
+        if (now - typingCheckedAt < TYPING_RECHECK_MS || warmJob?.isActive == true) return
+        typingCheckedAt = now
+        warm(target, why = "typing")
+    }
+
+    private var draftJob: Job? = null
+
+    private fun draftRecall(draft: String) {
+        draftJob?.cancel()
+        val retriever = retriever ?: return
+        if (draft.isBlank()) return
+        draftJob = scope.launch {
+            delay(DRAFT_PAUSE_MS)
+            try {
+                retriever.prepareQuery(draft)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "Couldn't embed the message being typed", e)
+            }
+        }
+    }
+
+    /**
+     * After a conversation was closed by work that needed the model, or left out of step by a
+     * turn: if its chat is the one on screen, it is made again in a moment, for the next message.
+     * A new chat on screen is made ready again too, whatever was closed.
+     */
+    private fun restoreSoon(closedChat: Long) {
+        val target = onScreen ?: return
+        if (target == closedChat || target == FRESH) warm(target, RESTORE_DELAY_MS, why = "restore")
+    }
+
+    /**
+     * Makes [target]'s conversation the live one, unless it already is: [FRESH] for the next new
+     * chat, or a chat's id. For the screen in front only, so it gives way to nothing but a turn:
+     * typing is what it is for. Never loads the engine itself; the screen asks again once it has.
+     */
+    private fun warm(target: Long, delayMs: Long = 0, why: String) {
+        warmJob?.cancel()
+        val askedAfter = turnsStarted
+        warmJob = scope.launch {
+            if (delayMs > 0) delay(delayMs)
+            if (!inSight() || onScreen != target || backend.capabilities == null) return@launch
+            scheduler.runBackground(ModelScheduler.Priority.WARM_UP, yieldsToTyping = false) {
+                mutex.withLock {
+                    // A message went first and has its conversation; or the screen moved on.
+                    if (turnsStarted != askedAfter || turnOpen || onScreen != target) return@withLock
+                    val capabilities = backend.capabilities ?: return@withLock
+                    val budget = MemoryBudget.forWindow(capabilities.maxContextTokens)
+                    if (target == FRESH) openFresh(budget, capabilities, why) else openChat(target, budget, capabilities, why)
+                }
+            }
+        }
+    }
+
+    /**
+     * Opens the conversation for the next new chat, unless the live one is that already, with the
+     * prefix this chat would be built with. Must hold [mutex].
+     */
+    private suspend fun openFresh(budget: MemoryBudget, capabilities: BackendCapabilities, why: String) {
+        val current = live
+        val alive = current?.session?.isAlive == true
+        if (current != null && current.chatId == FRESH && current.budget == budget && alive &&
+            prefixText(FRESH, budget, capabilities) == current.acknowledgedPrefix
+        ) {
+            return
+        }
+        val was = when {
+            current == null -> "closed:$closedBy"
+            !alive -> "engine_reloaded"
+            current.chatId == FRESH -> "prefix_changed"
+            else -> "other_chat"
+        }
+        // Like a rebuild after a reply: once the prefill starts it finishes.
+        withContext(NonCancellable) { rebuild(FRESH, emptyList(), budget, capabilities, why = "new_chat:$why:$was") }
+        Log.i(TAG, "A conversation is ready for the next new chat")
+    }
+
+    /**
+     * Opens [chatId]'s conversation from what is stored, unless the live one is it and in step.
+     * Must hold [mutex]; never while a turn is open, whose reply may not be stored yet.
+     */
+    private suspend fun openChat(chatId: Long, budget: MemoryBudget, capabilities: BackendCapabilities, why: String) {
+        // In the app, the next message is asked with the phone unlocked.
+        lockedChats -= chatId
+        val history = historyFor(chatId, Long.MAX_VALUE)
+        if (history.isEmpty()) return
+        val current = live
+        if (current != null && current.chatId == chatId && !current.locked && current.lastMessageId == history.last().id &&
+            current.budget == budget && current.session.isAlive
+        ) {
+            return
+        }
+        val was = whyOpened(current, chatId, history, locked = false, budget)
+        withContext(NonCancellable) { rebuild(chatId, history, budget, capabilities, why = "$was:$why") }
+    }
+
+    /**
+     * Why [chatId]'s turn could not carry on in [before], the conversation that was live: for
+     * the timing record, as "what:why" ("new_chat:prefix_changed", "chat:closed:background_job").
+     */
+    private fun whyOpened(before: Live?, chatId: Long, history: List<MessageEntity>, locked: Boolean, budget: MemoryBudget): String {
+        val what = if (history.isEmpty()) "new_chat" else "chat"
+        val why = when {
+            before == null -> "closed:$closedBy"
+            !before.session.isAlive -> "engine_reloaded"
+            before.budget != budget -> "window_changed"
+            before.chatId == FRESH && history.isEmpty() -> "prefix_changed"
+            before.chatId == FRESH -> "new_chat_was_ready"
+            before.chatId != chatId -> "other_chat"
+            before.locked != locked -> "lock_mode"
+            else -> "out_of_step"
+        }
+        return "$what:$why"
+    }
+
+    /**
+     * A new chat's first turn takes over the conversation [prepareFresh] made — if it is still
+     * what this chat would be built with (a fact saved since, or a new day's agenda, would have
+     * changed the prefix). Must hold [mutex].
+     */
+    private suspend fun adoptFresh(chatId: Long, history: List<MessageEntity>, budget: MemoryBudget, capabilities: BackendCapabilities): Live? {
+        val fresh = live?.takeIf { it.chatId == FRESH && history.isEmpty() && it.budget == budget && it.session.isAlive } ?: return null
+        if (prefixText(chatId, budget, capabilities) != fresh.acknowledgedPrefix) return null
+        Log.i(TAG, "Chat $chatId starts in the conversation made ready for it")
+        TurnTimings.event("adopted")
+        return Live(
+            chatId = chatId,
+            session = fresh.session,
+            budget = budget,
+            acknowledgedPrefix = fresh.acknowledgedPrefix,
+            lastMessageId = 0L,
+            windowStartId = fresh.windowStartId,
+            prefaceTokens = fresh.prefaceTokens,
+        ).also { live = it }
+    }
+
+    private suspend fun prefixText(chatId: Long, budget: MemoryBudget, capabilities: BackendCapabilities): String {
+        val inputs = prefixInputs(chatId, budget)
+        return withContext(Dispatchers.Default) { assemblerFor(budget, capabilities).buildPrefix(inputs).text }
+    }
+
+    /**
+     * What a live voice call ([com.local.assistant.live.LiveContext]) is told of the user: the
+     * prefix [chatId] would have here (profile, last or this chat's summary, agenda, notes index),
+     * without this model's instructions, which the server writes its own of. At the largest
+     * budget, since the cloud model's window dwarfs the phone's; and without the model loaded,
+     * which a call doesn't need. [chatId] null: no chat of its own, so the last session's summary.
+     */
+    suspend fun liveContext(chatId: Long?): String {
+        val budget = MemoryBudget.SIXTEEN_K
+        val inputs = prefixInputs(chatId ?: FRESH, budget).copy(instructions = "")
+        return withContext(Dispatchers.Default) { PromptAssembler(budget, estimator, zone()).buildPrefix(inputs).text }
+    }
+
+    /**
+     * [chatId]'s message [userMessageId] was answered by the app itself, without the model
+     * ([com.local.assistant.memory.tools.InstantCommands]); [said] is the user's words, [result]
+     * the call's and [reply] what the app answered. The live conversation never saw the exchange:
+     * it is told of it with the next message, in a line, rather than rebuilt for it (a rebuild
+     * reads the whole conversation again, ~10 s on the phone). A new chat's first message takes the
+     * conversation made ready for it, as one the model answered would.
+     *
+     * Returns at once: the conversation may be busy being made ready, and the reply shouldn't wait.
+     */
+    fun answeredWithoutModel(chatId: Long, userMessageId: Long, locked: Boolean, said: String, call: String, result: String, reply: String) {
+        // "Without you" in this line made the model disown it: asked "is the flashlight on or off
+        // now?" after the app turned it off, it said it didn't know, 3 runs of 3 (14–15 Nov 2026).
+        val line = "[Earlier in this chat: the user said \"$said\", $call ran for them and returned $result, and they were told \"$reply\". " +
+            "That is how things now stand, unless they say otherwise.]"
+        // Undispatched: in the mutex's queue before finishTurn, which follows the stored reply.
+        scope.launch(start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) {
+            mutex.withLock {
+                val capabilities = backend.capabilities ?: return@withLock
+                val budget = MemoryBudget.forWindow(capabilities.maxContextTokens)
+                val current = live?.takeIf { it.chatId == chatId && it.locked == locked }
+                    ?: if (locked) null else adoptFresh(chatId, historyFor(chatId, userMessageId), budget, capabilities)
+                current?.doneByApp?.add(line)
+            }
+        }
+    }
+
+    /**
+     * Drops the conversation for [chatId], e.g. after its messages were deleted. [reason] is what
+     * the timing record says closed it.
+     */
+    suspend fun forget(chatId: Long, reason: String = "forgotten") = mutex.withLock {
+        live?.takeIf { it.chatId == chatId }?.let { close(it, reason) }
+    }
+
+    /**
+     * Once the chat has been quiet for a while after a reply: rebuild if the stored prefix has
+     * changed in a way the model has not seen.
+     *
+     * A rebuild prefills for several seconds and cannot be interrupted, so it waits for a quiet
+     * spell and gives way to typing or a new turn up until it starts. Once started it finishes,
+     * and the next turn uses the result.
+     */
+    private fun scheduleMaintenance() {
+        maintenance?.cancel()
+        maintenance = scope.launch {
+            delay(IDLE_BEFORE_REBUILD_MS)
+            scheduler.runBackground(ModelScheduler.Priority.COMPACTION) {
+                mutex.withLock {
+                    val current = live ?: return@withLock
+                    val capabilities = backend.capabilities ?: return@withLock
+                    if (needsCompaction(current)) {
+                        // The summary can be interrupted (the user started typing); the rebuild
+                        // after it cannot, since a half-prefilled conversation is thrown away. So
+                        // a message waiting by now goes first, and its turn rebuilds instead.
+                        if (compact(current.chatId, current.budget, capabilities)) {
+                            currentCoroutineContext().ensureActive()
+                            withContext(NonCancellable) {
+                                publishUsage(rebuild(current.chatId, historyFor(current.chatId, Long.MAX_VALUE), current.budget, capabilities, why = "compacted"))
+                            }
+                        }
+                        return@withLock
+                    }
+                    val prefix = assemblerFor(current.budget, capabilities)
+                        .buildPrefix(prefixInputs(current.chatId, current.budget))
+                    if (prefix.text == current.acknowledgedPrefix) return@withLock
+                    Log.i(TAG, "Prefix changed outside the conversation; rebuilding while idle")
+                    val history = historyFor(current.chatId, Long.MAX_VALUE)
+                    currentCoroutineContext().ensureActive()
+                    withContext(NonCancellable) {
+                        rebuild(current.chatId, history, current.budget, capabilities, why = "prefix_changed")
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * The conversation has passed the compaction trigger, or was built without turns that no
+     * summary covers (a long chat reopened after a restart).
+     */
+    private fun needsCompaction(current: Live): Boolean {
+        if (summarizer == null) return false
+        val failed = compactionFailedAt[current.chatId]
+        if (failed != null && clock() - failed < COMPACTION_RETRY_MS) return false
+        val tokens = current.session.tokenCount() ?: 0
+        // The chat's own turns past the trigger, or the whole close to the ceiling (a big preface).
+        return tokens - current.prefaceTokens > current.budget.compactionTrigger ||
+            tokens + current.budget.envelopeCap > current.budget.promptCeiling ||
+            current.unsummarizedDropped > 0
+    }
+
+    /**
+     * Folds the chat's older turns into its rolling summary, keeping the newest whole turns that
+     * let a rebuilt conversation land near [MemoryBudget.compactionTarget]. Closes the live
+     * conversation (the summary needs the model, and two conversations at once cost gigabytes);
+     * the caller rebuilds. Must hold [mutex]. False when there was nothing to fold or no summary
+     * came back — the stored summary is then left as it was.
+     */
+    private suspend fun compact(
+        chatId: Long,
+        budget: MemoryBudget,
+        capabilities: BackendCapabilities,
+        beforeId: Long = Long.MAX_VALUE,
+    ): Boolean {
+        val summarizer = summarizer ?: return false
+        val history = historyFor(chatId, beforeId)
+        val assembler = assemblerFor(budget, capabilities)
+        // The newest turns that fit in the target stay verbatim; if the preface leaves less room
+        // than that, the rebuild sheds what doesn't fit (PromptAssembler.plan).
+        val keep = assembler.selectHistory(history, budget.maxVerbatimTurns, budget.compactionTarget)
+        // Always keep the newest turn verbatim, even if it alone is over the target.
+        val foldCount = if (keep.messages.isEmpty()) history.indexOfLast { it.role == Role.USER } else keep.droppedCount
+        if (foldCount <= 0) return false
+        val fold = history.subList(0, foldCount)
+
+        live?.let { close(it, "compaction") }
+        _contextUsage.value = null
+        val started = clock()
+        val summary = try {
+            summarizer.rolling(chats.chat(chatId)?.rollingSummary, fold, budget.rollingSummaryCap)
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "Compaction failed for chat $chatId", e)
+            null
+        }
+        if (summary == null) {
+            compactionFailedAt[chatId] = clock()
+            return false
+        }
+        compactionFailedAt.remove(chatId)
+        val fitted = assembler.truncateToTokens(summary, budget.rollingSummaryCap)
+        chats.setRollingSummary(chatId, fitted, fold.last().id)
+        Log.i(TAG, "Compacted ${fold.size} messages of chat $chatId into ${estimator.estimate(fitted)} tokens in ${clock() - started} ms")
+        TurnTimings.event("compacted", clock() - started, "${fold.size} messages")
+        return true
+    }
+
+    /**
+     * Runs [block] with the model free of any chat conversation: a one-shot summary or
+     * extraction. The live conversation is closed first — two at once cost gigabytes and run
+     * several times slower — and the next turn rebuilds it. Call it from a scheduler slot.
+     */
+    override suspend fun <T> withModelFree(block: suspend () -> T): T {
+        var closed: Long? = null
+        try {
+            return mutex.withLock {
+                closed = live?.chatId
+                live?.let { close(it, "background_job") }
+                _contextUsage.value = null
+                block()
+            }
+        } finally {
+            closed?.let(::restoreSoon)
+        }
+    }
+
+    /**
+     * Opens a conversation for [chatId] and makes it the live one. Must hold [mutex].
+     *
+     * [next], when given, is the turn about to be sent, so the plan leaves room for it.
+     *
+     * The prefix and history are always prefilled at creation. The next reply would have to
+     * prefill them anyway, so it costs nothing extra, and it means the runtime's count straight
+     * after opening is exactly what was planned — which is how the estimator learns.
+     */
+    private suspend fun rebuild(
+        chatId: Long,
+        history: List<MessageEntity>,
+        budget: MemoryBudget,
+        capabilities: BackendCapabilities,
+        next: EnvelopeInputs = EnvelopeInputs(now = now(), showNow = true, userText = ""),
+        /** What it is for and why, for the timing record ([TurnTimings.event]). */
+        why: String = "",
+    ): Live {
+        live?.let { close(it, "replaced") }
+        val prefixInputs = prefixInputs(chatId, budget)
+
+        val declared = tools().takeIf { capabilities.tools }.orEmpty()
+        val toolTokens = toolTokens(capabilities)
+
+        var historyEstimate = 0
+        suspend fun open(): Pair<PromptPlan, ChatSession> {
+            val plan = withContext(Dispatchers.Default) { assemblerFor(budget, capabilities).plan(prefixInputs, history, next, toolTokens) }
+            if (plan.shed.isNotEmpty()) Log.i(TAG, "Shed ${plan.shed} to fit ${plan.totalTokens} tokens")
+            val held = withToolCalls(chatId, plan.history.messages)
+            // What the turns cost, to tell the preface from them once the runtime has counted both.
+            historyEstimate = held.sumOf { estimator.estimate(it.text) + TEMPLATE_TOKENS_PER_MESSAGE }
+            val spec = ChatSpec(
+                systemPrefix = plan.prefix.text,
+                history = held,
+                toolDeclarations = declared,
+                sampling = Sampling.CHAT.copy(seed = seed),
+                maxOutputTokens = minOf(settings.maxOutputTokens, budget.generationReserve),
+                prefillOnOpen = true,
+            )
+            val opening = SystemClock.elapsedRealtime()
+            return (plan to backend.openChat(spec)).also { (_, session) ->
+                val ms = SystemClock.elapsedRealtime() - opening
+                val counted = session.tokenCount()
+                Log.i(TAG, "Opened chat $chatId: ${plan.totalTokens} tokens planned, $counted counted, prefilled in $ms ms")
+                TurnTimings.event("opened", ms, "${if (chatId == FRESH) "new_chat" else "chat"} ${why.ifEmpty { "-" }} $counted tokens")
+            }
+        }
+
+        val (plan, session) = try {
+            open()
+        } catch (e: Exception) {
+            if (!backend.isContextOverflow(e)) throw e
+            // Planned with a rate that proved too hopeful: start again from the safe one.
+            Log.w(TAG, "Rebuild overflowed at ${estimator.latinCharsPerToken} chars/token; replanning", e)
+            estimator.onOverflow()
+            open()
+        }
+        learnFrom(plan, session, toolTokens)
+        _droppedFromContext.value = plan.history.droppedCount
+        val lastId = history.lastOrNull()?.id ?: 0L
+        val counted = session.tokenCount()
+        return Live(
+            chatId = chatId,
+            session = session,
+            budget = budget,
+            acknowledgedPrefix = plan.prefix.text,
+            lastMessageId = lastId,
+            // With nothing kept verbatim, the window starts at the next message.
+            windowStartId = plan.history.messages.firstOrNull()?.id ?: (lastId + 1),
+            // Exact with no history; with some, less what the turns are estimated to cost.
+            prefaceTokens = counted?.let { (it - historyEstimate).coerceAtLeast(0) } ?: (plan.prefix.tokens + toolTokens),
+            unsummarizedDropped = plan.history.droppedCount,
+            locked = chatId in lockedChats,
+        ).also { live = it }
+    }
+
+    /** Tells the estimator what the runtime counted for what was planned. */
+    private fun learnFrom(plan: PromptPlan, session: ChatSession, toolTokens: Int) {
+        // Declarations are rendered by the runtime's template, not as the text planned here, so a
+        // conversation carrying them says nothing clean about the Latin rate.
+        if (toolTokens > 0) return
+        val real = session.tokenCount() ?: return
+        // Images and audio cost tokens that have nothing to do with text.
+        if (plan.history.messages.any { it.attachmentKind != null }) return
+        val counts = plan.history.messages.fold(HeuristicTokenEstimator.countScripts(plan.prefix.text)) { sum, message ->
+            sum + HeuristicTokenEstimator.countScripts(message.text)
+        }
+        val planned = plan.prefix.tokens + plan.history.tokens
+        estimator.observe(counts, messages = plan.history.messages.size + 1, realTokens = real)
+        Log.i(TAG, "Rebuilt: planned $planned, runtime counted $real; Latin rate now ${"%.2f".format(estimator.latinCharsPerToken)}")
+    }
+
+    private suspend fun prefixInputs(chatId: Long, budget: MemoryBudget): PrefixInputs {
+        val chat = chats.chat(chatId)
+        if (chatId in lockedChats) {
+            // On the lock screen: the instructions and this chat's own summary, none of the user's
+            // profile, agenda or other chats.
+            return PrefixInputs(
+                instructions = instructions(),
+                coreFacts = emptyList(),
+                summary = chat?.rollingSummary?.let { SummaryBlock(SummaryBlock.Kind.EARLIER_IN_CHAT, it) },
+                agendaDate = now().toLocalDate(),
+                agenda = emptyList(),
+            )
+        }
+        val summary = chat?.rollingSummary
+            ?.let { SummaryBlock(SummaryBlock.Kind.EARLIER_IN_CHAT, it) }
+            ?: memory.latestSessionSummary()?.let { SummaryBlock(SummaryBlock.Kind.LAST_SESSION, it) }
+        return PrefixInputs(
+            instructions = instructions(),
+            coreFacts = memory.coreFacts(),
+            summary = summary,
+            agendaDate = now().toLocalDate(),
+            agenda = memory.agenda(clock(), budget.agendaItems),
+            notes = noteIndex(),
+        )
+    }
+
+    /**
+     * [recalled] as the envelope shows it: all its items (ticked ones marked) or lines, and those of
+     * the parts that matched, for when all of it won't fit.
+     */
+    private fun noteLine(recalled: RecalledNote, shownAbove: Boolean): NoteLine {
+        val note = recalled.note
+        fun item(it: NoteItem) = if (it.done) "${it.text} (ticked)" else it.text
+        val (whole, matched) = when (note.kind) {
+            NoteKind.LIST -> note.items.map(::item) to recalled.parts.flatMap { part ->
+                note.items.subList(part.fromIndex.coerceIn(0, note.items.size), part.toIndex.coerceIn(part.fromIndex.coerceIn(0, note.items.size), note.items.size)).map(::item)
+            }
+            NoteKind.NOTE -> {
+                fun lines(text: String) = text.lines().map { it.trim() }.filter { it.isNotEmpty() }
+                lines(note.body) to recalled.parts.flatMap { part ->
+                    val from = part.fromIndex.coerceIn(0, note.body.length)
+                    lines(note.body.substring(from, part.toIndex.coerceIn(from, note.body.length)))
+                }
+            }
+        }
+        return NoteLine(note.id, note.title, note.kind == NoteKind.LIST, whole, matched, note.updatedAt, shownAbove)
+    }
+
+    private fun instructions() = Instructions.render(
+        settings.systemPrompt,
+        withTools = tools().isNotEmpty() && backend.capabilities?.tools == true,
+        webSearch = webSearch(),
+        photoSearch = photoSearch(),
+        healthData = healthData(),
+        fileSearch = fileSearch(),
+        inbox = inbox(),
+    )
+
+    /** Stored turns before [beforeId], minus any that a rolling summary already covers. */
+    /**
+     * [turns] with the tool calls made between them, for a rebuilt conversation to hold what a
+     * live one does. Without them the model saw earlier photo requests answered in plain words
+     * ("I found 3 photos of you watching the sunset.") and answered the next the same way, with
+     * no search: "I found 0 photos of you attending a wedding" (1 Nov 2026; 0 of 6 replays
+     * searched). Not the photos the app shows by itself ([ToolCatalog.RELATED_PHOTOS]), which the
+     * model never asked for; only the newest [MAX_REPLAYED_TOOLS], their results cut short.
+     */
+    private suspend fun withToolCalls(chatId: Long, turns: List<MessageEntity>): List<MessageEntity> {
+        val first = turns.firstOrNull() ?: return turns
+        val calls = chats.toolRowsBetween(chatId, first.id, turns.last().id)
+            .filter { ToolReplay.call(it.text)?.first?.let { name -> name != ToolCatalog.RELATED_PHOTOS } == true }
+            .takeLast(MAX_REPLAYED_TOOLS)
+        if (calls.isEmpty()) return turns
+        return (turns + calls).sortedBy { it.id }
+    }
+
+    private suspend fun historyFor(chatId: Long, beforeId: Long): List<MessageEntity> {
+        val summarisedUpTo = chats.chat(chatId)?.rollingUptoMessageId ?: 0L
+        return chats.turnsBefore(chatId, beforeId).filter { it.id > summarisedUpTo }
+    }
+
+    private fun publishUsage(current: Live) {
+        val window = backend.capabilities?.maxContextTokens ?: current.budget.contextTokens
+        _contextUsage.value = current.session.tokenCount()?.let { LlmService.ContextUsage(it, window, current.chatId) }
+    }
+
+    /** [reason]: what closed it, for the timing record. */
+    private fun close(current: Live, reason: String) {
+        runCatching { current.session.close() }
+        if (live === current) {
+            live = null
+            closedBy = reason
+        }
+        TurnTimings.event("closed", detail = "${if (current.chatId == FRESH) "new_chat" else "chat"} $reason")
+    }
+
+    /**
+     * The runtime renders tool declarations in its own template format; the JSON is a fair,
+     * conservative stand-in for what they cost.
+     */
+    private fun toolTokens(capabilities: BackendCapabilities): Int {
+        val declared = tools().takeIf { capabilities.tools }.orEmpty()
+        return if (declared.isEmpty()) 0 else estimator.estimate(declared.joinToString("\n"))
+    }
+
+    private fun assemblerFor(budget: MemoryBudget, capabilities: BackendCapabilities) =
+        PromptAssembler(budget, estimator, zone(), capabilities.visionTokensPerImage)
+
+    private fun now(): ZonedDateTime = Instant.ofEpochMilli(clock()).atZone(zone())
+
+    private companion object {
+        const val TAG = "ConversationManager"
+
+        /** The chat id of a conversation made ready for a chat not begun yet ([prepareFresh]). */
+        const val FRESH = -1L
+
+        /** How long a chat must be quiet after a reply before an idle rebuild may start. */
+        const val IDLE_BEFORE_REBUILD_MS = 30_000L
+
+        /** After the conversation on screen was closed, before it is made again ([restoreSoon]). */
+        const val RESTORE_DELAY_MS = 1_500L
+
+        /** How often typing checks the conversation on screen is ready, at most ([typing]). */
+        const val TYPING_RECHECK_MS = 5_000L
+
+        /** A pause in typing this long, and what's typed is embedded for recall ([typing]). */
+        const val DRAFT_PAUSE_MS = 400L
+
+        /** What the chat template adds around each message, about. */
+        const val TEMPLATE_TOKENS_PER_MESSAGE = 4
+
+        /** How soon after the user's last message this one is still taken as answering its question. */
+        const val EARLIER_MS = 10 * 60_000L
+
+        /** After a failed compaction, how long before trying that chat again. */
+        const val COMPACTION_RETRY_MS = 10 * 60_000L
+
+        /** Pictures recalled for one message at most, a saved image and photos together (the user's limit). */
+        const val MAX_RECALLED_IMAGES = 2
+
+        /** Tool calls replayed into a rebuilt conversation at most: the newest. */
+        const val MAX_REPLAYED_TOOLS = 8
+    }
+}

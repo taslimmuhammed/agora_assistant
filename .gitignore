@@ -1,0 +1,22 @@
+*.iml
+.gradle/
+local.properties
+.idea/
+.DS_Store
+build/
+captures/
+.externalNativeBuild/
+.cxx/
+*.litertlm
+
+# Built APKs (./gradlew :app:demoApk -Pdemo writes apk/LocalAssistant.apk) and demo videos:
+# shared directly, not kept in git, since every copy would stay in the history.
+*.apk
+/apk/
+*.mp4
+*.mov
+
+# The Play upload key and its passwords (see keystore.properties.example).
+keystore.properties
+*.jks
+*.keystore

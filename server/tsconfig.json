@@ -1,0 +1,17 @@
+{
+  // Only for checking: Node runs the .ts files itself (type stripping, Node 22.18+), so the code
+  // keeps to what stripping allows: no enums, namespaces or parameter properties.
+  "compilerOptions": {
+    "target": "es2023",
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "erasableSyntaxOnly": true,
+    "noEmit": true,
+    "strict": true,
+    "skipLibCheck": true,
+    "types": ["node"]
+  },
+  "include": ["src", "test"]
+}

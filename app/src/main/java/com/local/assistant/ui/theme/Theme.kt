@@ -1,0 +1,96 @@
+package com.local.assistant.ui.theme
+
+import android.app.Activity
+import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Typography
+import androidx.compose.material3.lightColorScheme
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.SideEffect
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.sp
+import androidx.core.view.WindowCompat
+
+/**
+ * A light palette on glass ([Glass]): screens are see-through to the frosted backdrop, text is
+ * near-black, and fills and lines are tints of that black, so they read on glass over any wallpaper.
+ */
+object AppColors {
+    /** A screen's own background: none, the window's frosted glass shows through. */
+    val Background = Color.Transparent
+    val Surface = Color(0xFFFFFFFF)
+
+    /** A quiet fill on the glass: code, progress tracks, a photo still loading. */
+    val SurfaceMuted = Color(0x1418181B)
+    val Border = Color(0x1F18181B)
+
+    /**
+     * The edge of something to press: outlined buttons, text fields. [Border] is for dividers; on
+     * a button it was so faint the button looked switched off.
+     */
+    val Outline = Color(0xFFA1A1AA)
+    val TextPrimary = Color(0xFF18181B)
+
+    /** Darker than a plain white screen would need: it sits on glass, over whatever the wallpaper is. */
+    val TextSecondary = Color(0xFF52525B)
+    val Accent = Color(0xFF18181B)
+    val OnAccent = Color(0xFFFFFFFF)
+    val Danger = Color(0xFFDC2626)
+}
+
+private val LightColors = lightColorScheme(
+    primary = AppColors.Accent,
+    onPrimary = AppColors.OnAccent,
+    background = AppColors.Background,
+    onBackground = AppColors.TextPrimary,
+    surface = AppColors.Surface,
+    onSurface = AppColors.TextPrimary,
+    surfaceVariant = AppColors.SurfaceMuted,
+    onSurfaceVariant = AppColors.TextSecondary,
+    outline = AppColors.Outline,
+    outlineVariant = AppColors.Border,
+    error = AppColors.Danger,
+    // Dialogs, menus and sheets: near-white, not Material's default lavender greys.
+    surfaceContainerLowest = Color.White,
+    surfaceContainerLow = Color(0xFFFAFAFB),
+    surfaceContainer = Color(0xFFFAFAFB),
+    surfaceContainerHigh = Color(0xFFF7F7F9),
+    surfaceContainerHighest = Color(0xFFF1F1F4),
+    scrim = Color(0xFF18181B),
+)
+
+private val AppTypography = Typography(
+    bodyLarge = TextStyle(fontSize = 16.sp, lineHeight = 24.sp),
+    bodyMedium = TextStyle(fontSize = 14.sp, lineHeight = 20.sp),
+    // Footnotes under a reply: present if you look for them, ignorable if you do not.
+    bodySmall = TextStyle(fontSize = 12.sp, lineHeight = 16.sp),
+    titleMedium = TextStyle(fontSize = 16.sp, lineHeight = 22.sp, fontWeight = FontWeight.SemiBold),
+    labelLarge = TextStyle(fontSize = 14.sp, lineHeight = 18.sp, fontWeight = FontWeight.Medium),
+)
+
+/**
+ * The app is light-only by design. [darkTheme] is accepted so the status-bar icons stay legible
+ * if a dark theme is added later.
+ */
+@Composable
+fun LocalAssistantTheme(
+    darkTheme: Boolean = isSystemInDarkTheme(),
+    content: @Composable () -> Unit,
+) {
+    val view = LocalView.current
+    if (!view.isInEditMode) {
+        SideEffect {
+            val window = (view.context as Activity).window
+            WindowCompat.getInsetsController(window, view).isAppearanceLightStatusBars = true
+        }
+    }
+
+    MaterialTheme(
+        colorScheme = LightColors,
+        typography = AppTypography,
+        content = content,
+    )
+}

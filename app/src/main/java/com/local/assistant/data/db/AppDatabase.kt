@@ -1,0 +1,189 @@
+package com.local.assistant.data.db
+
+import android.content.Context
+import androidx.room.Database
+import androidx.room.Room
+import androidx.room.RoomDatabase
+import androidx.room.TypeConverters
+import androidx.room.migration.Migration
+import androidx.sqlite.SQLiteConnection
+import androidx.sqlite.execSQL
+import com.local.assistant.memory.db.AgendaDao
+import com.local.assistant.memory.db.AppStateDao
+import com.local.assistant.memory.db.AppStateEntity
+import com.local.assistant.memory.db.ChunkDao
+import com.local.assistant.memory.db.ChunkEntity
+import com.local.assistant.memory.db.ChunkFts
+import com.local.assistant.memory.db.EventEntity
+import com.local.assistant.memory.db.FactDao
+import com.local.assistant.memory.db.FactEntity
+import com.local.assistant.memory.db.FactFts
+import com.local.assistant.memory.db.ForgottenEntity
+import com.local.assistant.memory.db.MaintenanceDao
+import com.local.assistant.memory.db.NoteDao
+import com.local.assistant.memory.db.NoteEntity
+import com.local.assistant.memory.db.NoteFts
+import com.local.assistant.memory.db.SessionDao
+import com.local.assistant.memory.db.SessionEntity
+import com.local.assistant.memory.db.SubjectAliasEntity
+import com.local.assistant.memory.db.TaskEntity
+import com.local.assistant.memory.db.UserNoteChunkEntity
+import com.local.assistant.memory.db.UserNoteChunkFts
+import com.local.assistant.memory.db.UserNoteDao
+import com.local.assistant.memory.db.UserNoteEntity
+import com.local.assistant.memory.retrieval.SqliteVec
+import kotlinx.coroutines.Dispatchers
+
+/**
+ * One file for chats and memory, so that a message, its archive chunk and any fact learned from
+ * it commit or roll back together, and forgetting something is a single transaction.
+ */
+@Database(
+    entities = [
+        ChatEntity::class,
+        MessageEntity::class,
+        SessionEntity::class,
+        FactEntity::class,
+        FactFts::class,
+        SubjectAliasEntity::class,
+        ForgottenEntity::class,
+        TaskEntity::class,
+        EventEntity::class,
+        ChunkEntity::class,
+        ChunkFts::class,
+        AppStateEntity::class,
+        NoteEntity::class,
+        NoteFts::class,
+        UserNoteEntity::class,
+        UserNoteChunkEntity::class,
+        UserNoteChunkFts::class,
+    ],
+    version = 9,
+    exportSchema = true,
+)
+@TypeConverters(Converters::class)
+abstract class AppDatabase : RoomDatabase() {
+
+    abstract fun chatDao(): ChatDao
+
+    abstract fun factDao(): FactDao
+
+    abstract fun agendaDao(): AgendaDao
+
+    abstract fun sessionDao(): SessionDao
+
+    abstract fun appStateDao(): AppStateDao
+
+    abstract fun chunkDao(): ChunkDao
+
+    abstract fun maintenanceDao(): MaintenanceDao
+
+    abstract fun noteDao(): NoteDao
+
+    abstract fun userNoteDao(): UserNoteDao
+
+    /** The vector index is a derived table outside Room's schema, created where it can be. */
+    object VectorTableCallback : Callback() {
+        override fun onOpen(connection: SQLiteConnection) = SqliteVec.createTable(connection)
+    }
+
+    companion object {
+        const val FILE_NAME = "assistant.db"
+
+        /** Adds attachment columns. Existing chats keep their text and survive the upgrade. */
+        private val MIGRATION_1_2 = object : Migration(1, 2) {
+            override fun migrate(connection: SQLiteConnection) {
+                connection.execSQL("ALTER TABLE messages ADD COLUMN attachmentPath TEXT")
+                connection.execSQL("ALTER TABLE messages ADD COLUMN attachmentKind TEXT")
+                connection.execSQL("ALTER TABLE messages ADD COLUMN attachmentDurationMs INTEGER")
+            }
+        }
+
+        /** Adds per-reply speed stats. */
+        private val MIGRATION_2_3 = object : Migration(2, 3) {
+            override fun migrate(connection: SQLiteConnection) {
+                connection.execSQL("ALTER TABLE messages ADD COLUMN tokensPerSecond REAL")
+                connection.execSQL("ALTER TABLE messages ADD COLUMN timeToFirstTokenMs INTEGER")
+            }
+        }
+
+        /** Pause memory: messages written while it is on are kept but never learned from. */
+        private val MIGRATION_4_5 = object : Migration(4, 5) {
+            override fun migrate(connection: SQLiteConnection) {
+                connection.execSQL("ALTER TABLE messages ADD COLUMN offRecord INTEGER NOT NULL DEFAULT 0")
+            }
+        }
+
+        /**
+         * Notes: images the user asked to have remembered, with what was seen in them. The
+         * statements are copied from `schemas/…/6.json`, which Room validates the result against,
+         * keyword index and its triggers included.
+         */
+        private val MIGRATION_5_6 = object : Migration(5, 6) {
+            override fun migrate(connection: SQLiteConnection) {
+                listOf(
+                    "CREATE TABLE IF NOT EXISTS `notes` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `title` TEXT NOT NULL, `details` TEXT NOT NULL, `imagePath` TEXT, `sourceMessageId` INTEGER, `chatId` INTEGER, `embedding` BLOB, `modelId` TEXT, `createdAt` INTEGER NOT NULL, `updatedAt` INTEGER NOT NULL, FOREIGN KEY(`sourceMessageId`) REFERENCES `messages`(`id`) ON UPDATE NO ACTION ON DELETE SET NULL )",
+                    "CREATE INDEX IF NOT EXISTS `index_notes_sourceMessageId` ON `notes` (`sourceMessageId`)",
+                    "CREATE VIRTUAL TABLE IF NOT EXISTS `notes_fts` USING FTS4(`title` TEXT NOT NULL, `details` TEXT NOT NULL, tokenize=unicode61, content=`notes`)",
+                    "CREATE TRIGGER IF NOT EXISTS room_fts_content_sync_notes_fts_BEFORE_UPDATE BEFORE UPDATE ON `notes` BEGIN DELETE FROM `notes_fts` WHERE `docid`=OLD.`rowid`; END",
+                    "CREATE TRIGGER IF NOT EXISTS room_fts_content_sync_notes_fts_BEFORE_DELETE BEFORE DELETE ON `notes` BEGIN DELETE FROM `notes_fts` WHERE `docid`=OLD.`rowid`; END",
+                    "CREATE TRIGGER IF NOT EXISTS room_fts_content_sync_notes_fts_AFTER_UPDATE AFTER UPDATE ON `notes` BEGIN INSERT INTO `notes_fts`(`docid`, `title`, `details`) VALUES (NEW.`rowid`, NEW.`title`, NEW.`details`); END",
+                    "CREATE TRIGGER IF NOT EXISTS room_fts_content_sync_notes_fts_AFTER_INSERT AFTER INSERT ON `notes` BEGIN INSERT INTO `notes_fts`(`docid`, `title`, `details`) VALUES (NEW.`rowid`, NEW.`title`, NEW.`details`); END",
+                ).forEach(connection::execSQL)
+            }
+        }
+
+        /** The assistant overlay's chats: stored and learned from, but not listed. */
+        private val MIGRATION_6_7 = object : Migration(6, 7) {
+            override fun migrate(connection: SQLiteConnection) {
+                connection.execSQL("ALTER TABLE chats ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0")
+            }
+        }
+
+        /** Place reminders: "remind me to buy milk near DMart" rings on arriving, not at a time. */
+        private val MIGRATION_7_8 = object : Migration(7, 8) {
+            override fun migrate(connection: SQLiteConnection) {
+                connection.execSQL("ALTER TABLE tasks ADD COLUMN place TEXT")
+            }
+        }
+
+        /**
+         * The user's notes and lists, and their parts for recall. Copied from `schemas/…/9.json`,
+         * which Room validates the result against, keyword index and its triggers included.
+         */
+        private val MIGRATION_8_9 = object : Migration(8, 9) {
+            override fun migrate(connection: SQLiteConnection) {
+                listOf(
+                    "CREATE TABLE IF NOT EXISTS `user_notes` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `title` TEXT NOT NULL, `kind` TEXT NOT NULL, `body` TEXT NOT NULL, `items` TEXT NOT NULL, `pinned` INTEGER NOT NULL, `sourceMessageId` INTEGER, `createdAt` INTEGER NOT NULL, `updatedAt` INTEGER NOT NULL, FOREIGN KEY(`sourceMessageId`) REFERENCES `messages`(`id`) ON UPDATE NO ACTION ON DELETE SET NULL )",
+                    "CREATE INDEX IF NOT EXISTS `index_user_notes_sourceMessageId` ON `user_notes` (`sourceMessageId`)",
+                    "CREATE INDEX IF NOT EXISTS `index_user_notes_updatedAt` ON `user_notes` (`updatedAt`)",
+                    "CREATE TABLE IF NOT EXISTS `user_note_chunks` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `noteId` INTEGER NOT NULL, `ordinal` INTEGER NOT NULL, `text` TEXT NOT NULL, `fromIndex` INTEGER NOT NULL, `toIndex` INTEGER NOT NULL, `embedding` BLOB, `modelId` TEXT, FOREIGN KEY(`noteId`) REFERENCES `user_notes`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE )",
+                    "CREATE INDEX IF NOT EXISTS `index_user_note_chunks_noteId` ON `user_note_chunks` (`noteId`)",
+                    "CREATE INDEX IF NOT EXISTS `index_user_note_chunks_modelId` ON `user_note_chunks` (`modelId`)",
+                    "CREATE VIRTUAL TABLE IF NOT EXISTS `user_note_chunks_fts` USING FTS4(`text` TEXT NOT NULL, tokenize=unicode61, content=`user_note_chunks`)",
+                    "CREATE TRIGGER IF NOT EXISTS room_fts_content_sync_user_note_chunks_fts_BEFORE_UPDATE BEFORE UPDATE ON `user_note_chunks` BEGIN DELETE FROM `user_note_chunks_fts` WHERE `docid`=OLD.`rowid`; END",
+                    "CREATE TRIGGER IF NOT EXISTS room_fts_content_sync_user_note_chunks_fts_BEFORE_DELETE BEFORE DELETE ON `user_note_chunks` BEGIN DELETE FROM `user_note_chunks_fts` WHERE `docid`=OLD.`rowid`; END",
+                    "CREATE TRIGGER IF NOT EXISTS room_fts_content_sync_user_note_chunks_fts_AFTER_UPDATE AFTER UPDATE ON `user_note_chunks` BEGIN INSERT INTO `user_note_chunks_fts`(`docid`, `text`) VALUES (NEW.`rowid`, NEW.`text`); END",
+                    "CREATE TRIGGER IF NOT EXISTS room_fts_content_sync_user_note_chunks_fts_AFTER_INSERT AFTER INSERT ON `user_note_chunks` BEGIN INSERT INTO `user_note_chunks_fts`(`docid`, `text`) VALUES (NEW.`rowid`, NEW.`text`); END",
+                ).forEach(connection::execSQL)
+            }
+        }
+
+        val MIGRATIONS: Array<Migration> = arrayOf(MIGRATION_1_2, MIGRATION_2_3, Migration3To4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9)
+
+        /**
+         * [withVectors]: sqlite-vec loaded on this device (see [SqliteVec.probe]). Its table is
+         * then made on open; without it the archive's vectors are searched in Kotlin instead.
+         */
+        fun build(context: Context, withVectors: Boolean): AppDatabase =
+            Room.databaseBuilder(context, AppDatabase::class.java, FILE_NAME)
+                // Our own SQLite build rather than the platform's: same version on every device,
+                // and it can load extensions (sqlite-vec) where the framework one cannot.
+                .setDriver(SqliteVec.driver(withVectors))
+                .setQueryCoroutineContext(Dispatchers.IO)
+                .setJournalMode(JournalMode.WRITE_AHEAD_LOGGING)
+                .addMigrations(*MIGRATIONS)
+                .apply { if (withVectors) addCallback(VectorTableCallback) }
+                .build()
+    }
+}

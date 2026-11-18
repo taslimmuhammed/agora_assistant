@@ -1,0 +1,279 @@
+package com.local.assistant.memory.db
+
+import android.util.Log
+import androidx.room.immediateTransaction
+import androidx.room.useWriterConnection
+import com.local.assistant.data.db.AppDatabase
+import com.local.assistant.data.db.Role
+import com.local.assistant.memory.retrieval.ArchiveSource
+import com.local.assistant.memory.retrieval.Bm25
+import com.local.assistant.memory.retrieval.ChunkPolicy
+import com.local.assistant.memory.retrieval.KeywordHit
+import com.local.assistant.memory.retrieval.VectorHit
+import com.local.assistant.memory.retrieval.VectorIndex
+import com.local.assistant.privacy.LogText
+
+/**
+ * The archive: every exchange as a chunk, keyword-indexed by Room's FTS triggers and embedded
+ * later in the background (see `EmbeddingQueue`).
+ *
+ * `chunks.embedding` is the source of truth for vectors. The [index] is derived from it and kept
+ * in step here — in the same transaction as the chunk where the index lives in the database —
+ * and is cleared and refilled whenever the two might disagree.
+ */
+class ArchiveRepository(
+    private val database: AppDatabase,
+    private val index: VectorIndex,
+) : ArchiveSource {
+
+    private val chunks = database.chunkDao()
+    private val messages = database.chatDao()
+    private val state = database.appStateDao()
+
+    private suspend fun <T> transaction(block: suspend () -> T): T =
+        database.useWriterConnection { connection -> connection.immediateTransaction { block() } }
+
+    /**
+     * Archives the exchange [userMessageId] opened, with whatever reply is stored for it (possibly
+     * partial, possibly none). A chunk already made for it is brought up to date. Returns true
+     * when the chunk is one to embed.
+     */
+    suspend fun recordExchange(userMessageId: Long): Boolean = transaction {
+        val user = messages.message(userMessageId)?.takeIf { it.role == Role.USER && !it.offRecord } ?: return@transaction false
+        val reply = chunks.nextTurn(user.chatId, user.id)?.takeIf { it.role == Role.ASSISTANT }
+        val existing = chunks.forMessage(user.id)
+        // Forgotten on purpose: an edit to the exchange must not bring it back.
+        if (existing?.modelId == ChunkPolicy.FORGOTTEN) return@transaction false
+        if (ChunkPolicy.isUtility(user.text, toolsOf(user.chatId, user.id, reply?.id))) {
+            skip(existing, user.id, user.chatId, user.sessionId, user.createdAt)
+            return@transaction false
+        }
+        val text = ChunkPolicy.text(user.text, user.attachmentKind, reply?.text) ?: return@transaction false
+        val marker = if (ChunkPolicy.shouldEmbed(user.text)) null else ChunkPolicy.NOT_EMBEDDED
+        when {
+            existing == null -> chunks.insert(
+                ChunkEntity(
+                    messageId = user.id,
+                    chatId = user.chatId,
+                    sessionId = user.sessionId,
+                    text = text,
+                    modelId = marker,
+                    createdAt = user.createdAt,
+                ),
+            )
+            existing.text != text -> {
+                chunks.replaceText(existing.id, text, marker)
+                index.remove(listOf(existing.id))
+            }
+        }
+        marker == null
+    }
+
+    /**
+     * The tools the turn after [userId] called, by name. Not the photos shown for the message
+     * itself: every question has them, and they say nothing about what the turn was.
+     */
+    private suspend fun toolsOf(chatId: Long, userId: Long, replyId: Long?): List<String> =
+        chunks.toolRecordsBetween(chatId, userId, replyId ?: Long.MAX_VALUE)
+            .mapNotNull { TOOL_NAME.find(it)?.groupValues?.get(1) }
+            .filter { it != com.local.assistant.memory.tools.ToolCatalog.RELATED_PHOTOS }
+
+    /** An empty, never-embedded chunk: marks the exchange as seen, so the backfill leaves it be. */
+    private suspend fun skip(existing: ChunkEntity?, messageId: Long, chatId: Long, sessionId: Long?, createdAt: Long) {
+        if (existing == null) {
+            chunks.insert(ChunkEntity(messageId = messageId, chatId = chatId, sessionId = sessionId, text = "", modelId = ChunkPolicy.SKIPPED, createdAt = createdAt))
+        } else if (existing.modelId != ChunkPolicy.SKIPPED) {
+            chunks.replaceText(existing.id, "", ChunkPolicy.SKIPPED)
+            index.remove(listOf(existing.id))
+        }
+    }
+
+    /**
+     * Takes out of the archive the exchanges [ChunkPolicy.isUtility] now leaves out, archived
+     * before it did. Once per rule version; returns how many went.
+     */
+    suspend fun dropUtilityExchanges(): Int {
+        if (state.get(KEY_UTILITY_CLEANUP) == UTILITY_CLEANUP_VERSION) return 0
+        var dropped = 0
+        for (chunk in chunks.liveChunks()) {
+            val user = messages.message(chunk.messageId) ?: continue
+            val reply = chunks.nextTurn(user.chatId, user.id)?.takeIf { it.role == Role.ASSISTANT }
+            if (ChunkPolicy.isUtility(user.text, toolsOf(user.chatId, user.id, reply?.id))) {
+                transaction { skip(chunk, chunk.messageId, chunk.chatId, chunk.sessionId, chunk.createdAt) }
+                dropped++
+            }
+        }
+        state.put(AppStateEntity(KEY_UTILITY_CLEANUP, UTILITY_CLEANUP_VERSION))
+        return dropped
+    }
+
+    /**
+     * Keeps only the user's side of exchanges archived before [before] whose reply has a digit
+     * in it: replies the model wrote while its text decoder ran in fp16, when it garbled digits
+     * past token 2,048 ("Your Roll No. was 43610104" for 4361044). Recalled, the model now copies
+     * such a reply exactly, so a wrong number would outlive the fix. The user's words were never
+     * garbled, and the chat itself keeps everything. Returns how many changed.
+     */
+    suspend fun dropRepliesWithNumbers(before: Long): Int {
+        var changed = 0
+        for (chunk in chunks.liveChunks()) {
+            if (chunk.createdAt >= before) continue
+            val reply = chunk.text.substringAfter(REPLY, missingDelimiterValue = "")
+            if (reply.none(Char::isDigit)) continue
+            val marker = chunk.modelId?.takeIf { it == ChunkPolicy.NOT_EMBEDDED }
+            transaction {
+                chunks.replaceText(chunk.id, chunk.text.substringBefore(REPLY), marker)
+                index.remove(listOf(chunk.id))
+            }
+            changed++
+        }
+        return changed
+    }
+
+    /**
+     * Archives user messages from before this feature existed, or whose chunk a crash prevented.
+     * Only messages below [beforeId] are touched, so a turn in flight — whose reply is not stored
+     * yet — is left to [recordExchange]. Returns how many were archived.
+     */
+    suspend fun backfill(beforeId: Long): Int {
+        var after = 0L
+        var archived = 0
+        while (true) {
+            val batch = chunks.unchunkedUserMessages(after, beforeId, BACKFILL_BATCH)
+            if (batch.isEmpty()) return archived
+            for (message in batch) {
+                recordExchange(message.id)
+                archived++
+            }
+            after = batch.last().id
+        }
+    }
+
+    suspend fun lastMessageId(): Long = chunks.lastMessageId() ?: 0L
+
+    suspend fun backlog(limit: Int): List<ChunkEntity> = chunks.backlog(limit)
+
+    suspend fun backlogSize(): Int = chunks.backlogSize()
+
+    /**
+     * Stores [vector] for [chunk] as made by [modelId], unless the chunk's text changed since it
+     * was read (its new text is then still in the backlog). A null vector marks the chunk as one
+     * this model cannot embed, so the backlog does not retry it forever.
+     */
+    suspend fun saveEmbedding(chunk: ChunkEntity, vector: ByteArray?, modelId: String): Boolean = transaction {
+        val marker = if (vector == null) ChunkPolicy.FAILED_PREFIX + modelId else modelId
+        val updated = chunks.setEmbedding(chunk.id, chunk.text, vector, marker) == 1
+        if (updated && vector != null) index.put(chunk.id, vector)
+        updated
+    }
+
+    /**
+     * Brings the archive in line with the embedder now installed: chunks embedded by any other
+     * model go back to the backlog (vectors from different models are never compared), and the
+     * index is refilled if it does not hold exactly the stored vectors.
+     */
+    suspend fun adoptModel(modelId: String) {
+        if (state.get(KEY_MODEL) != modelId) {
+            val reset = transaction {
+                chunks.resetOtherModels(modelId, listOf(ChunkPolicy.NOT_EMBEDDED, ChunkPolicy.FORGOTTEN)).also {
+                    state.put(AppStateEntity(KEY_MODEL, modelId))
+                }
+            }
+            if (reset > 0) Log.i(TAG, "Embedding model is now $modelId; $reset chunks to re-embed")
+            index.replaceAll(storedVectors(modelId))
+            return
+        }
+        index.prune()
+        val stored = chunks.embeddedCount(modelId)
+        if (index.count() != stored) {
+            Log.i(TAG, "Vector index out of step with $stored stored vectors; rebuilding")
+            index.replaceAll(storedVectors(modelId))
+        }
+    }
+
+    /** After chats were deleted: their chunks went by cascade, their index entries go now. */
+    suspend fun onChatsDeleted() = index.prune()
+
+    /**
+     * Archived exchanges that mention [phrase] (as a phrase, in any case) and, when [alsoOneOf]
+     * is given, at least one of those words too — "12 March" alone is too common to delete every
+     * mention of, "12 March" with "mother" is the fact being forgotten.
+     */
+    suspend fun mentioning(phrase: String, alsoOneOf: List<String> = emptyList()): List<ChunkEntity> {
+        val words = com.local.assistant.memory.retrieval.QueryText.words(phrase).map { it.lowercase() }
+        if (words.isEmpty()) return emptyList()
+        val found = try {
+            chunks.matching("\"" + words.joinToString(" ") + "\"")
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not search for '${LogText.of(phrase)}': ${e.javaClass.simpleName}", LogText.trace(e))
+            emptyList()
+        }
+        if (alsoOneOf.isEmpty()) return found
+        // Word by word, and "mother's" counts as "mother".
+        fun wordsOf(text: String) = com.local.assistant.memory.retrieval.QueryText.words(text)
+            .map { it.lowercase().substringBefore('\'').substringBefore('’') }
+        return found.filter { chunk ->
+            val text = wordsOf(chunk.text).toSet()
+            alsoOneOf.any { other -> wordsOf(other).all { it in text } }
+        }
+    }
+
+    /** Empties [forget] (see [ChunkPolicy.FORGOTTEN]) and returns them as they were, for undo. */
+    suspend fun forget(forget: List<ChunkEntity>): List<ChunkEntity> = transaction {
+        if (forget.isEmpty()) return@transaction emptyList()
+        chunks.blank(forget.map { it.id }, ChunkPolicy.FORGOTTEN)
+        index.remove(forget.map { it.id })
+        forget
+    }
+
+    /** Puts back chunks [forget] emptied. */
+    suspend fun restore(restored: List<ChunkEntity>) = transaction {
+        for (chunk in restored) {
+            chunks.update(chunk)
+            val vector = chunk.embedding
+            if (vector != null && chunk.modelId != null && !chunk.modelId.startsWith(ChunkPolicy.FAILED_PREFIX)) index.put(chunk.id, vector)
+        }
+    }
+
+    /** "Forget everything": every chunk emptied, the vector index cleared. */
+    suspend fun forgetAll(): Int {
+        val count = transaction { chunks.blankAll(ChunkPolicy.FORGOTTEN) }
+        index.replaceAll(emptyList())
+        return count
+    }
+
+    private suspend fun storedVectors(modelId: String): List<Pair<Long, ByteArray>> =
+        chunks.vectors(modelId).map { it.id to it.embedding }
+
+    // ---- ArchiveSource ----
+
+    override suspend fun keywordHits(match: String, limit: Int): List<KeywordHit> =
+        try {
+            chunks.keywordMatches(match, limit).map { row ->
+                val scored = Bm25.score(Bm25.parse(row.matchinfo))
+                KeywordHit(row.id, row.messageId, row.chatId, scored.score, scored.termHits)
+            }
+        } catch (e: Exception) {
+            // A query the FTS parser rejects must not cost the user their turn.
+            Log.w(TAG, "Keyword search failed for '${LogText.of(match)}': ${e.javaClass.simpleName}", LogText.trace(e))
+            emptyList()
+        }
+
+    override suspend fun chunks(ids: Collection<Long>): List<ChunkEntity> =
+        if (ids.isEmpty()) emptyList() else chunks.byIds(ids.toList())
+
+    override suspend fun nearest(query: ByteArray, k: Int): List<VectorHit> = index.nearest(query, k)
+
+    private companion object {
+        const val TAG = "Archive"
+        const val KEY_MODEL = "archive.embedding_model"
+        const val BACKFILL_BATCH = 200
+        /** Where the reply starts in a chunk's text ([ChunkPolicy.text]). */
+        private const val REPLY = "\nAssistant: "
+
+        const val KEY_UTILITY_CLEANUP = "archive.utility_cleanup"
+        /** 2: photo searches. */
+        const val UTILITY_CLEANUP_VERSION = "2"
+        val TOOL_NAME = Regex("\"tool\"\\s*:\\s*\"([a-z_]+)\"")
+    }
+}

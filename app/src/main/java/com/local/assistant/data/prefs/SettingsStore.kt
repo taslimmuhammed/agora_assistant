@@ -1,0 +1,413 @@
+package com.local.assistant.data.prefs
+
+import android.content.Context
+import androidx.core.content.edit
+import com.local.assistant.BuildConfig
+import com.local.assistant.memory.prompt.TokenRateStore
+import com.local.assistant.wake.WakeWord
+import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+
+/**
+ * Small preference-backed store. Deliberately plain: everything the app needs to remember
+ * right now is a handful of scalars.
+ */
+class SettingsStore(context: Context) {
+
+    private val prefs = context.getSharedPreferences("settings", Context.MODE_PRIVATE).also { prefs ->
+        if (RETIRED_KEYS.any(prefs::contains)) prefs.edit { RETIRED_KEYS.forEach(::remove) }
+    }
+
+    /** Absolute path of the installed .litertlm file, or null when no model is installed. */
+    var modelPath: String?
+        get() = prefs.getString(KEY_MODEL_PATH, null)
+        set(value) = prefs.edit { if (value == null) remove(KEY_MODEL_PATH) else putString(KEY_MODEL_PATH, value) }
+
+    /** Absolute path of the installed embedding bundle, or null when there is none. */
+    var embedderPath: String?
+        get() = prefs.getString(KEY_EMBEDDER_PATH, null)
+        set(value) = prefs.edit { if (value == null) remove(KEY_EMBEDDER_PATH) else putString(KEY_EMBEDDER_PATH, value) }
+
+    /** Absolute path of the installed photo-search model, or null when there is none. */
+    var galleryModelPath: String?
+        get() = prefs.getString(KEY_GALLERY_MODEL_PATH, null)
+        set(value) = prefs.edit { if (value == null) remove(KEY_GALLERY_MODEL_PATH) else putString(KEY_GALLERY_MODEL_PATH, value) }
+
+    /**
+     * Photo search also finds the people in the photos and groups their faces. Off until the user
+     * turns it on on the Photos screen: faces are biometric data, so none are read before that.
+     */
+    var findPeople: Boolean
+        get() = prefs.getBoolean(KEY_FIND_PEOPLE, false)
+        set(value) = prefs.edit { putBoolean(KEY_FIND_PEOPLE, value) }
+
+    /** The face matching rules (`FaceGrouping.VERSION`) the faces were last placed by; 0 before any. */
+    var faceGroupingVersion: Int
+        get() = prefs.getInt(KEY_FACE_GROUPING_VERSION, 0)
+        set(value) = prefs.edit { putInt(KEY_FACE_GROUPING_VERSION, value) }
+
+    /** Which embedder [embedderPath] is (an `EmbedderCatalog` key), which decides its prompts. */
+    var embedderKey: String?
+        get() = prefs.getString(KEY_EMBEDDER_KEY, null)
+        set(value) = prefs.edit { if (value == null) remove(KEY_EMBEDDER_KEY) else putString(KEY_EMBEDDER_KEY, value) }
+
+    /**
+     * Pause memory: while on, new messages are kept in their chat but nothing is learned from
+     * them — no archive, recall, summaries, extraction, and no facts saved by tools.
+     */
+    var memoryPaused: Boolean
+        get() = prefs.getBoolean(KEY_MEMORY_PAUSED, false)
+        set(value) = prefs.edit { putBoolean(KEY_MEMORY_PAUSED, value) }
+
+    /** Web search has been offered once, after the profile (a key saved, or skipped). */
+    var webSearchAsked: Boolean
+        get() = prefs.getBoolean(KEY_WEB_SEARCH_ASKED, false)
+        set(value) = prefs.edit { putBoolean(KEY_WEB_SEARCH_ASKED, value) }
+
+    /**
+     * Photos, files and messages have been offered once, after web search (allowed or skipped).
+     * False on installs from before the page, so they see it once too.
+     */
+    var accessAsked: Boolean
+        get() = prefs.getBoolean(KEY_ACCESS_ASKED, false)
+        set(value) = prefs.edit { putBoolean(KEY_ACCESS_ASKED, value) }
+
+    /**
+     * Messages that arrive (notifications from chat apps, and the SMS inbox while the app is the
+     * digital assistant) are kept on the phone for search, as long as chats are. Off until the
+     * user turns it on, on the first-launch page or in Settings › Messages.
+     */
+    var keepMessages: Boolean
+        get() = prefs.getBoolean(KEY_KEEP_MESSAGES, false)
+        set(value) = prefs.edit { putBoolean(KEY_KEEP_MESSAGES, value) }
+
+    fun observeKeepMessages(): Flow<Boolean> = observeKey(KEY_KEEP_MESSAGES) { keepMessages }
+
+    /** Apps whose messages aren't kept for search, by package name (Settings › Messages). */
+    var inboxIgnoredApps: Set<String>
+        get() = prefs.getStringSet(KEY_INBOX_IGNORED, emptySet()).orEmpty().toSet()
+        set(value) = prefs.edit { putStringSet(KEY_INBOX_IGNORED, value) }
+
+    fun observeInboxIgnoredApps(): Flow<Set<String>> = observeKey(KEY_INBOX_IGNORED) { inboxIgnoredApps }
+
+    /**
+     * The SMS inbox has been read up to this message ([com.local.assistant.inbox.SmsSync]). Not
+     * reset when the kept messages are deleted, so they don't come back.
+     */
+    var smsReadUpTo: Long
+        get() = prefs.getLong(KEY_SMS_READ_UP_TO, 0L)
+        set(value) = prefs.edit { putLong(KEY_SMS_READ_UP_TO, value) }
+
+    /** The profile has been offered once (filled in or skipped); first launch asks for it. */
+    var profileAsked: Boolean
+        get() = prefs.getBoolean(KEY_PROFILE_ASKED, false)
+        set(value) = prefs.edit { putBoolean(KEY_PROFILE_ASKED, value) }
+
+    /**
+     * The welcome tour has been shown (to the end, or skipped); first launch shows it before the
+     * profile. Someone whose profile was already asked set the app up before the tour existed, so
+     * it isn't sprung on them; Settings has it.
+     */
+    var tourSeen: Boolean
+        get() = prefs.getBoolean(KEY_TOUR_SEEN, profileAsked)
+        set(value) = prefs.edit { putBoolean(KEY_TOUR_SEEN, value) }
+
+    /** Chat history older than this many days is deleted by the nightly job; 0 keeps everything. */
+    var historyRetentionDays: Int
+        get() = prefs.getInt(KEY_HISTORY_RETENTION, 0)
+        set(value) = prefs.edit { putInt(KEY_HISTORY_RETENTION, value) }
+
+    /** Prefer the GPU backend. Falls back to CPU automatically if the GPU engine fails to start. */
+    var useGpu: Boolean
+        get() = prefs.getBoolean(KEY_USE_GPU, true)
+        set(value) = prefs.edit { putBoolean(KEY_USE_GPU, value) }
+
+    /** Multi-token prediction. Recommended on GPU, and disabled automatically if it fails. */
+    var useSpeculativeDecoding: Boolean
+        get() = prefs.getBoolean(KEY_SPECULATIVE, true)
+        set(value) = prefs.edit { putBoolean(KEY_SPECULATIVE, value) }
+
+    /**
+     * The window the model runs with, in tokens: 8K unless the user picks more in settings. The
+     * KV cache is sized by the window, not by how full it is, and the LLM shares memory with the
+     * embedder and a voice model. Changing it needs an engine reload.
+     */
+    var contextTokens: Int
+        get() = prefs.getInt(KEY_CONTEXT_TOKENS, DEFAULT_CONTEXT_TOKENS)
+        set(value) = prefs.edit(commit = true) { putInt(KEY_CONTEXT_TOKENS, value) }
+
+    /** A larger window failed to start, so the app went back to 8K; settings says so once. */
+    var contextFellBack: Boolean
+        get() = prefs.getBoolean(KEY_CONTEXT_FELL_BACK, false)
+        set(value) = prefs.edit { putBoolean(KEY_CONTEXT_FELL_BACK, value) }
+
+    /** The Latin characters-per-token rate measured for one model; see `MeasuredTokenEstimator`. */
+    val tokenRates: TokenRateStore = object : TokenRateStore {
+        override fun load(modelKey: String): Double? =
+            prefs.getFloat(KEY_TOKEN_RATE, 0f).takeIf { it > 0f && prefs.getString(KEY_TOKEN_RATE_MODEL, null) == modelKey }
+                ?.toDouble()
+
+        override fun save(modelKey: String, latinCharsPerToken: Double) = prefs.edit {
+            putFloat(KEY_TOKEN_RATE, latinCharsPerToken.toFloat())
+            putString(KEY_TOKEN_RATE_MODEL, modelKey)
+        }
+    }
+
+    /** Notifications are asked for once, the first time a timed reminder is made. */
+    var askedForNotifications: Boolean
+        get() = prefs.getBoolean(KEY_ASKED_NOTIFICATIONS, false)
+        set(value) = prefs.edit { putBoolean(KEY_ASKED_NOTIFICATIONS, value) }
+
+    /** Exact alarms are offered once, the first time a reminder could only be scheduled inexactly. */
+    var offeredExactAlarms: Boolean
+        get() = prefs.getBoolean(KEY_OFFERED_EXACT_ALARMS, false)
+        set(value) = prefs.edit { putBoolean(KEY_OFFERED_EXACT_ALARMS, value) }
+
+    /** The note that the phone keeps closing the app ([com.local.assistant.assist.ProcessExits]) was shown and answered: it isn't shown again. */
+    var toldAboutPhoneKills: Boolean
+        get() = prefs.getBoolean(KEY_TOLD_PHONE_KILLS, false)
+        set(value) = prefs.edit { putBoolean(KEY_TOLD_PHONE_KILLS, value) }
+
+    /**
+     * The window an engine load is in progress at, cleared when it returns. A native
+     * out-of-memory kills the process with no exception, so a value still here at the next launch
+     * means that size was too much for this phone. `commit`, since an asynchronous write may not
+     * reach disk before the process dies.
+     */
+    var initInFlightTokens: Int
+        get() = prefs.getInt(KEY_INIT_IN_FLIGHT, 0)
+        set(value) = prefs.edit(commit = true) { putInt(KEY_INIT_IN_FLIGHT, value) }
+
+    /** How long the model's last load took, for telling the user how long the next one will. */
+    var lastEngineLoadMs: Long
+        get() = prefs.getLong(KEY_LAST_ENGINE_LOAD_MS, 0L)
+        set(value) = prefs.edit { putLong(KEY_LAST_ENGINE_LOAD_MS, value) }
+
+    /** Ceiling on a single reply, so one runaway answer cannot consume the whole context. */
+    var maxOutputTokens: Int
+        get() = prefs.getInt(KEY_MAX_OUTPUT, DEFAULT_MAX_OUTPUT)
+        set(value) = prefs.edit { putInt(KEY_MAX_OUTPUT, value) }
+
+    /**
+     * Damps degenerate repetition loops. 1.0 disables it. Kept low because generated code and
+     * markup legitimately repeat, and a heavy penalty makes the model avoid necessary tokens.
+     */
+    var repetitionPenalty: Float
+        get() = prefs.getFloat(KEY_REPETITION_PENALTY, DEFAULT_REPETITION_PENALTY)
+        set(value) = prefs.edit { putFloat(KEY_REPETITION_PENALTY, value) }
+
+    /** How many recent tokens the repetition penalty considers. */
+    var repetitionWindow: Int
+        get() = prefs.getInt(KEY_REPETITION_WINDOW, DEFAULT_REPETITION_WINDOW)
+        set(value) = prefs.edit { putInt(KEY_REPETITION_WINDOW, value) }
+
+    var systemPrompt: String
+        get() = prefs.getString(KEY_SYSTEM_PROMPT, DEFAULT_SYSTEM_PROMPT) ?: DEFAULT_SYSTEM_PROMPT
+        set(value) = prefs.edit { putString(KEY_SYSTEM_PROMPT, value) }
+
+    /**
+     * The assistant works on the lock screen without unlocking, but sees none of the user's memory
+     * there and has only the lock screen's tools (reminders, alarms, timers …; anything more asks
+     * for an unlock: the user, 2026-10-30). Off by default (the user's decision): whoever holds
+     * the phone could still set reminders and alarms.
+     */
+    var assistantOnLockScreen: Boolean
+        get() = prefs.getBoolean(KEY_ON_LOCK_SCREEN, false)
+        set(value) = prefs.edit { putBoolean(KEY_ON_LOCK_SCREEN, value) }
+
+    /** When the wake word opens the assistant (wake/WakeWord). Off until the user turns it on. */
+    var wakeWord: com.local.assistant.wake.WakeWordMode
+        get() = prefs.getString(KEY_WAKE_WORD, null)
+            ?.let { saved -> com.local.assistant.wake.WakeWordMode.entries.firstOrNull { it.name == saved } }
+            ?: com.local.assistant.wake.WakeWordMode.OFF
+        set(value) = prefs.edit { putString(KEY_WAKE_WORD, value.name) }
+
+    /** The assistant overlay reads its answer aloud when it was asked by voice. */
+    var speakReplies: Boolean
+        get() = prefs.getBoolean(KEY_SPEAK_REPLIES, true)
+        set(value) = prefs.edit { putBoolean(KEY_SPEAK_REPLIES, value) }
+
+    /** The text-to-speech voice picked in settings, by name; null for the automatic choice. */
+    var assistantVoice: String?
+        get() = prefs.getString(KEY_ASSISTANT_VOICE, null)
+        set(value) = prefs.edit { if (value == null) remove(KEY_ASSISTANT_VOICE) else putString(KEY_ASSISTANT_VOICE, value) }
+
+    /**
+     * The downloaded natural voice the assistant speaks with (voice/NaturalVoices, by id), or
+     * null for the phone's; [assistantVoice] stays as the phone voice it falls back to. Null
+     * until one is downloaded. The first build had one voice and a switch, kept on as Heart.
+     */
+    var naturalVoice: String?
+        get() = prefs.getString(KEY_NATURAL_VOICE_ID, null)
+            ?: if (prefs.getBoolean(KEY_NATURAL_VOICE, false)) "kokoro-heart" else null
+        set(value) = prefs.edit {
+            remove(KEY_NATURAL_VOICE)
+            if (value == null) remove(KEY_NATURAL_VOICE_ID) else putString(KEY_NATURAL_VOICE_ID, value)
+        }
+
+    /** How fast the voice speaks; 1.0 is the engine's normal pace. */
+    var speechRate: Float
+        get() = prefs.getFloat(KEY_SPEECH_RATE, DEFAULT_SPEECH_RATE)
+        set(value) = prefs.edit { putFloat(KEY_SPEECH_RATE, value) }
+
+    /**
+     * "While you were away": notifications are read and kept for the brief. Off until the user
+     * turns it on and allows notification access; other people's messages aren't read before that.
+     */
+    var awayBrief: Boolean
+        get() = prefs.getBoolean(KEY_AWAY_BRIEF, false)
+        set(value) = prefs.edit { putBoolean(KEY_AWAY_BRIEF, value) }
+
+    /** The brief opens by itself at the unlock; off, it waits as a quiet notification. */
+    var awayPopUp: Boolean
+        get() = prefs.getBoolean(KEY_AWAY_POP_UP, true)
+        set(value) = prefs.edit { putBoolean(KEY_AWAY_POP_UP, value) }
+
+    /** Locked at least this long counts as away. */
+    var awayMinutes: Int
+        get() = prefs.getInt(KEY_AWAY_MINUTES, com.local.assistant.away.AwayBrief.DEFAULT_AWAY_MINUTES)
+        set(value) = prefs.edit { putInt(KEY_AWAY_MINUTES, value) }
+
+    /** Apps the user left out of the brief, by package name. */
+    var awayIgnoredApps: Set<String>
+        get() = prefs.getStringSet(KEY_AWAY_IGNORED, emptySet()).orEmpty().toSet()
+        set(value) = prefs.edit { putStringSet(KEY_AWAY_IGNORED, value) }
+
+    /** The daily step goal health_data measures steps against. */
+    var stepGoal: Int
+        get() = prefs.getInt(KEY_STEP_GOAL, com.local.assistant.health.HealthTools.DEFAULT_STEP_GOAL)
+        set(value) = prefs.edit { putInt(KEY_STEP_GOAL, value) }
+
+    /**
+     * Live voice (live/): the power button, "Hey Luna" and the chat's Call button start a call
+     * through Agora and Luna's server instead of the on-device model, while the phone is online.
+     * On by default in a build made with a server (`live.serverUrl` in local.properties), so the
+     * demo phone needs nothing set; nothing changes without one.
+     */
+    var liveVoice: Boolean
+        get() = prefs.getBoolean(KEY_LIVE_VOICE, BuildConfig.LIVE_SERVER_URL.isNotBlank())
+        set(value) = prefs.edit { putBoolean(KEY_LIVE_VOICE, value) }
+
+    /** The live voice server typed in Settings, over the build's own; null for the build's. */
+    var liveServerUrl: String?
+        get() = prefs.getString(KEY_LIVE_SERVER_URL, null)?.takeIf { it.isNotBlank() }
+        set(value) = prefs.edit { if (value.isNullOrBlank()) remove(KEY_LIVE_SERVER_URL) else putString(KEY_LIVE_SERVER_URL, value.trim()) }
+
+    /** The Murf voice a call speaks with ("Anusha"); null for the server's. */
+    var murfVoice: String?
+        get() = prefs.getString(KEY_MURF_VOICE, null)?.takeIf { it.isNotBlank() }
+        set(value) = prefs.edit { if (value.isNullOrBlank()) remove(KEY_MURF_VOICE) else putString(KEY_MURF_VOICE, value.trim()) }
+
+    /** The check-in calls, at the doses' times the family hub last sent ([com.local.assistant.live.CheckIns]). */
+    var checkInTimes: List<com.local.assistant.live.CheckIn>
+        get() = prefs.getString(KEY_CHECK_IN_TIMES, null)?.let { json ->
+            runCatching { com.google.gson.Gson().fromJson(json, Array<com.local.assistant.live.CheckIn>::class.java).toList() }.getOrNull()
+        }.orEmpty()
+        set(value) = prefs.edit { putString(KEY_CHECK_IN_TIMES, com.google.gson.Gson().toJson(value)) }
+
+    /** Who Luna's server knows the user as ("lakshmi"), from the family it last sent; blank for its own elder. */
+    var liveUserId: String
+        get() = prefs.getString(KEY_LIVE_USER_ID, "").orEmpty()
+        set(value) = prefs.edit { putString(KEY_LIVE_USER_ID, value) }
+
+    fun observeAwayBrief(): Flow<Boolean> = observeKey(KEY_AWAY_BRIEF) { awayBrief }
+
+    fun observeAwayIgnoredApps(): Flow<Set<String>> = observeKey(KEY_AWAY_IGNORED) { awayIgnoredApps }
+
+    fun observeModelPath(): Flow<String?> = observeKey(KEY_MODEL_PATH) { modelPath }
+
+    fun observeMemoryPaused(): Flow<Boolean> = observeKey(KEY_MEMORY_PAUSED) { memoryPaused }
+
+    fun observeHistoryRetentionDays(): Flow<Int> = observeKey(KEY_HISTORY_RETENTION) { historyRetentionDays }
+
+    private fun <T> observeKey(key: String, read: () -> T): Flow<T> = callbackFlow {
+        trySend(read())
+        val listener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, changed ->
+            if (changed == key) trySend(read())
+        }
+        prefs.registerOnSharedPreferenceChangeListener(listener)
+        awaitClose { prefs.unregisterOnSharedPreferenceChangeListener(listener) }
+    }.distinctUntilChanged()
+
+    companion object {
+        private const val KEY_MODEL_PATH = "model_path"
+        private const val KEY_AWAY_BRIEF = "away_brief"
+        private const val KEY_AWAY_POP_UP = "away_pop_up"
+        private const val KEY_AWAY_MINUTES = "away_minutes"
+        private const val KEY_AWAY_IGNORED = "away_ignored_apps"
+        private const val KEY_STEP_GOAL = "step_goal"
+        private const val KEY_LIVE_VOICE = "live_voice"
+        private const val KEY_LIVE_SERVER_URL = "live_server_url"
+        private const val KEY_MURF_VOICE = "murf_voice"
+        private const val KEY_CHECK_IN_TIMES = "check_in_times"
+        private const val KEY_LIVE_USER_ID = "live_user_id"
+        private const val KEY_EMBEDDER_PATH = "embedder_path"
+        private const val KEY_EMBEDDER_KEY = "embedder_key"
+        private const val KEY_GALLERY_MODEL_PATH = "gallery_model_path"
+        private const val KEY_FIND_PEOPLE = "find_people"
+        private const val KEY_FACE_GROUPING_VERSION = "face_grouping_version"
+        private const val KEY_MEMORY_PAUSED = "memory_paused"
+        private const val KEY_PROFILE_ASKED = "profile_asked"
+        private const val KEY_TOUR_SEEN = "tour_seen"
+        private const val KEY_WEB_SEARCH_ASKED = "web_search_asked"
+        private const val KEY_ACCESS_ASKED = "access_asked"
+        private const val KEY_KEEP_MESSAGES = "keep_messages"
+        private const val KEY_INBOX_IGNORED = "inbox_ignored_apps"
+        private const val KEY_SMS_READ_UP_TO = "sms_read_up_to"
+        private const val KEY_HISTORY_RETENTION = "history_retention_days"
+        private const val KEY_USE_GPU = "use_gpu"
+        private const val KEY_SPECULATIVE = "speculative_decoding"
+        private const val KEY_SYSTEM_PROMPT = "system_prompt"
+        private const val KEY_INIT_IN_FLIGHT = "init_in_flight_tokens"
+        private const val KEY_CONTEXT_TOKENS = "context_tokens"
+        private const val KEY_CONTEXT_FELL_BACK = "context_fell_back"
+
+        /** What calibration used to keep, before the window became a plain setting. */
+        private val RETIRED_KEYS = listOf(
+            "manual_context_tokens", "calibrated_context_tokens", "calibration_key", "generation_in_flight_tokens",
+            "generation_crash_streak", "context_ceiling_tokens", "init_crash_streak",
+            // The wake phrase was a choice for a day (Luna, Computer, Kalyani) before Luna stayed.
+            "wake_phrase",
+        )
+        private const val KEY_MAX_OUTPUT = "max_output_tokens"
+        private const val KEY_TOKEN_RATE = "latin_chars_per_token"
+        private const val KEY_ASKED_NOTIFICATIONS = "asked_for_notifications"
+        private const val KEY_OFFERED_EXACT_ALARMS = "offered_exact_alarms"
+        private const val KEY_TOLD_PHONE_KILLS = "told_phone_kills"
+        private const val KEY_LAST_ENGINE_LOAD_MS = "last_engine_load_ms"
+        private const val KEY_TOKEN_RATE_MODEL = "latin_chars_per_token_model"
+        private const val KEY_REPETITION_PENALTY = "repetition_penalty"
+        private const val KEY_REPETITION_WINDOW = "repetition_window"
+        private const val KEY_SPEAK_REPLIES = "speak_replies"
+        private const val KEY_ON_LOCK_SCREEN = "assistant_on_lock_screen"
+        private const val KEY_WAKE_WORD = "wake_word"
+        private const val KEY_ASSISTANT_VOICE = "assistant_voice"
+        private const val KEY_SPEECH_RATE = "speech_rate"
+        private const val KEY_NATURAL_VOICE = "natural_voice"
+        private const val KEY_NATURAL_VOICE_ID = "natural_voice_id"
+
+        const val DEFAULT_SPEECH_RATE = 1.0f
+
+        /** What settings offers for [speechRate]. */
+        val SPEECH_RATES = listOf(0.85f to "Relaxed", 1.0f to "Normal", 1.2f to "Brisk")
+
+        const val DEFAULT_MAX_OUTPUT = 2048
+        /** 8K: what the prompt budget is designed around, and what every supported phone holds. */
+        const val DEFAULT_CONTEXT_TOKENS = 8192
+
+        /**
+         * What settings offers. 4K for phones short on memory — the instructions and tools alone
+         * are ~2,000 tokens, so it keeps only the last exchange or two. 16K fitted the 15.5 GB
+         * test phone; more than that did not.
+         */
+        val CONTEXT_CHOICES = listOf(4096, 8192, 12288, 16384)
+        const val DEFAULT_REPETITION_PENALTY = 1.1f
+        const val DEFAULT_REPETITION_WINDOW = 256
+
+        /** The persona; Instructions adds the role or the name if a persona leaves either out. */
+        const val DEFAULT_SYSTEM_PROMPT =
+            "You are ${WakeWord.NAME}, a helpful assistant running entirely on the user's device."
+    }
+}

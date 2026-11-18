@@ -1,0 +1,214 @@
+package com.local.assistant.memory.tools
+
+import java.time.DayOfWeek
+
+import com.local.assistant.memory.db.EventEntity
+import com.local.assistant.memory.db.FactEntity
+import com.local.assistant.memory.db.ForgetResult
+import com.local.assistant.memory.db.TaskEntity
+import com.local.assistant.memory.db.TaskPlace
+import com.local.assistant.memory.db.UserNoteEntity
+import com.local.assistant.memory.prompt.Snippet
+
+/**
+ * The small confirmation under a reply: "Saved · Dentist: Dr. Rao · Undo".
+ *
+ * Times are kept as epoch millis and formatted when shown, so the chip follows the device's
+ * zone and locale rather than whatever they were when it was written.
+ */
+data class MemoryChip(
+    val kind: Kind,
+    /** "Saved", "Reminder", "Event", "Done", "Moved", "Forgot"… */
+    val label: String,
+    /** "Dentist: Dr. Rao", "Call the CA". */
+    val detail: String,
+    val at: Long? = null,
+    val allDay: Boolean = false,
+    /** A caveat worth showing, e.g. that the reminder may be a few minutes late. */
+    val note: String? = null,
+    /** Whether the time can be changed from the chip. */
+    val editable: Boolean = false,
+    /** A web page the chip can open: a web search's top source. */
+    val link: String? = null,
+    /** find_photos: the photos it found, drawn as thumbnails or a card instead of a text row. */
+    val photos: PhotoSet? = null,
+    /** A place reminder's place, shown instead of a time: "near DMart". */
+    val place: String? = null,
+    /** The note or list edit_note made or changed, shown as it is now under the chip; null once deleted. */
+    val noteId: Long? = null,
+    /** read_file: the files or folders it found, drawn as rows that open them. */
+    val files: FileSet? = null,
+) {
+    enum class Kind { FACT, TASK, EVENT, FORGET, ALARM, IMAGE, CALL, MESSAGE, TIMER, APP, SETTING, WEB, PHOTOS, SCREENSHOT, HEALTH, NOTE, FILES }
+}
+
+/** Files or folders on the phone that answer [query], best first; [read] is the one a reply was read from. */
+data class FileSet(
+    val query: String,
+    val files: List<FileRef>,
+    /** The name of the one read for the reply. */
+    val read: String? = null,
+    /** Its path, which tells it from a copy with the same name; null in chips from before it was kept. */
+    val readPath: String? = null,
+) {
+    fun wasRead(file: FileRef): Boolean = if (readPath != null) file.path == readPath else file.name == read
+}
+
+/**
+ * A file (or with [folder], a folder) on the phone, as found: opened from where it is when tapped,
+ * so a chip from last month opens the file as it is now. [path] is from the storage root's top
+ * (`/storage/emulated/0/Download/x.pdf`); for a folder, its path from the root (`Download/Bank/`).
+ */
+data class FileRef(
+    val name: String,
+    /** Its folder from the storage root, `Download/Bank/`. */
+    val where: String,
+    val path: String?,
+    val mediaId: Long? = null,
+    val sizeBytes: Long = 0,
+    val modifiedMs: Long = 0,
+    val mime: String? = null,
+    val folder: Boolean = false,
+    /** For a folder: how many files are in it. */
+    val count: Int = 0,
+)
+
+/**
+ * The phone's photos and videos that answer [query], by MediaStore id, best match first. For a
+ * video found by what's in it, [moments] has the moment that matched, to start playing there.
+ * Null in chips saved before videos were searched (Gson leaves a missing field null).
+ */
+data class PhotoSet(val query: String, val ids: List<Long>, val moments: Map<Long, Long>? = null) {
+
+    fun momentOf(mediaId: Long): Long? = moments?.get(mediaId)
+
+    companion object {
+        fun of(query: String, hits: List<com.local.assistant.gallery.PhotoHit>) =
+            PhotoSet(query, hits.map { it.mediaId }, hits.mapNotNull { hit -> hit.atMs?.let { hit.mediaId to it } }.toMap().ifEmpty { null })
+    }
+}
+
+/**
+ * What undoing a tool call needs: the state before it. Kept in the TOOL row itself, so an undo
+ * still works after a restart and no separate table is needed.
+ */
+data class UndoToken(
+    val previousFact: FactEntity? = null,
+    val writtenFact: FactEntity? = null,
+    val createdTaskId: Long? = null,
+    val previousTask: TaskEntity? = null,
+    val createdEventId: Long? = null,
+    val previousEvent: EventEntity? = null,
+    val forgotten: ForgetResult? = null,
+    /** A saved image (remember_image). */
+    val createdNoteId: Long? = null,
+    /** A note or list edit_note made. */
+    val createdUserNoteId: Long? = null,
+    /** A note or list as it was before edit_note changed or deleted it, and as it left it (null when deleted). */
+    val previousUserNote: UserNoteEntity? = null,
+    val writtenUserNote: UserNoteEntity? = null,
+)
+
+/**
+ * One tool call as persisted in a TOOL message row: what was asked, what came back, and what the
+ * chip under the reply shows. Never shown as a bubble, chunked or embedded.
+ */
+data class ToolRecord(
+    val tool: String,
+    val arguments: Map<String, Any?>,
+    /** The compact JSON the model was given back. */
+    val result: String,
+    val chip: MemoryChip? = null,
+    val undo: UndoToken? = null,
+    val undone: Boolean = false,
+)
+
+/**
+ * Where a tool call happens: which chat, and the user message that asked for it. [userText] is
+ * that message as typed, which numbers in the call's arguments are checked against.
+ */
+/** [locked]: the phone is locked, so only [ToolCatalog.LOCKED] tools run (see [ToolLoop]). */
+data class ToolContext(
+    val chatId: Long,
+    val userMessageId: Long,
+    val userText: String = "",
+    val locked: Boolean = false,
+    /** A screenshot of the screen the assistant was opened over, when it was ([com.local.assistant.assist.ScreenCapture]). */
+    val screen: String? = null,
+    /**
+     * The model heard the message, its recording sent with [userText] (what the phone's recogniser
+     * wrote of it): the names and numbers in its calls are from the recording, and checking them
+     * against [userText] would put the recogniser's mistakes back ("2450" made "200450").
+     */
+    val heard: Boolean = false,
+    /**
+     * The user's message before this one, when it came just before: a call may finish what it
+     * asked ("when I reach avilora" after "remind me to buy chicken"), so its words are theirs too.
+     */
+    val earlierText: String = "",
+    /** How far a long call has got ("Reading part 2 of 5"), shown while it runs ([ToolLoop]). */
+    val onStep: (String) -> Unit = {},
+    /** A document attached to the message, which read_file reads when asked to ([ToolLoop.readAttached]). */
+    val document: AttachedDocument? = null,
+    /**
+     * What the app read from [document] for the model to act on: the numbers in a call that came
+     * from it are the document's, so they're checked against it as well as the user's words.
+     */
+    val documentNotes: String = "",
+)
+
+/** A document attached to a message: the app's copy of it, and the name it was picked with. */
+data class AttachedDocument(val path: String, val name: String)
+
+/** Persists tool calls as TOOL rows in the chat. */
+interface ToolLog {
+    suspend fun record(chatId: Long, record: ToolRecord): Long
+
+    suspend fun read(id: Long): ToolRecord?
+
+    suspend fun update(id: Long, record: ToolRecord)
+}
+
+/**
+ * Alarms in the phone's own clock app — the ones that ring loudly and on time — as opposed to the
+ * app's reminders. They belong to the clock app once set: it is where they are changed or deleted.
+ */
+interface SystemAlarms {
+    /** Whether there is a clock app that accepts alarms from other apps. */
+    fun available(): Boolean
+
+    /**
+     * Sets an alarm at [hour]:[minute]. With no [days] it rings once, the next time that time
+     * comes round; with days it repeats on them. False if the clock app could not be reached.
+     */
+    fun set(hour: Int, minute: Int, days: Set<DayOfWeek>, label: String?): Boolean
+
+    /** Starts a countdown of [seconds] in the clock app. False if it could not be reached. */
+    fun setTimer(seconds: Int, label: String?): Boolean
+
+    fun openClock()
+}
+
+/** Makes reminders and event alerts go off. The Android implementation uses AlarmManager. */
+interface ReminderScheduler {
+    /** Whether alarms can be exact; without the permission they may arrive a few minutes late. */
+    fun canScheduleExact(): Boolean
+
+    fun schedule(taskId: Long, dueAt: Long)
+
+    /** Rings when the user arrives at [place]'s spots, instead of at a time (geofences). */
+    fun schedulePlace(taskId: Long, place: TaskPlace)
+
+    /** Stops the reminder, at a time or a place, and takes down its notification. */
+    fun cancel(taskId: Long)
+
+    /** Alerts about the event starting at [startsAt], at [alertAt] (ahead of it). */
+    fun scheduleEvent(eventId: Long, alertAt: Long, startsAt: Long)
+
+    fun cancelEvent(eventId: Long)
+}
+
+/** Archived exchanges matching a query, best first, for search_memory. */
+fun interface ArchiveSearch {
+    suspend fun search(query: String, limit: Int): List<Snippet>
+}

@@ -1,0 +1,421 @@
+package com.local.assistant.llm
+
+import android.os.SystemClock
+import android.util.Log
+import androidx.test.ext.junit.runners.AndroidJUnit4
+import androidx.test.platform.app.InstrumentationRegistry
+import com.google.ai.edge.litertlm.Backend
+import com.google.ai.edge.litertlm.Channel
+import com.google.ai.edge.litertlm.Content
+import com.google.ai.edge.litertlm.Contents
+import com.google.ai.edge.litertlm.Message
+import com.google.ai.edge.litertlm.ConversationConfig
+import com.google.ai.edge.litertlm.Engine
+import com.google.ai.edge.litertlm.EngineConfig
+import com.google.ai.edge.litertlm.ExperimentalApi
+import com.google.ai.edge.litertlm.ExperimentalFlags
+import com.google.ai.edge.litertlm.OpenApiTool
+import com.google.ai.edge.litertlm.SamplerConfig
+import com.google.ai.edge.litertlm.tool
+import com.local.assistant.data.prefs.SettingsStore
+import com.local.assistant.llm.ToolCallRepair
+import com.local.assistant.memory.prompt.Instructions
+import com.local.assistant.memory.tools.ToolCatalog
+import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.runBlocking
+import org.junit.Assume.assumeTrue
+import org.junit.Before
+import org.junit.Test
+import org.junit.runner.RunWith
+import java.io.File
+import java.time.ZonedDateTime
+import java.time.format.DateTimeFormatter
+import java.util.Locale
+
+/**
+ * The on-device routing eval: ~30 requests through the real model with the real instructions and
+ * tool declarations, scoring whether each routes to the right tool — or, for the negatives, to
+ * none. Runs at temperature 1.0 and 0.7, so the sampler choice rests on numbers.
+ *
+ * Opt-in, since it loads the model:
+ *
+ *     adb shell am instrument -w -e eval true \
+ *         -e class com.local.assistant.llm.RoutingEvalTest \
+ *         com.taslim.localassistant.dev.test/androidx.test.runner.AndroidJUnitRunner
+ *
+ * Results go to logcat (tag RoutingEval) and `Android/data/<app>/files/routing-eval.txt`.
+ */
+@RunWith(AndroidJUnit4::class)
+class RoutingEvalTest {
+
+    private val context = InstrumentationRegistry.getInstrumentation().targetContext
+    private val out by lazy { File(context.getExternalFilesDir(null), "routing-eval.txt").apply { writeText("") } }
+
+    /** [accept] holds the acceptable first tool; null in it means "no tool call" is right. */
+    private data class Case(val prompt: String, val accept: Set<String?>, val check: ((Map<String, Any?>) -> Boolean)? = null)
+
+    private val cases = listOf(
+        Case("remind me to call the CA tomorrow at 11", setOf("add_task")) { args -> args["when"].toString().let { "tomorrow" in it && "11" in it } },
+        Case("kal subah 11 baje CA ko call karna yaad dilana", setOf("add_task")),
+        Case("don't let me forget to pay the electricity bill on Friday", setOf("add_task")),
+        Case("I need to renew my passport next month", setOf("add_task")),
+        Case("remind me every Monday at 9 to submit the timesheet", setOf("add_task")) { args -> args["repeat"] != null },
+        Case("parso shaam 6 baje mummy ko call karna hai, yaad dilana", setOf("add_task")),
+        Case("move the CA call to 3", setOf("update_task")),
+        Case("I called the CA, mark it done", setOf("update_task")),
+        Case("cancel the passport reminder", setOf("update_task")),
+        // Place reminders: add_task with the place, not a call; a place only named is no place.
+        Case("remind me to buy milk near DMart", setOf("add_task")) { args -> "dmart" in args["place"].toString().lowercase().replace(" ", "") },
+        Case("when I reach office remind me to call Priya", setOf("add_task")) { args -> "office" in args["place"].toString().lowercase() },
+        Case("remind me to water the plants when I get home", setOf("add_task")) { args -> "home" in args["place"].toString().lowercase() },
+        Case("remind me to call the office at 5pm", setOf("add_task")) { args -> args["place"] == null && args["when"] != null },
+        // A distance with the place: the executor reads it from the words; the town must still be the place.
+        Case("set a reminder before 5 kilometer before I reach Munnar", setOf("add_task")) { args ->
+            "munnar" in args["place"].toString().lowercase() && args["when"] == null
+        },
+        Case("my dentist is Dr. Rao", setOf("save_fact")) { args -> args["value"].toString().contains("Rao") },
+        Case("reply in short answers from now on", setOf("save_fact")) { args -> args["core"] == true || args["core"] == "true" },
+        Case("my wife's birthday is 12 May", setOf("save_fact", "add_event")),
+        Case("I live in Bengaluru", setOf("save_fact")),
+        Case("my CA is Mr. Iyer", setOf("save_fact")),
+        Case("I'm allergic to peanuts", setOf("save_fact")),
+        Case("mera dentist Dr. Rao hai", setOf("save_fact")),
+        Case("dentist appointment on Thursday at 5pm", setOf("add_event")),
+        Case("team meeting tomorrow from 10 to 11", setOf("add_event")),
+        Case("flight to Kochi on 25 Oct at 6am", setOf("add_event")),
+        Case("what's coming up this week?", setOf("get_upcoming")),
+        Case("set an alarm for 6am", setOf("set_alarm")),
+        Case("wake me up at 5:30 tomorrow", setOf("set_alarm")),
+        Case("subah 6 baje ka alarm laga do", setOf("set_alarm")),
+        Case("set an alarm for 7 on weekdays", setOf("set_alarm")) { args -> args["repeat"] != null },
+        Case("what did I tell you about my CA?", setOf("search_memory")),
+        Case("forget my dentist", setOf("forget")),
+        Case("what's my dentist's name?", setOf(null, "search_memory")),
+        Case("I'm tired today", setOf(null)),
+        Case("what's the capital of Kerala?", setOf(null)),
+        Case("if I had a dentist, what should I ask them?", setOf(null)),
+        Case("my friend thinks Python is better than Java", setOf(null)),
+        Case("oh great, another Monday", setOf(null)),
+        Case("write a haiku about rain", setOf(null)),
+        // Its name, from the instructions; the reply in the results should say Luna.
+        Case("what's your name?", setOf(null)),
+        Case("hey Luna, who are you?", setOf(null)),
+        Case("should I call the CA tomorrow?", setOf(null)),
+        // Everyday tools.
+        Case("call amma", setOf("phone_call")) { args -> args["who"].toString().contains("amma", ignoreCase = true) },
+        Case("call 98450 12345", setOf("phone_call")),
+        Case("text Priya that I'm running 10 minutes late", setOf("send_message")) { args -> args["text"].toString().contains("late") },
+        Case("WhatsApp Anjali I'll be there by 7", setOf("send_message")) { args -> args["app"].toString().contains("whatsapp", ignoreCase = true) },
+        Case("email my landlord that the kitchen tap is leaking", setOf("send_message")),
+        Case("set a timer for 10 minutes", setOf("set_timer")) { args -> args["duration"].toString().contains("10") },
+        Case("open YouTube", setOf("open_app")),
+        Case("directions to Indiranagar", setOf("open_app")) { args -> args["query"].toString().contains("Indiranagar") },
+        Case("play some Arijit Singh songs", setOf("open_app")),
+        Case("turn on the flashlight", setOf("phone_setting")),
+        Case("put my phone on silent", setOf("phone_setting")),
+        Case("turn the volume up", setOf("phone_setting")),
+        Case("turn on wifi", setOf("phone_setting")),
+        Case("what's 18% of 2450?", setOf("calculate")),
+        Case("split 3450 between 4 people", setOf("calculate")),
+        Case("how many km is 5 miles?", setOf("calculate")) { args -> args["expression"].toString().contains("5") },
+        Case("what's the weather in Kochi today?", setOf("web_lookup")),
+        Case("latest news about ISRO", setOf("web_lookup")),
+        Case("what's the price of gold today?", setOf("web_lookup")),
+        Case("who won the last IPL final?", setOf("web_lookup")),
+        Case("search the web for a dal tadka recipe", setOf("web_lookup")),
+        Case("show me all my sunset photos", setOf("find_photos")) { args -> args["query"].toString().contains("sunset", ignoreCase = true) },
+        Case("find pictures of food I've eaten", setOf("find_photos")) { args -> args["query"].toString().contains("food", ignoreCase = true) },
+        Case("do I have any photos of the beach?", setOf("find_photos")) { args -> args["query"].toString().contains("beach", ignoreCase = true) },
+        Case("show the pics from the wedding", setOf("find_photos")),
+        Case("show me all the photos of me", setOf("find_photos")) { args -> args["person"].toString().lowercase() in setOf("me", "myself") },
+        // PhotoTools also takes a second person from the query, as the model sent it once.
+        Case("show me all the photos of me with shiyas", setOf("find_photos")) { args ->
+            "me" in args["person"].toString().lowercase() &&
+                "shiyas" in (args["person"].toString() + " " + args["query"].toString()).lowercase()
+        },
+        Case("show me all the photos of taslim", setOf("find_photos")) { args ->
+            args["person"].toString().lowercase().let { "taslim" in it || it == "me" }
+        },
+        // When photos were taken, in the user's words; PhotoTools also finds a date left in the query.
+        Case("show my photos from last December", setOf("find_photos")) { args ->
+            "december" in (args["when"].toString() + " " + args["query"].toString()).lowercase()
+        },
+        Case("beach photos from 2023", setOf("find_photos")) { args ->
+            "beach" in args["query"].toString().lowercase() && "2023" in (args["when"].toString() + " " + args["query"].toString())
+        },
+        Case("photos of me with shiyas this year", setOf("find_photos")) { args ->
+            "shiyas" in (args["person"].toString() + " " + args["query"].toString()).lowercase() &&
+                "this year" in (args["when"].toString() + " " + args["query"].toString()).lowercase()
+        },
+        // Where photos were taken: a town, state or country, in place rather than the query.
+        Case("show my photos from Munnar", setOf("find_photos")) { args -> "munnar" in args["place"].toString().lowercase() },
+        Case("beach photos in Goa", setOf("find_photos")) { args ->
+            "beach" in args["query"].toString().lowercase() && "goa" in args["place"].toString().lowercase()
+        },
+        Case("photos I took in Kerala last year", setOf("find_photos")) { args ->
+            "kerala" in args["place"].toString().lowercase() && "last year" in (args["when"].toString() + " " + args["query"].toString()).lowercase()
+        },
+        Case("what's the weather in Munnar this weekend?", setOf("web_lookup")),
+        // Videos are searched the same way; "video" in the query keeps to videos.
+        Case("show me my beach videos", setOf("find_photos")) { args -> args["query"].toString().lowercase().let { "beach" in it && "video" in it } },
+        Case("find the video of the birthday cake", setOf("find_photos")) { args -> args["query"].toString().lowercase().let { "cake" in it && "video" in it } },
+        Case("find videos of a sunset", setOf("find_photos")) { args -> args["query"].toString().lowercase().let { "sunset" in it && "video" in it } },
+        Case("show me my beach photos", setOf("find_photos")) { args -> args["query"].toString().lowercase().let { "beach" in it && "video" !in it } },
+        // Something written in their documents: found by photo search (the app reads the user's own
+        // question from the best photo, whether or not the model passes it on).
+        Case("what was my sslc score?", setOf("find_photos")) { args ->
+            "sslc" in (args["query"].toString() + " " + args["question"].toString()).lowercase()
+        },
+        Case("what's my driving licence number?", setOf("find_photos")) { args -> "licen" in args["query"].toString().lowercase() },
+        // Only seeing them: no question.
+        Case("show me my sslc certificate", setOf("find_photos")) { args -> "sslc" in args["query"].toString().lowercase() && args["question"] == null },
+        Case("get my aadhaar card", setOf("find_photos")) { args -> "aadhaar" in args["query"].toString().lowercase() && args["question"] == null },
+        // The user's own documents are photos on the phone, never something to look up online.
+        Case("fetch my driving license", setOf("find_photos")) { args -> "licen" in args["query"].toString().lowercase() },
+        Case("get my passport", setOf("find_photos")) { args -> "passport" in args["query"].toString().lowercase() },
+        Case("I need my aadhaar card", setOf("find_photos")) { args -> "aadhaar" in args["query"].toString().lowercase() },
+        Case("where is my PAN card?", setOf("find_photos")) { args -> "pan" in args["query"].toString().lowercase() },
+        Case("show my vehicle insurance", setOf("find_photos")) { args -> "insurance" in args["query"].toString().lowercase() },
+        Case("pull up my train ticket", setOf("find_photos")) { args -> "ticket" in args["query"].toString().lowercase() },
+        // And documents in general are not the user's: these still go online or get an answer.
+        Case("how do I renew a driving license in Kerala?", setOf(null, "web_lookup")),
+        Case("find photos of Amma at the beach", setOf("find_photos")) { args ->
+            args["person"].toString().contains("amma", ignoreCase = true) && args["query"].toString().contains("beach", ignoreCase = true)
+        },
+        Case("what does a sunset look like from space?", setOf(null)),
+        Case("how do I take a good photo of the moon?", setOf(null)),
+        Case("remind me to call amma at 6", setOf("add_task")),
+        Case("I should call my mom more often", setOf(null)),
+        Case("how do I set a timer on my phone?", setOf(null)),
+        Case("what is WhatsApp?", setOf(null)),
+        Case("my torch isn't working, what should I do?", setOf(null)),
+        Case("explain how a rainbow forms", setOf(null)),
+        Case("give me a recipe for dal tadka", setOf(null)),
+        // Files by name, read when asked about (not with "-e tools basic").
+        Case("find my resume pdf", setOf("read_file")) { args -> "resume" in args["name"].toString().lowercase() },
+        Case("summarise my rental agreement", setOf("read_file")) { args -> "rental" in args["name"].toString().lowercase() },
+        Case("what's the deposit in my rental agreement?", setOf("read_file")) { args -> "rental" in args["name"].toString().lowercase() },
+        Case("open my Bank folder", setOf("read_file")) { args -> "bank" in args["name"].toString().lowercase() },
+        Case("show the spreadsheets I downloaded last week", setOf("read_file")),
+        Case("how do I write a good resume?", setOf(null, "web_lookup")),
+        // Messages that came to the phone; sending one stays send_message.
+        Case("what did Rahul say about the trip?", setOf("check_inbox")) { args -> "rahul" in args["from"].toString().lowercase() },
+        Case("did the bank SMS me today?", setOf("check_inbox")),
+        Case("any messages from amma?", setOf("check_inbox")) { args -> "amma" in args["from"].toString().lowercase() },
+        Case("read me Priya's last message", setOf("check_inbox")) { args -> "priya" in args["from"].toString().lowercase() },
+        Case("text Rahul I'm late", setOf("send_message")),
+        Case("what did we talk about last week?", setOf("search_memory")),
+        Case("what's my PAN number?", setOf("find_photos")),
+    )
+
+    /**
+     * "-e tools main": the tools main has (health data, no files or messages); "-e tools basic":
+     * the earlier runs' (no health either), to compare with them. Every tool otherwise.
+     */
+    private val toolSet = InstrumentationRegistry.getArguments().getString("tools") ?: "all"
+    private val everyTool = toolSet == "all"
+    private val health = toolSet != "basic"
+    private val newTools = setOf(ToolCatalog.READ_FILE, ToolCatalog.CHECK_INBOX)
+
+    private fun instructions() = Instructions.render(
+        PERSONA, withTools = true, webSearch = true, photoSearch = true, healthData = health, fileSearch = everyTool, inbox = everyTool,
+    )
+
+    private fun declared() = ToolCatalog.declarations(web = true, photos = true, health = health, files = everyTool, inbox = everyTool)
+
+    @Before
+    fun onlyWhenAsked() {
+        assumeTrue("Loads the real model; run with -e eval true", InstrumentationRegistry.getArguments().getString("eval") == "true")
+    }
+
+    @OptIn(ExperimentalApi::class)
+    @Test
+    fun routing() {
+        val modelPath = requireNotNull(SettingsStore(context).modelPath) { "No model installed" }
+        ExperimentalFlags.enableSpeculativeDecoding = true
+        ExperimentalFlags.enableBenchmark = true
+        // "-e constrained true": tool calls decoded against their grammar, so they always parse.
+        val constrained = InstrumentationRegistry.getArguments().getString("constrained") == "true"
+        ExperimentalFlags.enableConversationConstrainedDecoding = constrained
+        report("constrainedDecoding", constrained)
+        Engine(
+            EngineConfig(
+                modelPath = modelPath,
+                backend = Backend.GPU(),
+                maxNumTokens = 8_192,
+                cacheDir = context.cacheDir.absolutePath,
+                // As the app declares it, for "-e voice": the requests spoken rather than typed.
+                audioBackend = Backend.CPU().takeIf { voiceDir() != null },
+            ),
+        ).apply { initialize() }.use { engine ->
+            measureDeclarations(engine)
+            // "-e temps 1.0" and "-e only <words>" narrow a run to check one fix quickly.
+            val temps = InstrumentationRegistry.getArguments().getString("temps")
+                ?.split(',')?.map { it.trim().toDouble() } ?: listOf(1.0, 0.7)
+            for (temperature in temps) evaluate(engine, temperature)
+        }
+    }
+
+    /** What the tool declarations really cost: the same prefix with and without them. */
+    private fun measureDeclarations(engine: Engine) {
+        val system = instructions()
+        fun count(withTools: Boolean): Int = engine.createConversation(
+            ConversationConfig(
+                systemInstruction = Contents.of(system),
+                tools = if (withTools) declarations() else emptyList(),
+                automaticToolCalling = false,
+                prefillPrefaceOnInit = true,
+            ),
+        ).use { it.getTokenCount() }
+        val without = count(false)
+        val with = count(true)
+        report("prefix.tokens.instructions", without)
+        report("prefix.tokens.toolDeclarations", with - without)
+        // "-e costs true": what each tool adds, its declaration and its rule, each left out in turn.
+        if (InstrumentationRegistry.getArguments().getString("costs") == "true") {
+            val all = declared()
+            for (json in all) {
+                val name = com.google.gson.JsonParser.parseString(json).asJsonObject.get("name").asString
+                val rest = engine.createConversation(
+                    ConversationConfig(
+                        systemInstruction = Contents.of(system),
+                        tools = (all - json).map(::toolOf),
+                        automaticToolCalling = false,
+                        prefillPrefaceOnInit = true,
+                    ),
+                ).use { it.getTokenCount() }
+                report("prefix.tokens.tool.$name", with - rest)
+            }
+            if (everyTool) {
+                val bare = Instructions.render(PERSONA, withTools = true, webSearch = true, photoSearch = true, healthData = true)
+                fun rules(system: String) = engine.createConversation(
+                    ConversationConfig(systemInstruction = Contents.of(system), automaticToolCalling = false, prefillPrefaceOnInit = true),
+                ).use { it.getTokenCount() }
+                report("prefix.tokens.rules.filesAndInbox", rules(system) - rules(bare))
+            }
+        }
+    }
+
+    private fun evaluate(engine: Engine, temperature: Double) {
+        // "-e profile Taslim": the user's name in the prompt, as the app puts it, which changes how
+        // the model reads "photos of <that name>".
+        val profile = InstrumentationRegistry.getArguments().getString("profile")
+        val system = instructions() +
+            (profile?.let { "\n\n${com.local.assistant.memory.core.CoreMemoryRenderer.HEADER}\nProfile: Name: $it" } ?: "")
+        val now = "[Now: ${DateTimeFormatter.ofPattern("EEE d MMM yyyy, HH:mm", Locale.ENGLISH).format(ZonedDateTime.now())}]"
+        var right = 0
+        var positivesRight = 0
+        var negativesRight = 0
+        val latencies = mutableListOf<Long>()
+
+        val only = InstrumentationRegistry.getArguments().getString("only")
+        val raw = InstrumentationRegistry.getArguments().getString("raw") == "true"
+        val repair = ToolCallRepair(declared())
+        // "-e samples 3" asks each three times, each with its own seed: the runtime's sampler is
+        // seeded (0 by default), so the same prompt with the same seed always gives the same reply.
+        val samples = InstrumentationRegistry.getArguments().getString("samples")?.toIntOrNull() ?: 1
+        // "-e voice <dir>": each request as a recording, <dir>/<case index>.wav under the app's
+        // external files, sent the way the app sends a voice message — the clip, then the
+        // bracketed lines, no typed words. Only cases with a clip run. (This is how the overlay's
+        // "answer briefly, it will be read aloud" line was caught: 22/32 actions called their
+        // tool with it, 32/32 without; the rest were "I've set an alarm" with no alarm set.)
+        val voice = voiceDir()
+        report("t$temperature.voice", voice?.name ?: "off")
+        fun clip(case: Case): File? = voice?.let { File(it, "${cases.indexOf(case)}.wav") }?.takeIf { it.isFile }
+        // "-e only '<words>|<other words>'": the cases whose request has any of them.
+        val selected = (if (only == null) cases else cases.filter { case -> only.split('|').any { it in case.prompt } })
+            .filter { voice == null || clip(it) != null }
+            .filter { everyTool || it.accept.none { tool -> tool in newTools } }
+            .flatMap { case -> List(samples) { seed -> case to seed } }
+        for ((case, seed) in selected) {
+            val conversation = engine.createConversation(
+                ConversationConfig(
+                    systemInstruction = Contents.of(system),
+                    tools = declarations(),
+                    automaticToolCalling = false,
+                    samplerConfig = SamplerConfig(topK = 64, topP = 0.95, temperature = temperature, seed = seed),
+                    prefillPrefaceOnInit = true,
+                    maxOutputToken = 160,
+                    // "-e raw true": tool calls land in a channel as the text the model wrote,
+                    // unparsed, to see what a call the runtime can't read looks like.
+                    channels = if (raw) listOf(Channel("call", "<|tool_call>", "<tool_call|>")) else null,
+                ),
+            )
+            val rawCalls = StringBuilder()
+            val started = SystemClock.elapsedRealtime()
+            var firstAt = 0L
+            // The whole response, not its first chunk: a model may say a few words before it calls.
+            val (call, text) = runCatching {
+                runBlocking {
+                    var firstCall: com.google.ai.edge.litertlm.ToolCall? = null
+                    val said = StringBuilder()
+                    val recording = clip(case)
+                    val text = listOfNotNull(now, case.prompt.takeIf { recording == null })
+                        .joinToString("\n")
+                    val message = if (recording != null) {
+                        Message.user(Contents.of(Content.AudioFile(recording.absolutePath), Content.Text(text)))
+                    } else {
+                        Message.user(Contents.of(text))
+                    }
+                    conversation.sendMessageAsync(message)
+                        .onEach { if (firstAt == 0L) firstAt = SystemClock.elapsedRealtime() }
+                        .collect { message ->
+                            message.channels["call"]?.let(rawCalls::append)
+                            if (firstCall == null) firstCall = message.toolCalls.firstOrNull()
+                            if (message.toolCalls.isEmpty()) said.append(message.toString())
+                        }
+                    firstCall to said.toString()
+                }
+            }.getOrElse { null to "failed: ${it.message}" }
+            conversation.close()
+            latencies += (if (firstAt > 0) firstAt else SystemClock.elapsedRealtime()) - started
+
+            if (raw) report("raw ${case.prompt}", rawCalls.toString().ifEmpty { "(no channel text) said: $text" })
+            // What the app does with a call the runtime rejected: an action that only slipped in
+            // its format is repaired and carried out (ToolLoop); anything else is a miss.
+            val repaired = if (call == null && "Failed to parse tool calls" in text) {
+                repair.repair(text)?.takeIf { it.name in ToolCatalog.WRITES || it.name in ToolCatalog.DEVICE_ACTIONS }
+            } else {
+                null
+            }
+            val routedTo = call?.name ?: repaired?.name
+            val arguments = call?.arguments ?: repaired?.arguments
+            val argsOk = arguments == null || case.check == null || case.check.invoke(arguments)
+            val correct = routedTo in case.accept && argsOk
+            if (correct) right++
+            if (null in case.accept && case.accept.size == 1) { if (correct) negativesRight++ } else if (correct) positivesRight++
+            report(
+                "t$temperature ${if (correct) "OK  " else "MISS"} ${case.prompt}",
+                (if (repaired != null) "REPAIRED " else "") +
+                    (routedTo?.let { "$it($arguments)" } ?: "no call: ${text.take(200).replace('\n', ' ')}"),
+            )
+        }
+
+        val negatives = selected.count { (case, _) -> null in case.accept && case.accept.size == 1 }
+        report("t$temperature.accuracy", "$right/${selected.size}")
+        report("t$temperature.positives", "$positivesRight/${selected.size - negatives}")
+        report("t$temperature.negatives", "$negativesRight/$negatives")
+        report("t$temperature.firstEventMs.median", latencies.sorted()[latencies.size / 2])
+        report("t$temperature.firstEventMs.p90", latencies.sorted()[(latencies.size * 9) / 10])
+    }
+
+    private fun voiceDir(): File? = InstrumentationRegistry.getArguments().getString("voice")
+        ?.let { File(context.getExternalFilesDir(null), it) }
+
+    private fun declarations() = declared().map(::toolOf)
+
+    private fun toolOf(json: String) = tool(object : OpenApiTool {
+        override fun getToolDescriptionJsonString() = json
+        override fun execute(paramsJsonString: String): String = error("manual")
+    })
+
+    private fun report(key: String, value: Any) {
+        Log.i(TAG, "$key = $value")
+        out.appendText("$key = $value\n")
+    }
+
+    private companion object {
+        const val TAG = "RoutingEval"
+        const val PERSONA = com.local.assistant.data.prefs.SettingsStore.DEFAULT_SYSTEM_PROMPT
+    }
+}

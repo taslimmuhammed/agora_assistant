@@ -1,0 +1,1381 @@
+package com.local.assistant.memory.tools
+
+import android.util.Log
+import com.google.gson.Gson
+import com.local.assistant.llm.ToolCall
+import com.local.assistant.memory.core.FactDecision
+import com.local.assistant.memory.core.FactKeys
+import com.local.assistant.memory.core.FactLabels
+import com.local.assistant.memory.db.EventEntity
+import com.local.assistant.memory.db.FactEntity
+import com.local.assistant.memory.db.FactOrigin
+import com.local.assistant.memory.db.MemoryStore
+import com.local.assistant.location.DistanceWords
+import com.local.assistant.location.GeoPoint
+import com.local.assistant.location.PlaceFinder
+import com.local.assistant.location.PlaceFinding
+import com.local.assistant.location.PlaceWords
+import com.local.assistant.memory.db.TaskEntity
+import com.local.assistant.memory.db.PlaceDistance
+import com.local.assistant.memory.db.TaskPlace
+import com.local.assistant.memory.db.TaskStatus
+import com.local.assistant.reminders.PlaceAlerts
+import com.local.assistant.memory.db.NoteKind
+import com.local.assistant.memory.db.UserNoteEntity
+import com.local.assistant.memory.notes.FoundImage
+import com.local.assistant.memory.notes.ImageNotes
+import com.local.assistant.memory.notes.NoteEdits
+import com.local.assistant.memory.notes.NoteMatch
+import com.local.assistant.memory.notes.NoteStore
+import com.local.assistant.voice.SpokenCommands
+import com.local.assistant.privacy.LogText
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import java.time.DayOfWeek
+import java.time.Instant
+import java.time.LocalTime
+import java.time.ZonedDateTime
+import java.time.format.DateTimeFormatter
+import java.time.format.TextStyle
+import java.util.Locale
+import kotlin.math.roundToInt
+
+/**
+ * Runs the model's tool calls against the memory store.
+ *
+ * Each call is validated, deduplicated (the same call within [dedupeWindowMs] returns what the
+ * first one did — models do repeat themselves), applied in one transaction together with its
+ * TOOL row, and answered with a compact JSON result: `{"ok":true,"id":42,"due":"Tue 22 Sep 11:00"}`.
+ * Arguments the app cannot use come back as `{"ok":false,"error":"…"}` so the model asks the user
+ * rather than guessing.
+ *
+ * Everything that changed is recorded with enough to undo it, and anything worth showing comes
+ * back as a chip for under the reply.
+ */
+class ToolExecutor(
+    private val store: MemoryStore,
+    private val reminders: ReminderScheduler,
+    private val alarms: SystemAlarms,
+    private val log: ToolLog,
+    private val now: () -> ZonedDateTime,
+    private val resolver: WhenResolver = WhenResolver(),
+    private val defaults: WhenDefaults = WhenDefaults(),
+    private val dedupeWindowMs: Long = DEDUPE_WINDOW_MS,
+    /** Past conversations, for search_memory; nothing when the archive is not wired in. */
+    private val archive: ArchiveSearch = ArchiveSearch { _, _ -> emptyList() },
+    /** Memory is paused: nothing new is saved about the user until it is turned back on. */
+    private val memoryPaused: () -> Boolean = { false },
+    /** Images kept for remember_image; none when not wired in. */
+    private val images: ImageNotes = NoImageNotes,
+    /**
+     * remember_image saved a note with the details the model wrote in its call — past token
+     * 2,048, where it mis-copies digits — so the image is to be read again once the turn is over.
+     */
+    private val onImageSaved: (noteId: Long, userText: String) -> Unit = { _, _ -> },
+    /** Calls, messages, timers, apps, phone settings and arithmetic; none when not wired in. */
+    private val device: DeviceTools? = null,
+    /** web_search; none when not wired in. */
+    private val web: WebTools? = null,
+    /** find_photos; none when not wired in. */
+    private val photos: com.local.assistant.gallery.PhotoTools? = null,
+    /** health_data; none when not wired in. */
+    private val health: com.local.assistant.health.HealthTools? = null,
+    /** Where place reminders ring ("near DMart"); none when not wired in. */
+    private val places: PlaceFinder? = null,
+    /** The user's notes and lists, for edit_note; none when not wired in. */
+    private val notes: NoteStore = NoNotes,
+    /** read_file: files on the phone by name, read when asked about; null without All files access wired. */
+    private val files: com.local.assistant.files.FileTools? = null,
+    /** check_inbox: messages that came to the phone; null when not wired in. */
+    private val inbox: com.local.assistant.inbox.InboxTools? = null,
+) {
+
+    data class Outcome(
+        /** The JSON the model gets back. */
+        val result: String,
+        val ok: Boolean,
+        /** The TOOL row this call was recorded in. */
+        val recordId: Long?,
+        val chip: MemoryChip?,
+        /** Whether the system prefix (core memory, agenda) now renders differently. */
+        val changedPrefix: Boolean,
+        /** A picture that goes back with [result] for the model to look at. */
+        val image: String? = null,
+        /** The reply itself, written by the tool; the turn ends with it ([ActionResult.reply]). */
+        val reply: String? = null,
+        /** What a call or message got ready for the user to send ([ActionResult.ready]). */
+        val ready: String? = null,
+    )
+
+    enum class UndoResult { UNDONE, ALREADY_UNDONE, CHANGED_SINCE, NOT_UNDOABLE }
+
+    private sealed interface AlarmChange {
+        data class Schedule(val taskId: Long, val dueAt: Long) : AlarmChange
+        data class SchedulePlace(val taskId: Long, val place: TaskPlace) : AlarmChange
+        data class Cancel(val taskId: Long) : AlarmChange
+        data class ScheduleEvent(val eventId: Long, val alert: EventTimes.Alert) : AlarmChange
+        data class CancelEvent(val eventId: Long) : AlarmChange
+    }
+
+    private data class Applied(
+        val result: Map<String, Any?>,
+        val chip: MemoryChip? = null,
+        val undo: UndoToken? = null,
+        val changedPrefix: Boolean = false,
+        val alarms: List<AlarmChange> = emptyList(),
+        val image: String? = null,
+        val reply: String? = null,
+        val ready: String? = null,
+    )
+
+    private val recentMutex = Mutex()
+
+    /** Recent successful calls: when each stops counting as a repeat, and what it returned. */
+    private val recent = LinkedHashMap<String, Pair<Long, Outcome>>()
+
+    /**
+     * Photos found for the message itself ([mediaIds], best first), kept in a TOOL row of their
+     * own ([ToolCatalog.RELATED_PHOTOS]) so they show under the reply like a photo search's. The
+     * row's id and its chip.
+     */
+    suspend fun showRelatedPhotos(chatId: Long, mediaIds: List<Long>): Pair<Long, MemoryChip> {
+        val chip = MemoryChip(MemoryChip.Kind.PHOTOS, "Photos", RELATED_TITLE, photos = PhotoSet(RELATED_TITLE, mediaIds))
+        val id = log.record(chatId, ToolRecord(ToolCatalog.RELATED_PHOTOS, emptyMap(), gson.toJson(ok("shown" to mediaIds.size)), chip))
+        return id to chip
+    }
+
+    suspend fun execute(model: ToolCall, context: ToolContext): Outcome {
+        val call = if (context.heard) model else grounded(model, listOf(context.userText, context.documentNotes).filter { it.isNotBlank() }.joinToString("\n"))
+        if (call != model) Log.i(TAG, "Numbers or names in ${model.name} taken from the user's words: ${LogText.of(model.arguments)} -> ${LogText.of(call.arguments)}")
+        val nowMs = nowMs()
+        val key = dedupeKey(call)
+        recentMutex.withLock {
+            recent.entries.removeAll { nowMs >= it.value.first }
+            recent[key]?.let { (_, first) -> return first.copy(chip = null, changedPrefix = false) }
+        }
+
+        fun recordOf(applied: Applied) = ToolRecord(call.name, call.arguments, gson.toJson(applied.result), applied.chip, applied.undo)
+
+        val (applied, recordId) = if (call.name in ToolCatalog.OUTSIDE_MEMORY) {
+            // Outside the transaction: finding a contact can wait on the user's answer to a
+            // permission dialog, a search on the network, and none of these write to memory.
+            val applied = try {
+                device(call, context)
+            } catch (e: ToolError) {
+                Applied(failure(e.message.orEmpty()))
+            }
+            applied to log.record(context.chatId, recordOf(applied))
+        } else {
+            // A reminder's place is found first, outside the transaction: finding it can wait on
+            // a location permission dialog and a map search.
+            val found = try {
+                Result.success(placeFor(call, context))
+            } catch (e: ToolError) {
+                Result.failure(e)
+            }
+            store.transaction {
+                val applied = try {
+                    dispatch(call, context, found.getOrThrow())
+                } catch (e: ToolError) {
+                    Applied(failure(e.message.orEmpty()))
+                }
+                applied to log.record(context.chatId, recordOf(applied))
+            }
+        }
+        applied.alarms.forEach(::applyAlarm)
+
+        val ok = applied.result["ok"] == true
+        val outcome = Outcome(gson.toJson(applied.result), ok, recordId, applied.chip, applied.changedPrefix, applied.image, applied.reply, applied.ready)
+        val window = when (call.name) {
+            in ToolCatalog.WRITES -> dedupeWindowMs
+            // A model that repeats itself within a turn must not open the dialer twice, but
+            // "call her again" a minute later is a real request.
+            in ToolCatalog.DEVICE_ACTIONS, ToolCatalog.WEB_SEARCH -> DEVICE_DEDUPE_WINDOW_MS
+            else -> 0L
+        }
+        if (ok && window > 0) recentMutex.withLock { recent[key] = (nowMs + window) to outcome }
+        return outcome
+    }
+
+    /**
+     * The call with every number the model mis-copied from the user's message put back (see
+     * [NumberGrounding]). What an image showed is left alone: its numbers were never the user's.
+     */
+    private fun grounded(call: ToolCall, userText: String): ToolCall {
+        if (userText.isBlank() || call.name == ToolCatalog.REMEMBER_IMAGE) return call
+        val arguments = call.arguments.mapValues { (key, value) ->
+            when {
+                value !is String -> value
+                call.name == ToolCatalog.CALCULATE && key == "expression" -> NumberGrounding.groundExpression(value, userText)
+                // "list 3" is the id from "Notes and lists:", not a number the user said.
+                call.name == ToolCatalog.EDIT_NOTE && key == "note" -> value
+                // A file's name as the earlier result listed it ("Invoice_10234"), not the user's numbers.
+                call.name == ToolCatalog.READ_FILE && key == "name" -> value
+                // Who to call or message: a name spelled as the user spelled it.
+                call.name == ToolCatalog.CALL && key == "who" || call.name == ToolCatalog.SEND_MESSAGE && key == "to" ->
+                    ContactMatcher.asSaid(NumberGrounding.ground(value, userText), userText)
+                else -> NumberGrounding.ground(value, userText)
+            }
+        }
+        return if (arguments == call.arguments) call else call.copy(arguments = arguments)
+    }
+
+    private suspend fun device(call: ToolCall, context: ToolContext): Applied {
+        val userText = context.userText
+        val args = Args(call.arguments)
+        if (call.name == ToolCatalog.WEB_SEARCH) {
+            // Health data stays on the phone: a search with a reading just read out would send it off.
+            if (health?.inQuery(args.text("query").orEmpty()) == true) {
+                throw ToolError("That search has the user's health readings in it, and those stay on this phone. Search without their numbers (\"normal resting heart rate\"), or answer from what you know.")
+            }
+            val done = (web ?: throw ToolError("Web search isn't set up.")).search(args)
+            return Applied(done.result, done.chip)
+        }
+        if (call.name == ToolCatalog.HEALTH) {
+            val done = (health ?: throw ToolError("Health data isn't available in this app.")).read(args.text("metric"), args.text("when"))
+            return Applied(done.result, done.chip)
+        }
+        if (call.name == ToolCatalog.FIND_PHOTOS) {
+            // What to read is the user's own question when they asked one: the model passed it
+            // only some of the time ("what is my driving licence number?" came with only query
+            // driving licence), and reworded it at others ("what was my plus two score?" came as
+            // "what was my SSLC score", and was answered with the SSLC marks).
+            val question = com.local.assistant.gallery.PhotoTools.questionIn(userText) ?: args.text("question")
+            val done = (photos ?: throw ToolError("Photo search isn't set up."))
+                .find(args.text("query"), args.text("person"), args.text("when"), args.text("place"), question)
+            val result = if (userText.isBlank()) withRemembered(done.result, args) else done.result
+            return Applied(result, done.chip, image = done.image, reply = done.reply)
+        }
+        if (call.name == ToolCatalog.READ_FILE) {
+            val files = files ?: throw ToolError("Finding files isn't available in this app.")
+            // A document attached to the message, read by the app ([ToolLoop.readAttached]).
+            val document = context.document
+            if (document != null && call.arguments[ATTACHED] == true) {
+                val done = if (call.arguments[NOTES_FOR] != null) {
+                    files.notesOnAttached(document, args.text(NOTES_FOR).orEmpty())
+                } else {
+                    files.readAttached(document, args.text("question"), context.onStep)
+                }
+                return Applied(done.result, done.chip, reply = done.reply)
+            }
+            // As for photos: the user's own question when they asked one, the model's otherwise.
+            val question = com.local.assistant.files.FileTools.questionIn(userText) ?: args.text("question")
+            val done = files.read(args.text("name"), args.text("type"), args.text("when"), question, context.onStep, context.chatId)
+            return Applied(done.result, done.chip, reply = done.reply)
+        }
+        if (call.name == ToolCatalog.CHECK_INBOX) {
+            val done = (inbox ?: throw ToolError("Messages aren't kept in this app."))
+                .check(args.text("query"), args.text("from"), args.text("app"), args.text("when"))
+            return Applied(done.result, done.chip)
+        }
+        val tools = device ?: throw ToolError("That isn't available in this app.")
+        val done = when (call.name) {
+            ToolCatalog.CALL -> tools.call(args)
+            ToolCatalog.SEND_MESSAGE -> tools.sendMessage(args, context.screen)
+            ToolCatalog.TAKE_SCREENSHOT -> tools.takeScreenshot(context.screen)
+            ToolCatalog.SET_TIMER -> tools.setTimer(args)
+            ToolCatalog.OPEN_APP -> tools.openApp(args)
+            ToolCatalog.PHONE_SETTING -> tools.phoneSetting(args)
+            ToolCatalog.CALCULATE -> tools.calculate(args)
+            else -> throw ToolError("There is no tool called ${call.name}.")
+        }
+        return Applied(done.result, done.chip, ready = done.ready)
+    }
+
+    private suspend fun dispatch(call: ToolCall, context: ToolContext, place: PlaceFinding?): Applied {
+        val args = Args(call.arguments)
+        return when (call.name) {
+            ToolCatalog.ADD_TASK -> addTask(args, context, place)
+            ToolCatalog.UPDATE_TASK -> updateTask(args)
+            ToolCatalog.ADD_EVENT -> addEvent(args, context)
+            ToolCatalog.SAVE_FACT -> if (memoryPaused()) {
+                throw ToolError("Memory is paused, so nothing was saved. Tell the user; they can turn memory back on in 'What I know about you'.")
+            } else {
+                saveFact(args, context)
+            }
+            ToolCatalog.GET_UPCOMING -> getUpcoming(args)
+            ToolCatalog.SEARCH_MEMORY -> searchMemory(args)
+            ToolCatalog.FORGET -> forget(args)
+            ToolCatalog.SET_ALARM -> if (place != null) placeAlarm(args, context, place) else setAlarm(args, context.userText)
+            ToolCatalog.REMEMBER_IMAGE -> if (memoryPaused()) {
+                throw ToolError("Memory is paused, so nothing was saved. Tell the user; they can turn memory back on in 'What I know about you'.")
+            } else {
+                rememberImage(args, context)
+            }
+            // Not stopped by a pause: like a reminder, a note is something the user asked to have kept.
+            ToolCatalog.EDIT_NOTE -> editNote(args, context)
+            else -> throw ToolError("There is no tool called ${call.name}.")
+        }
+    }
+
+    // ---- Tasks ----
+
+    /**
+     * Where an add_task with a place rings, or a set_alarm on arriving somewhere, found before its
+     * transaction; null for any other call. A place the user never said is the model's own idea
+     * ("call the office at 5" names a place but is a reminder at 5), so the reminder is made as if
+     * it hadn't been given.
+     */
+    private suspend fun placeFor(call: ToolCall, context: ToolContext): PlaceFinding? {
+        val args = Args(call.arguments)
+        val said = when (call.name) {
+            ToolCatalog.ADD_TASK -> args.text("place")
+            // "Set alarm when I reach avilora" came as when (8 Nov 2026): the clock app only knows
+            // times, so an alarm on arriving rings from here, as a place reminder does.
+            ToolCatalog.SET_ALARM -> args.text("place") ?: args.text("when")?.takeIf(PlaceWords::isArrival)
+            else -> null
+        } ?: return null
+        if (!context.heard && !PlaceWords.mentioned(said, context.userText)) {
+            Log.i(TAG, "Place '${LogText.of(said)}' isn't in the user's words; made without it")
+            return null
+        }
+        val finder = places ?: throw ToolError("Place reminders aren't available in this app. Offer a reminder at a time instead.")
+        return finder.find(said, context.locked)
+    }
+
+    private suspend fun addTask(args: Args, context: ToolContext, place: PlaceFinding?): Applied {
+        val title = unborrowed(tidyTitle(args.required("title")), context)
+        // Arriving is when it rings: a time given with it is dropped. An alarm there is one of
+        // these, as a place reminder rings as an alarm: "set alarm when I reach avilora" came as
+        // add_task titled "set alarm" (8 Nov 2026), and was sent on to set_alarm, which had no place.
+        if (place != null) {
+            val alarm = title.lowercase(Locale.ROOT) in ALARM_TITLES || SpokenCommands.isGarbledCommand(title)
+            return addPlaceTask(if (alarm) "" else title, args.text("place"), context, place, alarm)
+        }
+        // "Sarlamat 4:30 p.m. today" made a reminder named "Sarlamat" (2 Nov 2026): it was an alarm.
+        if (SpokenCommands.isGarbledCommand(title) && alarms.available()) {
+            throw ToolError("'$title' is \"set alarm\" misheard: the user asked for an alarm. Call set_alarm with the same time, and no label.")
+        }
+        val rule = args.text("repeat")?.let { RepeatRule.parse(it) ?: throw ToolError("I couldn't understand repeat '$it'. Ask how often.") }
+        val now = now()
+        val due: ZonedDateTime? = when (val whenText = args.text("when")) {
+            null -> rule?.let { firstOccurrence(it, now) }
+            else -> future(whenText, now).at
+        }
+        // No name of its own, as the user may give none: a reminder at a time is "Reminder".
+        val name = title.ifEmpty { if (due != null) REMINDER else throw ToolError("What should it remind the user of? Ask them.") }
+
+        val nowMs = nowMs()
+        val id = store.insertTask(
+            TaskEntity(
+                title = name,
+                dueAt = due?.millis(),
+                repeatRule = rule?.toRrule(),
+                sourceMessageId = context.userMessageId,
+                createdAt = nowMs,
+                updatedAt = nowMs,
+            ),
+        )
+        return Applied(
+            result = ok("id" to id, "due" to due?.let(::modelTime), "repeats" to rule?.let { true }),
+            chip = MemoryChip(
+                kind = MemoryChip.Kind.TASK,
+                label = if (due != null) REMINDER else "To-do",
+                detail = name.takeUnless { it == REMINDER }.orEmpty(),
+                at = due?.millis(),
+                note = lateNote(due != null),
+                editable = true,
+            ),
+            undo = UndoToken(createdTaskId = id),
+            changedPrefix = true,
+            alarms = listOfNotNull(due?.let { AlarmChange.Schedule(id, it.millis()) }),
+        )
+    }
+
+    /**
+     * A reminder that rings on arriving at [found]'s place: "buy milk" near the nearest DMarts. Or
+     * further out, when a distance was said ("5 km before I reach Munnar"): in the model's title or
+     * [placeSaid], or in the user's own words. Not in the recogniser's words for a message the
+     * model heard: a number in them may be misheard ([ToolContext.heard]). An [alarm] is the same,
+     * named "Alarm" rather than "Reminder" when the user gave it no name.
+     */
+    private suspend fun addPlaceTask(title: String, placeSaid: String?, context: ToolContext, found: PlaceFinding, alarm: Boolean = false): Applied {
+        // Android watches at most MAX_FENCES places per app, across every place reminder.
+        val watched = store.openTasks().sumOf { it.place?.spots?.size ?: 0 }
+        val room = PlaceAlerts.MAX_FENCES - watched
+        if (room <= 0) {
+            throw ToolError("Android lets an app watch at most ${PlaceAlerts.MAX_FENCES} places at once, and place reminders use them all. Nothing was saved. Ask the user to finish or cancel one first.")
+        }
+        val reach = (DistanceWords.find(title) ?: DistanceWords.find(placeSaid) ?: DistanceWords.find(context.userText.takeUnless { context.heard }))?.distance
+        if (reach != null && reach.metres > PlaceDistance.MAX_M) {
+            throw ToolError("A place reminder can ring at most ${PlaceDistance.MAX_M / 1000} km before a place. Nothing was saved. Ask the user for a shorter distance.")
+        }
+        val spots = found.place.spots.take(room).map { spot -> reach?.let { spot.copy(radiusM = it.radiusFor(spot.radiusM)) } ?: spot }
+        val place = found.place.copy(spots = spots, distance = reach)
+        // "Reminder before 5 kilometer" says only where: it is named for it, not for the distance
+        // again, which the chip and the agenda show beside it. With no distance either, it is
+        // only a reminder, or an alarm.
+        val words = tidyTitle(DistanceWords.remove(title))
+        val label = if (alarm) ALARM else REMINDER
+        val name = when {
+            words.lowercase(Locale.ROOT) !in BARE_TITLES -> words
+            reach == null -> label
+            reach.beforeArriving -> "Almost at ${place.name}"
+            else -> "Near ${place.name}"
+        }
+        val nowMs = nowMs()
+        val id = store.insertTask(
+            TaskEntity(title = name, sourceMessageId = context.userMessageId, createdAt = nowMs, updatedAt = nowMs, place = place),
+        )
+        val count = place.spots.size
+        val nearest = found.nearestM?.let(::distance)
+        // A fence entered, not one already inside, rings: from inside it waits for the next time.
+        val inside = found.here?.let { here -> spots.any { GeoPoint(it.lat, it.lon).metresTo(here) <= it.radiusM } } == true
+        return Applied(
+            result = ok(
+                "id" to id,
+                "rings" to when {
+                    reach == null -> "when the user gets near ${place.name}"
+                    reach.beforeArriving -> "when the user is ${reach.words()} away from reaching ${place.name}"
+                    else -> "when the user comes within ${reach.words()} of ${place.name}"
+                } + if (count > 1) " (any of the $count nearest)" else "",
+                "nearest" to nearest,
+                "note" to when {
+                    !found.canRing -> CANT_RING
+                    inside -> ALREADY_INSIDE
+                    else -> null
+                },
+            ),
+            chip = MemoryChip(
+                kind = MemoryChip.Kind.TASK,
+                label = label,
+                detail = name.takeUnless { it == label }.orEmpty(),
+                note = when {
+                    !found.canRing -> "Rings once location is allowed all the time"
+                    inside -> "You're already there: rings the next time you arrive"
+                    count > 1 -> "Any of the $count nearest" + nearest?.let { ", closest $it" }.orEmpty()
+                    else -> place.spots.single().label?.takeUnless { it == place.name }
+                },
+                place = place.where(),
+            ),
+            undo = UndoToken(createdTaskId = id),
+            changedPrefix = true,
+            alarms = listOf(AlarmChange.SchedulePlace(id, place)),
+        )
+    }
+
+    private suspend fun updateTask(args: Args): Applied {
+        val statusText = args.text("status")
+        val whenText = args.text("when")
+        if (statusText == null && whenText == null) throw ToolError("Say what to change: status or when.")
+        val task = findTask(args.required("task"))
+        val status = statusText?.let(::parseStatus)
+        val now = now()
+        val nowMs = nowMs()
+
+        var updated = task.copy(updatedAt = nowMs)
+        var label = "Updated"
+        if (whenText != null) {
+            val resolved = resolver.resolve(whenText, now) ?: throw ToolError("I couldn't understand the time '$whenText'. Ask the user when.")
+            // "Move it to 3" keeps the reminder's own day.
+            val current = task.dueAt?.let { Instant.ofEpochMilli(it).atZone(now.zone) }
+            val at = if (!resolved.daySaid && current != null) {
+                current.toLocalDate().atTime(resolved.at.toLocalTime()).atZone(now.zone)
+            } else {
+                resolved.at
+            }
+            if (!at.isAfter(now)) throw ToolError("'$whenText' has already passed. Ask for a later time.")
+            // A place reminder given a time rings at that time instead.
+            updated = updated.copy(dueAt = at.millis(), status = TaskStatus.OPEN, completedAt = null, place = null)
+            label = "Moved"
+        }
+        when (status) {
+            TaskStatus.DONE -> {
+                updated = TaskOps.complete(updated, now)
+                label = if (updated.status == TaskStatus.OPEN) "Done, next one set" else "Done"
+            }
+            TaskStatus.CANCELLED -> {
+                updated = updated.copy(status = TaskStatus.CANCELLED)
+                label = "Cancelled"
+            }
+            TaskStatus.OPEN -> if (task.status != TaskStatus.OPEN) {
+                updated = updated.copy(status = TaskStatus.OPEN, completedAt = null)
+                label = "Reopened"
+            }
+            null -> Unit
+        }
+        store.updateTask(updated)
+
+        val live = updated.status == TaskStatus.OPEN && updated.dueAt != null && updated.dueAt > nowMs
+        val place = updated.place.takeIf { updated.status == TaskStatus.OPEN }
+        return Applied(
+            result = ok(
+                "id" to task.id,
+                "status" to updated.status.name.lowercase(Locale.ROOT),
+                "due" to updated.dueAt?.let { modelTime(it.atZone(now)) },
+            ),
+            chip = MemoryChip(
+                kind = MemoryChip.Kind.TASK,
+                label = label,
+                detail = task.title,
+                at = updated.dueAt.takeIf { updated.status == TaskStatus.OPEN },
+                note = lateNote(live),
+                editable = updated.status == TaskStatus.OPEN && place == null,
+                place = place?.where(),
+            ),
+            undo = UndoToken(previousTask = task),
+            changedPrefix = true,
+            alarms = listOf(
+                when {
+                    live -> AlarmChange.Schedule(task.id, updated.dueAt!!)
+                    place != null -> AlarmChange.SchedulePlace(task.id, place)
+                    else -> AlarmChange.Cancel(task.id)
+                },
+            ),
+        )
+    }
+
+    /** A task by id ("42", "#42", "task 42") or by words from its title. */
+    private suspend fun findTask(reference: String): TaskEntity {
+        ID_REFERENCE.matchEntire(reference.trim().lowercase(Locale.ROOT))?.let { match ->
+            val id = match.groupValues[1].toLong()
+            return store.task(id) ?: throw ToolError("There is no reminder #$id.")
+        }
+        val words = significantWords(reference)
+        if (words.isEmpty()) throw ToolError("Which reminder? Use its id or words from its title.")
+
+        fun score(task: TaskEntity): Int {
+            val title = task.title.lowercase(Locale.ROOT)
+            return words.count { it in title }
+        }
+        val open = store.openTasks().map { it to score(it) }.filter { it.second > 0 }
+        val candidates = open.ifEmpty {
+            // Reopening a finished one: look beyond the open list.
+            words.flatMap { store.tasksMentioning(it, 5) }.distinctBy { it.id }.map { it to score(it) }
+        }
+        val best = candidates.maxOfOrNull { it.second } ?: throw ToolError("I couldn't find a reminder matching '$reference'.")
+        val top = candidates.filter { it.second == best }.map { it.first }
+        if (top.size > 1) {
+            val choices = top.take(3).joinToString("; ") { "#${it.id} ${it.title}" }
+            throw ToolError("More than one reminder matches: $choices. Ask which one.")
+        }
+        return top.single()
+    }
+
+    private fun parseStatus(text: String): TaskStatus = when (text.trim().lowercase(Locale.ROOT)) {
+        "done", "complete", "completed", "finished", "finish", "did it" -> TaskStatus.DONE
+        "cancelled", "canceled", "cancel", "delete", "deleted", "remove", "removed", "drop" -> TaskStatus.CANCELLED
+        "open", "reopen", "reopened", "pending", "undone", "not done" -> TaskStatus.OPEN
+        else -> throw ToolError("status must be done, cancelled or open.")
+    }
+
+    // ---- Events ----
+
+    private suspend fun addEvent(args: Args, context: ToolContext): Applied {
+        val title = tidyTitle(args.required("title"))
+        val whenText = args.required("when")
+        val now = now()
+        val start = resolver.resolve(whenText, now) ?: throw ToolError("I couldn't understand the time '$whenText'. Ask the user when.")
+        val allDay = start.dateOnly
+        val startsAt = if (allDay) start.at.toLocalDate().atStartOfDay(now.zone) else start.at
+        val stillAhead = if (allDay) !start.at.toLocalDate().isBefore(now.toLocalDate()) else start.at.isAfter(now)
+        if (!stillAhead) throw ToolError("'$whenText' has already passed. Ask for the right date.")
+
+        val endsAt = args.text("ends")?.let { endsText ->
+            val end = resolver.resolve(endsText, now) ?: throw ToolError("I couldn't understand the end time '$endsText'.")
+            val at = if (!end.daySaid) startsAt.toLocalDate().atTime(end.at.toLocalTime()).atZone(now.zone) else end.at
+            if (!at.isAfter(startsAt)) throw ToolError("The end has to be after the start.")
+            at
+        }
+        val rule = args.text("repeat")?.let { RepeatRule.parse(it) ?: throw ToolError("I couldn't understand repeat '$it'.") }
+
+        val nowMs = nowMs()
+        val event = EventEntity(
+            title = title,
+            startsAt = startsAt.millis(),
+            endsAt = endsAt?.millis(),
+            allDay = allDay,
+            recurrence = rule?.toRrule(),
+            notes = args.text("notes"),
+            sourceMessageId = context.userMessageId,
+            createdAt = nowMs,
+            updatedAt = nowMs,
+        )
+        val id = store.insertEvent(event)
+        val alert = alertFor(event.copy(id = id))
+        return Applied(
+            result = ok(
+                "id" to id,
+                "starts" to if (allDay) modelDate(startsAt) else modelTime(startsAt),
+                "ends" to endsAt?.let(::modelTime),
+                "repeats" to rule?.let { true },
+            ),
+            chip = MemoryChip(
+                MemoryChip.Kind.EVENT,
+                "Event",
+                title,
+                startsAt.millis(),
+                allDay = allDay,
+                note = lateNote(alert != null),
+                editable = true,
+            ),
+            undo = UndoToken(createdEventId = id),
+            changedPrefix = true,
+            alarms = listOfNotNull(alert?.let { AlarmChange.ScheduleEvent(id, it) }),
+        )
+    }
+
+    // ---- Clock alarms ----
+
+    /**
+     * An alarm in the phone's clock app. The clock app only knows times of day: an alarm rings
+     * the next time its time comes round, or repeats on days of the week. So anything further
+     * off than a day, or repeating some other way, is refused — the model can offer a reminder.
+     */
+    private fun setAlarm(args: Args, userText: String): Applied {
+        if (!alarms.available()) throw ToolError("This phone's clock app doesn't accept alarms from other apps. Offer a reminder instead.")
+        val whenText = args.required("when")
+        val now = now()
+        val resolved = resolver.resolve(whenText, now, soonestBareHour = true)
+            ?: throw ToolError("I couldn't understand the time '$whenText'. Ask the user when.")
+        if (resolved.dateOnly) throw ToolError("What time should the alarm ring? Ask the user.")
+
+        val days = args.text("repeat")?.let { text ->
+            val rule = RepeatRule.parse(text) ?: throw ToolError("I couldn't understand repeat '$text'.")
+            when {
+                rule.freq == RepeatRule.Freq.DAILY && rule.interval == 1 -> DayOfWeek.entries.toSet()
+                rule.freq == RepeatRule.Freq.WEEKLY && rule.interval == 1 && rule.byDay.isNotEmpty() -> rule.byDay
+                else -> throw ToolError("Clock alarms can only repeat daily or on days of the week.")
+            }
+        }.orEmpty()
+
+        val at = resolved.at
+        if (days.isEmpty()) {
+            if (!at.isAfter(now)) throw ToolError("'$whenText' has already passed. Ask for a later time.")
+            if (at.isAfter(now.plusDays(1))) {
+                throw ToolError("The clock app can only set a one-off alarm for the next 24 hours. Offer a reminder for that day instead.")
+            }
+        }
+        val label = args.text("label")?.let(::alarmName)?.takeIf { saidIn(it, userText) }
+        // The clock app can't rename an alarm, nor remove one, for another app (seen on the test
+        // phone's OnePlus Clock: DISMISS_ALARM ignored, a new name set a second alarm beside the
+        // first, both on). A new name for one just set goes to the clock app, opened for it.
+        val next = if (days.isEmpty()) at else nextOn(days, at, now)
+        val key = ClockAlarm(at.hour, at.minute, days)
+        val earlier = synchronized(clockAlarms) { clockAlarms[key]?.takeIf { now.millis() < it.second } }
+        if (earlier != null && label != null && label != earlier.first) {
+            alarms.openClock()
+            val name = earlier.first?.let { " ($it)" }.orEmpty()
+            throw ToolError("The clock app doesn't let other apps rename an alarm, and setting another would ring twice. Its alarms are open now: tell the user to rename the ${modelTime(next)} alarm$name to $label there.")
+        }
+        if (!alarms.set(at.hour, at.minute, days, label)) {
+            throw ToolError("The clock app couldn't be reached. Offer a reminder instead.")
+        }
+        // A one-off alarm can be renamed until it rings; a repeating one, for a while after it's set.
+        val until = if (days.isEmpty()) next.millis() else now.millis() + RENAME_WINDOW_MS
+        synchronized(clockAlarms) { clockAlarms[key] = label to until }
+
+        return Applied(
+            result = ok("alarm" to modelTime(next), "repeats" to days.takeIf { it.isNotEmpty() }?.let(::describeDays)),
+            chip = MemoryChip(
+                kind = MemoryChip.Kind.ALARM,
+                label = "Alarm",
+                detail = label.orEmpty(),
+                at = next.millis(),
+                note = days.takeIf { it.isNotEmpty() }?.let { "Repeats " + describeDays(it) },
+            ),
+        )
+    }
+
+    /**
+     * An alarm on arriving somewhere ("set an alarm when I reach Bangalore"): the clock app only
+     * knows times, so it is a place reminder, which rings as an alarm. Named by its label if the
+     * user gave one, else "Alarm".
+     */
+    private suspend fun placeAlarm(args: Args, context: ToolContext, found: PlaceFinding): Applied {
+        val label = args.text("label")?.let(::alarmName)
+            ?.takeIf { it.lowercase(Locale.ROOT) !in ALARM_TITLES && saidIn(it, context.userText) }
+        return addPlaceTask(label.orEmpty(), args.text("place") ?: args.text("when"), context, found, alarm = true)
+    }
+
+    private data class ClockAlarm(val hour: Int, val minute: Int, val days: Set<DayOfWeek>)
+
+    /** Alarms set from here, with their names and until when a new name is a rename: the clock app can't be asked. */
+    private val clockAlarms = HashMap<ClockAlarm, Pair<String?, Long>>()
+
+    /**
+     * An alarm's name as the model gave it, or null for none: not "alarm", not a reminder's
+     * listing copied over ("Sarlamat (task 3)", 2 Nov 2026), not the garbled request ("Setalaam").
+     */
+    private fun alarmName(raw: String): String? =
+        tidyTitle(raw.replace(TASK_LISTING, "")).takeUnless { it.isEmpty() || it.equals("alarm", ignoreCase = true) || SpokenCommands.isGarbledCommand(it) }
+
+    /**
+     * [title], or "" for none when it is an open reminder's, copied though the user never said it:
+     * "remind me when I reach avilora" was saved as "Buy chicken", a reminder from days before
+     * (8 Nov 2026). Theirs to reuse if they said it just before (it answers a question about it),
+     * or point back to it ("that", "again"). Only for Latin-script words: a title the model put
+     * into English from other words can't be checked against them.
+     */
+    private suspend fun unborrowed(title: String, context: ToolContext): String {
+        val said = context.userText
+        if (said.isBlank() || said.none { it in 'a'..'z' || it in 'A'..'Z' }) return title
+        val earlier = context.earlierText
+        if (saidIn(title, said) || earlier.isNotBlank() && saidIn(title, earlier)) return title
+        if (REFER_BACK.containsMatchIn(said)) return title
+        if (store.openTasks().none { it.title.equals(title, ignoreCase = true) }) return title
+        Log.i(TAG, "Title '${LogText.of(title)}' is an open reminder's, and not in the user's words; made without it")
+        return ""
+    }
+
+    /** Whether the user said any of [name]'s words in [userText]; with no text to check, it stands. */
+    private fun saidIn(name: String, userText: String): Boolean {
+        if (userText.isBlank()) return true
+        val said = significantWords(userText)
+        return significantWords(name).any { word -> said.any { it == word || (minOf(it.length, word.length) >= 3 && (it.startsWith(word) || word.startsWith(it))) } }
+    }
+
+    /** The first of [days] at [at]'s time, after [now]. */
+    private fun nextOn(days: Set<DayOfWeek>, at: ZonedDateTime, now: ZonedDateTime): ZonedDateTime {
+        var candidate = now.toLocalDate().atTime(at.toLocalTime()).atZone(now.zone)
+        while (!candidate.isAfter(now) || candidate.dayOfWeek !in days) candidate = candidate.plusDays(1)
+        return candidate
+    }
+
+    private fun describeDays(days: Set<DayOfWeek>): String = when (days.size) {
+        7 -> "every day"
+        else -> days.sorted().joinToString(", ") { it.getDisplayName(TextStyle.SHORT, Locale.ENGLISH) }
+    }
+
+    // ---- Facts ----
+
+    private suspend fun saveFact(args: Args, context: ToolContext): Applied {
+        val subject = args.required("subject")
+        val attribute = args.required("attribute")
+        val value = args.required("value")
+        if (value.length > MAX_FACT_LENGTH) throw ToolError("That is too long to keep as a fact; keep it short.")
+        val core = args.bool("core") ?: false
+
+        val written = store.saveFact(subject, attribute, value, FactOrigin.CHAT, pin = core, sourceMessageId = context.userMessageId)
+        val fact = written.fact ?: throw ToolError("subject, attribute and value are all needed.")
+        val previous = written.previous
+        val changedPrefix = fact.core || previous?.core == true
+
+        val label = when (written.decision) {
+            is FactDecision.Insert -> "Saved"
+            is FactDecision.Update -> "Updated"
+            // Restating what was already known changes nothing worth a chip, unless it pinned it.
+            else -> if (fact.core && previous?.core == false) "Saved" else null
+        }
+        return Applied(
+            result = ok(
+                "id" to fact.id,
+                "saved" to "${FactLabels.attribute(fact.attribute)}: ${fact.value}",
+                "core" to fact.core.takeIf { it },
+                "unchanged" to (label == null).takeIf { it },
+            ),
+            chip = label?.let {
+                MemoryChip(MemoryChip.Kind.FACT, it, describe(fact), note = if (fact.core) "Always in mind" else null)
+            },
+            undo = label?.let { UndoToken(previousFact = previous, writtenFact = fact) },
+            changedPrefix = changedPrefix,
+        )
+    }
+
+    /**
+     * Keeps the image with the title and details the model gave. The details are what later
+     * questions are matched against; the image is attached again when one is, so the model can
+     * read what nobody wrote down.
+     */
+    private suspend fun rememberImage(args: Args, context: ToolContext): Applied {
+        val title = tidyTitle(args.required("title")).take(MAX_TITLE)
+        val details = args.text("details").orEmpty().take(MAX_DETAILS)
+        // With nothing sent, the screen the assistant was opened over: "remember this" over a ticket.
+        val image = images.findImage(context.chatId, context.userMessageId)
+            ?: context.screen?.takeIf { java.io.File(it).isFile }?.let { FoundImage(context.chatId, context.userMessageId, it) }
+            ?: throw ToolError("There is no image in this chat to remember. Ask the user to send it.")
+        val id = images.save(title, details, image)
+        onImageSaved(id, context.userText)
+        return Applied(
+            result = ok("id" to id, "saved" to "the image and your details; it will be shown to you again when the user asks about it"),
+            chip = MemoryChip(MemoryChip.Kind.IMAGE, "Saved image", title),
+            undo = UndoToken(createdNoteId = id),
+        )
+    }
+
+    // ---- Notes and lists ----
+
+    /**
+     * Makes, changes, reads or deletes one of the user's notes. Which one is matched from [Args]'
+     * note by id or name ([NoteMatch]); a name nothing matches makes a new one, but only for a call
+     * that puts something in it: "remove eggs from the party list" with no party list is refused,
+     * with the names there are. Called with nothing to change, it reads the note back.
+     */
+    private suspend fun editNote(args: Args, context: ToolContext): Applied {
+        val reference = args.required("note")
+        val request = NoteEdits.Request(
+            add = args.text("add"),
+            remove = args.text("remove"),
+            check = args.text("check"),
+            uncheck = args.text("uncheck"),
+            text = args.text("text"),
+            title = args.text("title"),
+        )
+        val delete = args.bool("delete") == true
+        val all = notes.all()
+        if ((request.changes || delete) && NoteEdits.onlyAsks(context.userText)) return answerOnly(all, reference)
+        val creating = !delete && (request.add != null || request.text != null)
+        val note = when (val found = NoteMatch.find(all, reference, loose = !creating)) {
+            is NoteMatch.Found.One -> found.note
+            is NoteMatch.Found.Many -> throw ToolError("More than one note fits '$reference': ${listing(found.notes)}. Ask which one.")
+            NoteMatch.Found.None -> if (creating) {
+                return createNote(reference, request, context)
+            } else {
+                throw ToolError("There's no note called '$reference'. " + notesThere(all) + " Nothing was changed. Ask which one they mean.")
+            }
+        }
+        if (delete) {
+            notes.delete(note.id)
+            return Applied(
+                result = ok("deleted" to "${kindWord(note)} ${note.title}"),
+                chip = MemoryChip(MemoryChip.Kind.NOTE, "Deleted", note.title),
+                undo = UndoToken(previousUserNote = note),
+                changedPrefix = true,
+            )
+        }
+        if (!request.changes) return Applied(read(note), chip = MemoryChip(MemoryChip.Kind.NOTE, kindLabel(note), note.title, noteId = note.id))
+
+        val outcome = try {
+            NoteEdits.apply(note, request, nowMs())
+        } catch (e: NoteEdits.Refused) {
+            throw ToolError(e.message.orEmpty())
+        }
+        val written = outcome.note
+        if (outcome.changed) notes.update(written)
+        val open = written.items.count { !it.done }
+        return Applied(
+            result = ok(
+                "id" to note.id,
+                // "note" is the hint below, as in every tool's result: a note's name goes as its title.
+                (if (note.kind == NoteKind.LIST) "list" else "title") to written.title,
+                "renamed_from" to note.title.takeIf { outcome.renamed },
+                "added" to outcome.added.takeIf { it.isNotEmpty() && note.kind == NoteKind.LIST },
+                "already_on_it" to outcome.already.takeIf { it.isNotEmpty() },
+                "back_on_it" to outcome.reopened.takeIf { it.isNotEmpty() },
+                "removed" to outcome.removed.takeIf { it.isNotEmpty() },
+                "ticked" to outcome.checked.takeIf { it.isNotEmpty() },
+                "unticked" to outcome.unchecked.takeIf { it.isNotEmpty() },
+                "rewritten" to outcome.rewritten.takeIf { it },
+                "not_found" to outcome.notFound.takeIf { it.isNotEmpty() },
+                "items" to (if (note.kind == NoteKind.LIST) "$open to do, ${written.items.size - open} ticked" else null),
+                "note" to outcome.notFound.takeIf { it.isNotEmpty() }?.let {
+                    "Not on it, so left alone: ${it.joinToString(", ")}. Tell the user." +
+                        if (note.kind == NoteKind.LIST && written.items.isNotEmpty()) " On it: " + written.items.take(MAX_LISTED * 2).joinToString(", ") { item -> item.text } else ""
+                },
+            ),
+            chip = MemoryChip(
+                kind = MemoryChip.Kind.NOTE,
+                label = changeLabel(outcome, note),
+                detail = written.title,
+                note = changeNote(outcome),
+                noteId = note.id,
+            ),
+            undo = UndoToken(previousUserNote = note, writtenUserNote = written).takeIf { outcome.changed },
+            changedPrefix = outcome.renamed,
+        )
+    }
+
+    /** A change called for on a message that only asks about a note: the note read back, nothing changed. */
+    private fun answerOnly(all: List<UserNoteEntity>, reference: String): Applied =
+        when (val found = NoteMatch.find(all, reference, loose = true)) {
+            is NoteMatch.Found.One -> Applied(
+                read(found.note) + ("note" to "They only asked, so nothing was changed. Answer their question from this."),
+                chip = MemoryChip(MemoryChip.Kind.NOTE, kindLabel(found.note), found.note.title, noteId = found.note.id),
+            )
+            is NoteMatch.Found.Many -> throw ToolError("More than one note fits '$reference': ${listing(found.notes)}. Nothing was changed. Ask which one they mean.")
+            NoteMatch.Found.None -> throw ToolError("There's no note called '$reference'. " + notesThere(all) + " Nothing was made: they only asked. Tell them.")
+        }
+
+    /** A new note or list named [reference] (or the title given), holding what [request] adds. */
+    private suspend fun createNote(reference: String, request: NoteEdits.Request, context: ToolContext): Applied {
+        val named = request.title ?: reference
+        val kind = NoteEdits.kindFor(named, request.add, request.text)
+        // "Make a list: milk, eggs" names nothing: a list is "List", a note its first words.
+        val title = NoteEdits.tidyTitle(named).takeIf { NoteMatch.keys(it).isNotEmpty() }
+            ?: if (kind == NoteKind.LIST) "List" else NoteEdits.tidyTitle((request.text ?: request.add).orEmpty().split(' ').take(UNTITLED_WORDS).joinToString(" ")).ifEmpty { "Note" }
+        val nowMs = nowMs()
+        val blank = UserNoteEntity(title = title, kind = kind, sourceMessageId = context.userMessageId, createdAt = nowMs, updatedAt = nowMs)
+        val filled = try {
+            NoteEdits.apply(blank, request.copy(title = null, remove = null, check = null, uncheck = null), nowMs).note
+        } catch (e: NoteEdits.Refused) {
+            throw ToolError(e.message.orEmpty())
+        }
+        val id = notes.insert(filled)
+        val note = filled.copy(id = id)
+        return Applied(
+            result = ok(
+                "id" to id,
+                "created" to "${kindWord(note)} ${note.title}",
+                "items" to note.items.size.takeIf { kind == NoteKind.LIST },
+                "note" to "It is in their Notes and shown under your reply, where they can tick and edit it.",
+            ),
+            chip = MemoryChip(
+                kind = MemoryChip.Kind.NOTE,
+                label = if (kind == NoteKind.LIST) "New list" else "New note",
+                detail = note.title,
+                noteId = id,
+            ),
+            undo = UndoToken(createdUserNoteId = id, writtenUserNote = note),
+            changedPrefix = true,
+        )
+    }
+
+    /** A note as the model reads it back: a list's items, ticked ones marked, or a note's text. */
+    private fun read(note: UserNoteEntity): Map<String, Any?> = when (note.kind) {
+        NoteKind.LIST -> ok(
+            "id" to note.id,
+            "list" to note.title,
+            "items" to note.items.take(MAX_NOTE_ITEMS).map { if (it.done) "${it.text} (ticked)" else it.text },
+            "more" to (note.items.size - MAX_NOTE_ITEMS).takeIf { it > 0 },
+            "empty" to note.items.isEmpty().takeIf { it },
+        )
+        // Its name as "title": "note" is a result's hint.
+        NoteKind.NOTE -> ok("id" to note.id, "title" to note.title, "text" to note.body.take(MAX_NOTE_CHARS_READ).ifEmpty { "(empty)" })
+    }
+
+    private fun kindWord(note: UserNoteEntity) = if (note.kind == NoteKind.LIST) "list" else "note"
+
+    private fun kindLabel(note: UserNoteEntity) = if (note.kind == NoteKind.LIST) "List" else "Note"
+
+    /** "Shopping list (note 3); Goa packing (note 4)", as the model can name them back. */
+    private fun listing(found: List<UserNoteEntity>): String =
+        found.take(MAX_LISTED).joinToString("; ") { "${it.title} (note ${it.id})" }
+
+    private fun notesThere(all: List<UserNoteEntity>): String =
+        if (all.isEmpty()) "The user has no notes yet." else "Their notes: ${listing(all)}."
+
+    /** "Added", "Ticked", "Removed"…; "Changed" for more than one kind of change. */
+    private fun changeLabel(outcome: NoteEdits.Outcome, note: UserNoteEntity): String {
+        val kinds = listOfNotNull(
+            "Added".takeIf { outcome.added.isNotEmpty() || outcome.reopened.isNotEmpty() },
+            "Removed".takeIf { outcome.removed.isNotEmpty() },
+            "Ticked".takeIf { outcome.checked.isNotEmpty() },
+            "Unticked".takeIf { outcome.unchecked.isNotEmpty() },
+            "Rewritten".takeIf { outcome.rewritten },
+            "Renamed".takeIf { outcome.renamed },
+        )
+        return when (kinds.size) {
+            0 -> kindLabel(note)
+            1 -> kinds.single()
+            else -> "Changed"
+        }
+    }
+
+    /** What changed, item by item: "Eggs, Butter"; "Not on it: Jam". */
+    private fun changeNote(outcome: NoteEdits.Outcome): String? {
+        val items = (outcome.added + outcome.reopened + outcome.removed + outcome.checked + outcome.unchecked)
+            .takeIf { it.isNotEmpty() && !outcome.rewritten }
+            ?.joinToString(", ")
+            ?.let { if (it.length > MAX_CHIP_NOTE) it.take(MAX_CHIP_NOTE).substringBeforeLast(", ") + "…" else it }
+        val missing = outcome.notFound.takeIf { it.isNotEmpty() }?.let { "Not on it: " + it.joinToString(", ") }
+        return listOfNotNull(items, missing).joinToString(" · ").ifEmpty { null }
+    }
+
+    private suspend fun forget(args: Args): Applied {
+        val subject = args.required("subject")
+        val attribute = args.text("attribute")
+        var forgotten = store.forgetFacts(subject, attribute)
+        // "Forget my dentist" arrives as forget(subject = "dentist") as often as it arrives as
+        // forget(subject = "user", attribute = "dentist").
+        if (forgotten.removed.isEmpty() && attribute == null && FactKeys.subject(subject) != FactKeys.USER) {
+            val asAttribute = store.forgetFacts(FactKeys.USER, subject)
+            if (asAttribute.removed.isNotEmpty()) {
+                // It was the user's dentist, not an entity called "dentist": withdraw that tombstone.
+                store.unforget(forgotten)
+                forgotten = asAttribute
+            } else {
+                // Nothing stored either way. The first reading's tombstone still stops extraction
+                // learning it from older messages; the second is noise.
+                store.unforget(asAttribute)
+            }
+        }
+        val removed = forgotten.removed
+        return Applied(
+            result = ok("removed" to removed.size),
+            chip = removed.takeIf { it.isNotEmpty() }?.let {
+                val what = if (it.size == 1) describe(it.single()).substringBefore(':') else "${it.size} things about ${subjectLabel(forgotten.subject)}"
+                MemoryChip(MemoryChip.Kind.FORGET, "Forgot", what)
+            },
+            undo = UndoToken(forgotten = forgotten).takeIf { removed.isNotEmpty() },
+            changedPrefix = removed.any { it.core },
+        )
+    }
+
+    // ---- Reading ----
+
+    private suspend fun getUpcoming(args: Args): Applied {
+        val days = (args.int("days") ?: 7).coerceIn(1, 60)
+        val now = now()
+        val from = now.millis()
+        val to = now.plusDays(days.toLong()).millis()
+        val tasks = store.tasksDueBetween(from, to).map { Triple(it.dueAt!!, "task", it) }
+        val events = store.eventsBetween(from, to).mapNotNull { event ->
+            EventTimes.nextStart(event, from, now.zone)?.takeIf { it < to }?.let { Triple(it, "event", event) }
+        }
+        val items = (tasks + events).sortedBy { it.first }
+        // Place reminders have no time: they come up whenever the user gets there.
+        val atPlaces = store.openTasks().filter { it.place != null }
+        return Applied(
+            ok(
+                "items" to items.take(MAX_LISTED).map { (at, type, item) ->
+                    val (id, title) = when (item) {
+                        is TaskEntity -> item.id to item.title
+                        is EventEntity -> item.id to item.title
+                        else -> error("unreachable")
+                    }
+                    mapOf("id" to id, "type" to type, "title" to title, "at" to modelTime(at.atZone(now)))
+                },
+                "more" to (items.size - MAX_LISTED).takeIf { it > 0 },
+                "at_places" to atPlaces.take(MAX_LISTED).map { mapOf("id" to it.id, "type" to "task", "title" to it.title, "where" to it.place!!.where()) }
+                    .takeIf { it.isNotEmpty() },
+            ),
+        )
+    }
+
+    /**
+     * For a spoken photo search, what memory holds on the same thing. A typed message is matched
+     * against memory before the model answers, but a spoken one has no words to match, so memory
+     * went unsearched: "what's my credit card number" by voice in the power-button panel got
+     * only the card's photos, though the number was in an earlier chat, and typed in the app it
+     * got the number (2026-10-27). The search's own words stand in for the user's.
+     */
+    private suspend fun withRemembered(result: Map<String, Any?>, args: Args): Map<String, Any?> {
+        val text = listOfNotNull(args.text("query"), args.text("question")).joinToString(" ")
+        val words = significantWords(text)
+        if (words.isEmpty()) return result
+        val now = now()
+        val remembered = store.searchFacts(words, MAX_FOUND).map(::describe) +
+            archive.search(text, MAX_NOTES).map { snippet ->
+                "(${NOTE_DATE.format(snippet.at.atZone(now))}) ${FactLabels.inline(snippet.text).take(MAX_NOTE_CHARS)}"
+            }
+        if (remembered.isEmpty()) return result
+        // First, and asked for in the note: given as a field after the photos' counts, it was
+        // passed over ("I found 9 photos that might contain your credit card number").
+        val note = "From memory: the user told you about this before (remembered). If that answers what they asked, give " +
+            "the answer from it first, then mention the photos."
+        return linkedMapOf<String, Any?>("ok" to result["ok"], "remembered" to remembered) +
+            (result - "ok" - "note") + ("note" to listOfNotNull(note, result["note"] as? String).joinToString(" "))
+    }
+
+    private suspend fun searchMemory(args: Args): Applied {
+        val query = args.required("query")
+        val words = significantWords(query)
+        if (words.isEmpty()) throw ToolError("Search for what? Give a word or two.")
+        val facts = store.searchFacts(words, MAX_FOUND).map(::describe)
+        val now = now()
+        val tasks = words.take(3).flatMap { store.tasksMentioning(it, MAX_FOUND) }.distinctBy { it.id }
+            .map { "${it.title} (task ${it.id}, ${it.status.name.lowercase(Locale.ROOT)}${(it.dueAt?.let { at -> modelTime(at.atZone(now)) } ?: it.place?.where())?.let { w -> ", $w" }.orEmpty()})" }
+        val events = words.take(3).flatMap { store.eventsMentioning(it, MAX_FOUND) }.distinctBy { it.id }
+            .map { "${it.title} (event ${it.id}, ${modelTime(it.startsAt.atZone(now))})" }
+        // Earlier conversations, dated so the model can tell an old note from a new one.
+        val notes = archive.search(query, MAX_NOTES).map { snippet ->
+            "(${NOTE_DATE.format(snippet.at.atZone(now))}) ${FactLabels.inline(snippet.text).take(MAX_NOTE_CHARS)}"
+        }
+        return Applied(
+            ok(
+                "facts" to facts.takeIf { it.isNotEmpty() },
+                "items" to (tasks + events).take(MAX_FOUND).takeIf { it.isNotEmpty() },
+                "conversations" to notes.takeIf { it.isNotEmpty() },
+                "found" to (facts.size + tasks.size + events.size + notes.size),
+            ),
+        )
+    }
+
+    // ---- Undo and edit ----
+
+    /** Puts things back as they were before the call recorded in [recordId]. */
+    suspend fun undo(recordId: Long): UndoResult {
+        val record = log.read(recordId) ?: return UndoResult.NOT_UNDOABLE
+        if (record.undone) return UndoResult.ALREADY_UNDONE
+        val token = record.undo ?: return UndoResult.NOT_UNDOABLE
+        val alarms = mutableListOf<AlarmChange>()
+        val restored = store.transaction {
+            val done = when {
+                token.writtenFact != null -> store.restoreFact(token.previousFact, token.writtenFact)
+                token.createdTaskId != null -> {
+                    store.deleteTask(token.createdTaskId)
+                    alarms += AlarmChange.Cancel(token.createdTaskId)
+                    true
+                }
+                token.previousTask != null -> {
+                    val previous = token.previousTask
+                    store.updateTask(previous)
+                    val live = previous.status == TaskStatus.OPEN && previous.dueAt != null && previous.dueAt > nowMs()
+                    alarms += when {
+                        live -> AlarmChange.Schedule(previous.id, previous.dueAt!!)
+                        previous.status == TaskStatus.OPEN && previous.place != null -> AlarmChange.SchedulePlace(previous.id, previous.place)
+                        else -> AlarmChange.Cancel(previous.id)
+                    }
+                    true
+                }
+                token.createdEventId != null -> {
+                    store.deleteEvent(token.createdEventId)
+                    alarms += AlarmChange.CancelEvent(token.createdEventId)
+                    true
+                }
+                token.previousEvent != null -> {
+                    store.updateEvent(token.previousEvent)
+                    alarms += alertFor(token.previousEvent)?.let { AlarmChange.ScheduleEvent(token.previousEvent.id, it) }
+                        ?: AlarmChange.CancelEvent(token.previousEvent.id)
+                    true
+                }
+                token.forgotten != null -> {
+                    store.unforget(token.forgotten)
+                    true
+                }
+                token.createdNoteId != null -> {
+                    images.delete(token.createdNoteId)
+                    true
+                }
+                // A note changed since (an item ticked on the Notes screen) is left as it is.
+                token.createdUserNoteId != null -> {
+                    val current = notes.note(token.createdUserNoteId)
+                    when {
+                        current == null -> true
+                        current == token.writtenUserNote || token.writtenUserNote == null -> {
+                            notes.delete(token.createdUserNoteId)
+                            true
+                        }
+                        else -> false
+                    }
+                }
+                token.previousUserNote != null -> {
+                    val current = notes.note(token.previousUserNote.id)
+                    val unchanged = if (token.writtenUserNote == null) current == null else current == token.writtenUserNote
+                    if (unchanged) notes.restore(token.previousUserNote)
+                    unchanged
+                }
+                else -> false
+            }
+            if (done) log.update(recordId, record.copy(undone = true))
+            done
+        }
+        alarms.forEach(::applyAlarm)
+        return if (restored) UndoResult.UNDONE else UndoResult.CHANGED_SINCE
+    }
+
+    /** Moves the reminder or event recorded in [recordId] to [at]. False if it no longer exists. */
+    suspend fun editTime(recordId: Long, at: Long): Boolean {
+        val record = log.read(recordId) ?: return false
+        val chip = record.chip ?: return false
+        val token = record.undo
+        val nowMs = nowMs()
+        val alarms = mutableListOf<AlarmChange>()
+        val edited = store.transaction {
+            when (chip.kind) {
+                MemoryChip.Kind.TASK -> {
+                    val id = token?.createdTaskId ?: token?.previousTask?.id ?: return@transaction false
+                    val task = store.task(id) ?: return@transaction false
+                    store.updateTask(task.copy(dueAt = at, status = TaskStatus.OPEN, completedAt = null, updatedAt = nowMs))
+                    if (at > nowMs) alarms += AlarmChange.Schedule(id, at) else alarms += AlarmChange.Cancel(id)
+                }
+                MemoryChip.Kind.EVENT -> {
+                    val id = token?.createdEventId ?: token?.previousEvent?.id ?: return@transaction false
+                    val event = store.event(id) ?: return@transaction false
+                    val length = event.endsAt?.minus(event.startsAt)
+                    val moved = event.copy(startsAt = at, endsAt = length?.let { at + it }, allDay = false, updatedAt = nowMs)
+                    store.updateEvent(moved)
+                    alarms += alertFor(moved)?.let { AlarmChange.ScheduleEvent(id, it) } ?: AlarmChange.CancelEvent(id)
+                }
+                else -> return@transaction false
+            }
+            log.update(recordId, record.copy(chip = chip.copy(at = at, allDay = false)))
+            true
+        }
+        alarms.forEach(::applyAlarm)
+        return edited
+    }
+
+    // ---- Helpers ----
+
+    private fun applyAlarm(change: AlarmChange) = when (change) {
+        is AlarmChange.Schedule -> reminders.schedule(change.taskId, change.dueAt)
+        is AlarmChange.SchedulePlace -> reminders.schedulePlace(change.taskId, change.place)
+        is AlarmChange.Cancel -> reminders.cancel(change.taskId)
+        is AlarmChange.ScheduleEvent -> reminders.scheduleEvent(change.eventId, change.alert.at, change.alert.startsAt)
+        is AlarmChange.CancelEvent -> reminders.cancelEvent(change.eventId)
+    }
+
+    private fun alertFor(event: EventEntity): EventTimes.Alert? =
+        EventTimes.nextAlert(event, nowMs(), now().zone, defaults.dateOnly)
+
+    /** A time that has not already gone, or a ToolError the model can relay. */
+    private fun future(whenText: String, now: ZonedDateTime): ResolvedWhen {
+        val resolved = resolver.resolve(whenText, now) ?: throw ToolError("I couldn't understand the time '$whenText'. Ask the user when.")
+        if (!resolved.at.isAfter(now)) throw ToolError("'$whenText' has already passed. Ask for a later time.")
+        return resolved
+    }
+
+    /** A repeating task with no time given starts at the default time, the next time it comes round. */
+    private fun firstOccurrence(rule: RepeatRule, now: ZonedDateTime): ZonedDateTime? {
+        val today = now.toLocalDate().atTime(defaults.dateOnly).atZone(now.zone)
+        return if (today.isAfter(now) && (rule.byDay.isEmpty() || today.dayOfWeek in rule.byDay)) today else rule.next(today, now)
+    }
+
+    /** "1.2 km", "300 m": how far, as the model says it. */
+    private fun distance(metres: Double): String =
+        if (metres < 1_000) "${(metres / 50).roundToInt() * 50} m" else String.format(Locale.ROOT, "%.1f km", metres / 1_000)
+
+    private fun lateNote(scheduled: Boolean): String? =
+        if (scheduled && !reminders.canScheduleExact()) "may be a few minutes late" else null
+
+    private fun describe(fact: FactEntity): String {
+        val attribute = FactLabels.attribute(fact.attribute).replaceFirstChar { it.titlecase(Locale.ROOT) }
+        return if (fact.subject == FactKeys.USER) {
+            "$attribute: ${fact.value}"
+        } else {
+            "${subjectLabel(fact.subject)}'s ${FactLabels.attribute(fact.attribute)}: ${fact.value}"
+        }
+    }
+
+    private fun subjectLabel(subject: String): String =
+        subject.replace('_', ' ').replaceFirstChar { it.titlecase(Locale.ROOT) }
+
+    private fun tidyTitle(raw: String): String =
+        raw.trim().removePrefix("remind me to ").removePrefix("to ").trim().trimEnd('.')
+            .replaceFirstChar { it.titlecase(Locale.ROOT) }
+
+    private fun significantWords(text: String): List<String> =
+        text.lowercase(Locale.ROOT).split(Regex("[^\\p{L}\\p{M}\\p{N}]+"))
+            .filter { it.length >= 2 && it !in STOP_WORDS }
+
+    private fun dedupeKey(call: ToolCall): String =
+        call.name + "|" + call.arguments.toSortedMap().entries.joinToString("|") { (key, value) ->
+            "$key=" + value.toString().trim().lowercase(Locale.ROOT).replace(Regex("\\s+"), " ")
+        }
+
+    private fun ok(vararg fields: Pair<String, Any?>): Map<String, Any?> =
+        linkedMapOf<String, Any?>("ok" to true).apply { fields.forEach { (k, v) -> if (v != null) put(k, v) } }
+
+    private fun failure(message: String): Map<String, Any?> = linkedMapOf("ok" to false, "error" to message)
+
+    private fun now(): ZonedDateTime = now.invoke()
+
+    private fun nowMs(): Long = now().millis()
+
+    private fun ZonedDateTime.millis(): Long = toInstant().toEpochMilli()
+
+    private fun Long.atZone(reference: ZonedDateTime): ZonedDateTime = Instant.ofEpochMilli(this).atZone(reference.zone)
+
+    private fun modelTime(at: ZonedDateTime): String =
+        if (at.toLocalTime() == LocalTime.MIDNIGHT) modelDate(at) else MODEL_TIME.format(at)
+
+    private fun modelDate(at: ZonedDateTime): String = MODEL_DATE.format(at)
+
+    companion object {
+        private const val TAG = "ToolExecutor"
+        const val DEDUPE_WINDOW_MS = 2 * 60 * 1000L
+        const val DEVICE_DEDUPE_WINDOW_MS = 15 * 1000L
+
+        /**
+         * read_file's arguments when the app reads a document attached to the message itself
+         * ([ToolLoop.readAttached]): never declared, so only the app makes such a call; one
+         * replayed from the history reads as an ordinary search by name.
+         */
+        const val ATTACHED = "attached"
+
+        /** With [ATTACHED]: notes on it for this request, for the chat model to act on ([ToolLoop.notesOnAttached]). */
+        const val NOTES_FOR = "notes_for"
+
+        /** A place reminder saved without location all the time: what the model tells the user. */
+        private const val CANT_RING =
+            "Saved, but it can't ring there until the user allows this app's location 'All the time' (Android settings, Apps, this app, Permissions, Location). Tell them."
+
+        /** A place reminder made from inside its fence, which only an arrival rings. */
+        private const val ALREADY_INSIDE =
+            "The user is already there (within that distance), so it rings the next time they arrive, not now. Tell them."
+
+        /** A reminder's title that says nothing but that it is one: "Reminder", once the distance is gone. */
+        private val BARE_TITLES = setOf("", "reminder", "a reminder", "remind me", "set a reminder", "set reminder", "alert", "an alert", "notify me")
+
+        /** What a reminder or alarm the user gave no name is called. */
+        private const val REMINDER = "Reminder"
+        private const val ALARM = "Alarm"
+
+        /** A title that says only that it's an alarm: "set alarm", "wake me up". */
+        private val ALARM_TITLES = setOf(
+            "alarm", "an alarm", "the alarm", "set alarm", "set an alarm", "set the alarm", "set a alarm", "alarm me", "wake me", "wake me up",
+        )
+
+        /** Words pointing back at something said before, whose title a call may reuse: "remind me again", "that one too". */
+        private val REFER_BACK = Regex("\\b(?:again|also|too|same|another|that|this|it|them|those|one more)\\b", RegexOption.IGNORE_CASE)
+
+        /** How long after a repeating alarm is set a new name for it is taken as a rename. */
+        private const val RENAME_WINDOW_MS = 12 * 60 * 60 * 1000L
+
+        /** "(task 3, open, Mon 2 Nov 16:30)", as reminders are listed to the model. */
+        private val TASK_LISTING = Regex("\\s*\\(task\\s*#?\\d+[^)]*\\)", RegexOption.IGNORE_CASE)
+        private const val MAX_FACT_LENGTH = 300
+        private const val MAX_LISTED = 8
+        private const val MAX_FOUND = 5
+        private const val MAX_TITLE = 80
+        private const val MAX_DETAILS = 4_000
+        private const val MAX_NOTES = 3
+        private const val MAX_NOTE_CHARS = 360
+
+        /** A list read back to the model: its first items, then how many more. */
+        private const val MAX_NOTE_ITEMS = 40
+        private const val MAX_NOTE_CHARS_READ = 1_500
+        private const val MAX_CHIP_NOTE = 80
+
+        /** A note made with no name is named for its first few words. */
+        private const val UNTITLED_WORDS = 5
+        private val NOTE_DATE = DateTimeFormatter.ofPattern("d MMM yyyy", Locale.ENGLISH)
+
+        private val gson = Gson()
+
+        /** The heading of photos shown because the message was searched for. */
+        const val RELATED_TITLE = "Related photos"
+        private val MODEL_TIME = DateTimeFormatter.ofPattern("EEE d MMM HH:mm", Locale.ENGLISH)
+        private val MODEL_DATE = DateTimeFormatter.ofPattern("EEE d MMM", Locale.ENGLISH)
+        private val ID_REFERENCE = Regex("(?:#|task\\s*#?\\s*)?(\\d+)")
+
+        private val STOP_WORDS = setOf(
+            "the", "a", "an", "to", "my", "me", "for", "with", "about", "reminder", "remind", "task",
+            "it", "that", "this", "and", "of", "on", "at", "in", "is", "ko", "ka", "ki", "se",
+        )
+    }
+}
+
+/** No image store: remember_image finds nothing to remember. */
+private object NoImageNotes : ImageNotes {
+    override suspend fun findImage(chatId: Long, upToMessageId: Long): FoundImage? = null
+    override suspend fun save(title: String, details: String, image: FoundImage): Long = error("no image store")
+    override suspend fun delete(noteId: Long) = Unit
+}
+
+/** No notes: edit_note finds none, and can't make one. */
+private object NoNotes : NoteStore {
+    override suspend fun all(): List<UserNoteEntity> = emptyList()
+    override suspend fun note(id: Long): UserNoteEntity? = null
+    override suspend fun insert(note: UserNoteEntity): Long = throw ToolError("Notes aren't available in this app.")
+    override suspend fun update(note: UserNoteEntity) = Unit
+    override suspend fun delete(id: Long) = Unit
+    override suspend fun restore(note: UserNoteEntity) = Unit
+}
+
+/** A call the app cannot carry out, told to the model so it can ask the user. */
+internal class ToolError(message: String) : Exception(message)
+
+/** Lenient reads of the model's arguments, which may arrive as strings, numbers or booleans. */
+internal class Args(private val map: Map<String, Any?>) {
+    fun text(key: String): String? = map[key]
+        ?.let { if (it is Number && it.toDouble() == Math.floor(it.toDouble())) it.toLong().toString() else it.toString() }
+        ?.trim()
+        ?.takeIf { it.isNotEmpty() && !it.equals("null", ignoreCase = true) }
+
+    fun required(key: String): String = text(key) ?: throw ToolError("'$key' is missing.")
+
+    fun bool(key: String): Boolean? = when (val value = map[key]) {
+        is Boolean -> value
+        is String -> value.trim().lowercase(Locale.ROOT) in setOf("true", "yes", "1")
+        is Number -> value.toInt() != 0
+        else -> null
+    }
+
+    fun int(key: String): Int? = when (val value = map[key]) {
+        is Number -> value.toInt()
+        is String -> value.trim().toIntOrNull()
+        else -> null
+    }
+}

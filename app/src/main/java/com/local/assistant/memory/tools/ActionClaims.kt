@@ -1,0 +1,158 @@
+package com.local.assistant.memory.tools
+
+/**
+ * Spots a reply that says it has done something only a tool can do: sent, called, booked, set an
+ * alarm. With no tool run behind it, that is a false promise the user acts on. "I've sent the
+ * email to Hitesh" (10 Oct 2026) came with no send_message call at all.
+ *
+ * English, and kept to what can only mean acting on the world: "I've written a poem" and "I've
+ * updated the code" are not claims. Verbs that also describe writing or code (set, added, turned,
+ * opened …) count only next to something a tool acts on: an alarm, a reminder, the flashlight,
+ * an app.
+ */
+object ActionClaims {
+
+    /** Whether [text] says something was done. */
+    fun claims(text: CharSequence): Boolean = CLAIMS.any { it.containsMatchIn(text) }
+
+    /**
+     * Whether [text] says photos were found or are shown: "I found 3 photos of your B.Tech
+     * certificate.", "Here are your sunset photos." Only find_photos finds and shows them, so with
+     * no photo in front of the model either, that is a claim. On follow-ups the model repeated an
+     * earlier search's answer instead of searching, and "I found 5 photos of you watching the
+     * sunset" came with no search at all (1 Nov 2026), so nothing appeared under it.
+     */
+    fun foundPhotos(text: CharSequence): Boolean = FOUND_PHOTOS.any { it.containsMatchIn(text) }
+
+    /**
+     * Whether [text] says a message was written without showing it: "I've drafted the email for
+     * you. Would you like me to send it now?" (the power-button panel, 27 Oct 2026), with no tool
+     * run, means no draft exists anywhere. A draft the reply goes on to show ("…for you:", in
+     * quotes, or [DRAFT_MAX] characters and more of it) is writing, not a claim.
+     */
+    fun unshownDraft(text: CharSequence): Boolean {
+        if (text.length >= DRAFT_MAX) return false
+        val said = DRAFT.find(text) ?: return false
+        return !SHOWN.containsMatchIn(text.subSequence(said.range.last + 1, text.length))
+    }
+
+    /**
+     * Where the opening of a reply ends, the part a claim would be in: its first sentence, or
+     * more of them while that is still short ("Sure! I've sent it."), and never more than
+     * [OPENING_MAX] characters. Null while the reply may still be inside it.
+     */
+    fun openingEnd(text: CharSequence): Int? {
+        SENTENCE_END.findAll(text).firstOrNull { it.range.last + 1 >= OPENING_MIN }?.let { return it.range.last + 1 }
+        return if (text.length >= OPENING_MAX) text.length else null
+    }
+
+    /**
+     * [reply], after a call or message was only got ready, with what it says was sent or called
+     * put right. Each sentence saying so gives way to [ready], what is really open for the user
+     * ("WhatsApp is open with your message to Anjali; tap send."), and keeps what else it said
+     * was done: "I have sent the message to Anjali and set an alarm for 6:30." still says
+     * "I've also set an alarm for 6:30." The result told the model "not sent yet, the user taps
+     * send", and it said "I have sent" 4 times in 6 all the same (MultiStepEvalTest, 4 Nov 2026).
+     */
+    fun handedOff(reply: String, ready: List<String>): String {
+        if (ready.isEmpty() || SENT.none { it.containsMatchIn(reply) }) return reply
+        val out = mutableListOf<String>()
+        var placed = false
+        for (sentence in SENTENCES.split(reply.trim())) {
+            if (SENT.none { it.containsMatchIn(sentence) }) {
+                out += sentence
+                continue
+            }
+            if (!placed) {
+                out += ready
+                placed = true
+            }
+            // What else it said was done, after an "and": "…and set an alarm for 6:30 a.m."
+            for (part in AND.split(sentence).drop(1)) {
+                val rest = part.trim().trimEnd('.', '!')
+                if (rest.isEmpty() || SENT.any { it.containsMatchIn(rest) }) continue
+                when {
+                    DONE_VERB.containsMatchIn(rest) -> out += "I've also $rest."
+                    STATE.containsMatchIn(rest) -> out += rest.replaceFirstChar { it.titlecase(java.util.Locale.ROOT) } + "."
+                }
+            }
+        }
+        return out.joinToString(" ")
+    }
+
+    private val SENTENCES = Regex("(?<=[.!?])\\s+")
+    private val AND = Regex(",?\\s+and\\s+")
+    private val DONE_VERB = Regex("^(?:set|added|turned|put|switched|saved|created|scheduled|started|changed|muted)\\b", RegexOption.IGNORE_CASE)
+    private val STATE = Regex("\\b(?:is|are|was|has been|have been)\\b", RegexOption.IGNORE_CASE)
+
+    /** Says a message went or a call was made: only true once the user has pressed the button. */
+    private val SENT = listOf(
+        "$I_DID(?:sent|shared|e-?mailed|texted|messaged|whatsapped|forwarded|dial(?:l)?ed|called|rang|rung)\\b",
+        "\\b(?:has|have)\\s+been\\s+(?:successfully\\s+)?(?:sent|shared|e-?mailed|texted|forwarded|delivered|made|placed)\\b",
+        "(?:^|[.!?]\\s+)(?:your\\s+)?(?:email|e-mail|mail|message|text|sms|whatsapp|screenshot|call)\\s+(?:was\\s+|is\\s+|has\\s+been\\s+)?(?:successfully\\s+)?(?:sent|shared|made|placed)\\b",
+        "^\\s*sent\\b",
+    ).map { Regex(it, RegexOption.IGNORE_CASE) }
+
+    private const val OPENING_MIN = 30
+    private const val OPENING_MAX = 200
+    private const val DRAFT_MAX = 200
+
+    /** What follows a message that is shown: a colon, or the text in quotes. */
+    private val SHOWN = Regex("[:\"“«]")
+
+    /** A sentence ends at . ! or ? once a space follows (not in "google.com"), or a line ends. */
+    private val SENTENCE_END = Regex("[.!?](?=\\s)|\\n")
+
+    /** "I", "I've", "I have just" …: the model speaking of what it did. */
+    private const val I_DID = "\\bI(?:['’]ve|\\s+have|\\s+had)?(?:\\s+(?:just|now|already|also|successfully|(?:gone|went)\\s+ahead\\s+and))*\\s+"
+
+    /** Between words of one sentence. */
+    private const val GAP = "[^\\w.!?\\n]+"
+
+    /** [verbs] with one of [objects] within [words] words after it. */
+    private fun near(verbs: String, objects: String, words: Int = 3) =
+        "$I_DID(?:$verbs)\\b(?:$GAP[\\w'’-]+){0,$words}?$GAP(?:$objects)\\b"
+
+    private const val SCHEDULED = "alarms?|timers?|reminders?|events?|appointments?|meetings?|calendar|tasks?|to-?dos?"
+    private const val PHONE_STATE = "silent|vibrate|do not disturb|dnd|airplane mode|flight mode"
+    private const val SWITCHABLE = "flashlight|torch|wi-?fi|bluetooth|mobile data|hotspot|volume|ringer|$PHONE_STATE"
+    private const val APPS = "app|youtube|maps|spotify|whatsapp|gmail|chrome|browser|settings|camera|music|songs?|playlist|videos?|navigation|directions|dialer|stopwatch|clock"
+
+    private val CLAIMS = listOf(
+        // Only a tool could have done these, whatever they were done to.
+        "$I_DID(?:sent|e-?mailed|texted|messaged|whatsapped|forwarded|dial(?:l)?ed|booked|posted|uploaded|published|reminded|notified|contacted" +
+            "|paid(?!\\s+(?:close\\s+)?attention)|cancell?ed(?!\\s+out\\b)" +
+            "|called(?!\\s+(?:it|this|that)\\b)(?!\\s+the\\s+(?:function|method|variable|class|file|api)\\b))\\b",
+        "\\bI(?:['’]m|\\s+am)\\s+(?:now\\s+)?(?:sending|calling|dialing|dialling|booking|ordering|paying|posting|emailing|texting|messaging|forwarding|transferring)\\b",
+        // The verbs that also describe writing and code, next to what a tool acts on.
+        near("set|added|created|scheduled|rescheduled|saved|put|made|booked|moved|changed|updated|deleted|removed|cleared", SCHEDULED, words = 4),
+        near("turned|switched", "on|off|up|down|$SWITCHABLE"),
+        near("put|set|changed|muted|silenced|enabled|disabled|activated|deactivated", "phone|$SWITCHABLE", words = 4),
+        near("opened|launched|started|played|pulled up", APPS),
+        near("saved|stored|noted down|added", "memory|that|this|preference|number|address|details|fact|contacts?|shopping list"),
+        // "I've added eggs and milk to your shopping list": a list or note of theirs, not one written in the reply.
+        "$I_DID(?:added|put|removed|deleted|ticked|checked|crossed|struck|marked|noted|jotted|saved|written|wrote)\\b[^.!?\\n]{0,60}?\\b(?:to|from|on|in|into|off)\\s+(?:your|the)\\s+(?:[\\w'’-]+\\s+){0,2}?(?:list|note|notes)\\b(?!\\s+(?:below|above))",
+        near("marked", "done|complete|completed|finished"),
+        near("ordered|reserved|placed", "orders?|pizza|food|meal|groceries|cab|taxi|uber|ola|ride|table|seats?|tickets?|room"),
+        near("transferred", "money|rupees|rs|amount|funds|payment|\\d+"),
+        near("deleted|removed|erased|cleared|forgotten|forgot", "facts?|memory|memories|chats?|conversation|history|messages?|emails?|photos?|pictures?|contacts?|that|this"),
+        // In the passive, and the bare "Done!" or "Email sent."
+        "\\b(?:has|have)\\s+been\\s+(?:successfully\\s+)?(?:sent|e-?mailed|texted|forwarded|booked|paid|posted|scheduled|cancell?ed|delivered|placed)\\b",
+        "\\b(?:$SCHEDULED)\\s+(?:has|have|is|are)\\s+(?:been\\s+|now\\s+)?(?:set|added|saved|created|scheduled|updated|deleted|cancell?ed)\\b",
+        "(?:^|[.!?]\\s+)(?:your\\s+)?(?:email|e-mail|mail|message|text|sms|whatsapp)\\s+(?:was\\s+|is\\s+|has\\s+been\\s+)?(?:successfully\\s+)?sent\\b",
+        "^\\s*(?:sent|done|all done|all set)\\b",
+    ).map { Regex(it, RegexOption.IGNORE_CASE) }
+
+    private const val PHOTOS = "photos?|pictures?|pics?|images?|videos?|selfies?|screenshots?|snaps?"
+
+    private val FOUND_PHOTOS = listOf(
+        near("found|located|pulled up|got|retrieved|fetched", PHOTOS, words = 4),
+        "\\bhere\\s+(?:are|is)\\b(?:$GAP[\\w'’-]+){0,4}?$GAP(?:$PHOTOS)\\b",
+    ).map { Regex(it, RegexOption.IGNORE_CASE) }
+
+    private val DRAFT = Regex(
+        near("drafted|written|wrote|prepared|composed|typed out|put together", "e-?mails?|mails?|messages?|texts?|whatsapps?|sms|replies|reply") +
+            "|\\b(?:e-?mail|mail|message|text|reply|draft)\\s+is\\s+(?:now\\s+)?(?:ready|drafted|written|prepared)\\b",
+        RegexOption.IGNORE_CASE,
+    )
+}

@@ -1,0 +1,348 @@
+package com.local.assistant.memory
+
+import com.google.gson.GsonBuilder
+import com.local.assistant.data.db.AppDatabase
+import com.local.assistant.data.db.ChatEntity
+import com.local.assistant.data.db.MessageEntity
+import com.local.assistant.data.repo.ChatRepository
+import com.local.assistant.location.GeoPoint
+import com.local.assistant.memory.core.AliasPlanner
+import com.local.assistant.memory.core.DuplicateSuggestion
+import com.local.assistant.memory.core.FactKeys
+import com.local.assistant.memory.db.AppStateEntity
+import com.local.assistant.memory.db.ArchiveRepository
+import com.local.assistant.memory.db.ChunkEntity
+import com.local.assistant.memory.db.EventEntity
+import com.local.assistant.memory.db.FactEntity
+import com.local.assistant.memory.db.FactOrigin
+import com.local.assistant.memory.db.ForgetResult
+import com.local.assistant.memory.db.MemoryRepository
+import com.local.assistant.memory.db.NoteEntity
+import com.local.assistant.memory.db.TaskEntity
+import com.local.assistant.memory.db.TaskPlace
+import com.local.assistant.memory.db.TaskStatus
+import com.local.assistant.memory.notes.SavedImages
+import com.local.assistant.memory.tools.ReminderEdits
+import com.local.assistant.memory.tools.ReminderScheduler
+import com.local.assistant.memory.tools.TaskOps
+import kotlinx.coroutines.flow.Flow
+import java.time.Instant
+import java.time.ZoneId
+
+/**
+ * Everything the "What you know about me" screen can do: see, edit, pin and delete what the
+ * assistant knows, and the global controls. Deleted things stay deleted — a tombstone keeps the
+ * nightly pass from learning them again from old messages.
+ */
+class MemoryControls(
+    private val database: AppDatabase,
+    private val memory: MemoryRepository,
+    private val archive: ArchiveRepository,
+    private val chats: ChatRepository,
+    private val reminders: ReminderScheduler,
+    /** Something the prompt prefix shows changed; the live conversation should catch up. */
+    private val onChanged: suspend () -> Unit,
+    /** Images the user asked to have remembered; none in tests that do not need them. */
+    private val images: SavedImages? = null,
+    private val clock: () -> Long = System::currentTimeMillis,
+    private val zone: () -> ZoneId = ZoneId::systemDefault,
+    /** The town nearest a point, for a reminder's pin moved on the map. */
+    private val townAt: suspend (GeoPoint) -> String? = { null },
+) {
+    private val facts = database.factDao()
+    private val agenda = database.agendaDao()
+    private val sessions = database.sessionDao()
+    private val state = database.appStateDao()
+    private val edits = ReminderEdits(memory, reminders, clock, townAt)
+
+    fun observeFacts(): Flow<List<FactEntity>> = facts.observeAll()
+
+    fun observeTasks(): Flow<List<TaskEntity>> = agenda.observeOpenTasks()
+
+    /** Events that aren't over yet: a past one drops off once it has ended. */
+    fun observeEvents(): Flow<List<EventEntity>> = agenda.observeEvents(clock())
+
+    fun observeSavedImages(): Flow<List<NoteEntity>> = database.noteDao().observe()
+
+    // ---- Facts ----
+
+    /** The user typed a new value: it is theirs now, and nothing extracted will overwrite it. */
+    suspend fun edit(fact: FactEntity, value: String) {
+        val clean = FactKeys.value(value)
+        if (clean.isEmpty() || clean == fact.value) return
+        val now = clock()
+        facts.update(fact.copy(value = clean, origin = FactOrigin.USER_EDIT, statedAt = now, updatedAt = now, lastConfirmedAt = now))
+        onChanged()
+    }
+
+    /** Always in mind, or not. Only facts about the user themself can be. */
+    suspend fun setCore(fact: FactEntity, core: Boolean) {
+        if (fact.subject != FactKeys.USER || fact.core == core) return
+        facts.update(fact.copy(core = core, updatedAt = clock()))
+        onChanged()
+    }
+
+    /** What a delete took with it, so undo can put it all back. */
+    data class Deletion(val forgotten: ForgetResult, val snippets: List<ChunkEntity>)
+
+    /**
+     * Deletes [fact], leaves a tombstone, and empties the archived exchanges that state it: its
+     * value as a phrase, alongside the subject (or one of its names) when it is about someone else.
+     */
+    suspend fun delete(fact: FactEntity): Deletion {
+        val forgotten = memory.forgetFacts(fact.subject, fact.attribute)
+        val names = if (fact.subject == FactKeys.USER) {
+            // "short answers" or "Dr. Rao" can be common words; with the attribute, they are the fact.
+            if (fact.value.length < SHORT_VALUE) listOf(FactKeys.attribute(fact.attribute).removePrefix(FactKeys.PREFERENCE_PREFIX).replace('_', ' ')) else emptyList()
+        } else {
+            listOf(fact.subject.replace('_', ' ')) + aliasesOf(fact.subject)
+        }
+        val snippets = archive.forget(archive.mentioning(fact.value, names))
+        onChanged()
+        return Deletion(forgotten, snippets)
+    }
+
+    suspend fun undo(deletion: Deletion) {
+        memory.unforget(deletion.forgotten)
+        archive.restore(deletion.snippets)
+        onChanged()
+    }
+
+    /** The message a fact came from, and its chat, for "tap to see where this came from". */
+    suspend fun source(fact: FactEntity): Pair<MessageEntity, ChatEntity?>? {
+        val message = fact.sourceMessageId?.let { chats.message(it) } ?: return null
+        return message to chats.chat(message.chatId)
+    }
+
+    private suspend fun aliasesOf(subject: String): List<String> =
+        facts.aliases().filter { it.subject == subject }.map { it.alias.replace('_', ' ') }
+
+    // ---- Saved images ----
+
+    /** The row goes now; the image file waits for the nightly tidy, so undo can bring it back. */
+    suspend fun deleteSavedImage(note: NoteEntity) {
+        images?.remove(note)
+    }
+
+    suspend fun restoreSavedImage(note: NoteEntity) {
+        images?.restore(note)
+    }
+
+    /** A deleted saved image's file, now that its undo has passed. */
+    suspend fun discardSavedImageFile(note: NoteEntity) {
+        note.imagePath?.let { images?.discardFile(it) }
+    }
+
+    // ---- Profile ----
+
+    /** The profile fields as stored: attribute → value, for the fields that have one. */
+    suspend fun profile(): Map<String, String> {
+        memory.normalizeAttributes()
+        return com.local.assistant.memory.core.UserProfile.FIELDS.mapNotNull { field ->
+            facts.find(FactKeys.USER, field.attribute)?.let { field.attribute to it.value }
+        }.toMap()
+    }
+
+    /**
+     * Saves what the user typed: each filled field becomes their own edit, pinned to "Always in
+     * mind"; each field they cleared is forgotten, so it is not learned again from old chats.
+     * Returns whether anything changed.
+     */
+    suspend fun saveProfile(values: Map<String, String>): Boolean {
+        var changed = false
+        for (field in com.local.assistant.memory.core.UserProfile.FIELDS) {
+            val value = FactKeys.value(values[field.attribute].orEmpty())
+            val existing = facts.find(FactKeys.USER, field.attribute)
+            when {
+                value.isEmpty() && existing != null -> {
+                    memory.forgetFacts(FactKeys.USER, field.attribute)
+                    changed = true
+                }
+                value.isNotEmpty() && (existing == null || existing.value != value || !existing.core || existing.origin != FactOrigin.USER_EDIT) -> {
+                    memory.saveFact(FactKeys.USER, field.attribute, value, FactOrigin.USER_EDIT, pin = true)
+                    changed = true
+                }
+            }
+        }
+        if (changed) onChanged()
+        return changed
+    }
+
+    // ---- Possible duplicates ----
+
+    suspend fun duplicates(): List<DuplicateSuggestion> = AliasPlanner.suggestions(facts.all(), dismissed())
+
+    /** The user says they are the same: [from] becomes a name for [into]. */
+    suspend fun merge(from: String, into: String) {
+        memory.mergeSubjects(from, into)
+        onChanged()
+    }
+
+    suspend fun dismiss(suggestion: DuplicateSuggestion) {
+        state.put(AppStateEntity(KEY_DISMISSED, (dismissed() + suggestion.key).joinToString("\n")))
+    }
+
+    private suspend fun dismissed(): Set<String> =
+        state.get(KEY_DISMISSED)?.split("\n")?.filter { it.isNotBlank() }?.toSet().orEmpty()
+
+    // ---- Reminders and events ----
+
+    suspend fun completeTask(task: TaskEntity) {
+        val done = TaskOps.complete(task, Instant.ofEpochMilli(clock()).atZone(zone()))
+        memory.updateTask(done)
+        if (done.status == TaskStatus.OPEN && done.dueAt != null) reminders.schedule(done.id, done.dueAt) else reminders.cancel(task.id)
+        onChanged()
+    }
+
+    suspend fun deleteTask(task: TaskEntity) {
+        memory.deleteTask(task.id)
+        reminders.cancel(task.id)
+        onChanged()
+    }
+
+    /** [task] with new words and a new time, or for a place reminder its pins and circles; what can't be done is said to the user. */
+    suspend fun editTask(task: TaskEntity, title: String, at: Long?, place: TaskPlace? = null): ReminderEdits.Outcome =
+        edits.edit(task, title, at, place).also { if (it is ReminderEdits.Outcome.Saved) onChanged() }
+
+    /** Undoes an edit: [previous] is the reminder as it was. */
+    suspend fun undoEdit(previous: TaskEntity) {
+        edits.putBack(previous)
+        onChanged()
+    }
+
+    suspend fun restoreTask(task: TaskEntity) {
+        memory.insertTask(task)
+        when {
+            task.status != TaskStatus.OPEN -> Unit
+            task.dueAt != null && task.dueAt > clock() -> reminders.schedule(task.id, task.dueAt)
+            task.place != null -> reminders.schedulePlace(task.id, task.place)
+        }
+        onChanged()
+    }
+
+    /**
+     * Reminders whose time has come and gone: a one-off one is done — it rang, or its moment passed
+     * while the phone was off — and a repeating one moves on to its next time, so neither sits in
+     * the lists and the agenda for ever. Returns how many changed.
+     */
+    suspend fun finishPastReminders(): Int {
+        val now = clock()
+        var changed = 0
+        for (task in memory.openTasks()) {
+            val due = task.dueAt ?: continue
+            if (due > now - PAST_GRACE_MS) continue
+            val next = TaskOps.complete(task, Instant.ofEpochMilli(now).atZone(zone()))
+            memory.updateTask(next)
+            if (next.status == TaskStatus.OPEN && next.dueAt != null && next.dueAt > now) reminders.schedule(next.id, next.dueAt) else reminders.cancel(task.id)
+            changed++
+        }
+        if (changed > 0) onChanged()
+        return changed
+    }
+
+    suspend fun deleteEvent(event: EventEntity) {
+        memory.deleteEvent(event.id)
+        reminders.cancelEvent(event.id)
+        onChanged()
+    }
+
+    suspend fun restoreEvent(event: EventEntity) {
+        memory.insertEvent(event)
+        com.local.assistant.memory.tools.EventTimes.nextAlert(event, clock(), zone(), com.local.assistant.memory.tools.WhenDefaults().dateOnly)
+            ?.let { reminders.scheduleEvent(event.id, it.at, it.startsAt) }
+        onChanged()
+    }
+
+    // ---- Global controls ----
+
+    /**
+     * Facts, names, reminders and events, saved images, the archive's search index and every summary go.
+     * Chats stay as they are, but nothing is ever learned from what was said before now. The user's
+     * notes and lists stay too: like chats, they are what the user wrote, not what was learned.
+     */
+    suspend fun forgetEverything(skipExtractionTo: suspend (Long) -> Unit) {
+        for (task in agenda.allTasks()) reminders.cancel(task.id)
+        for (event in agenda.allEvents()) reminders.cancelEvent(event.id)
+        memory.transaction {
+            facts.deleteAll()
+            facts.deleteAllAliases()
+            agenda.deleteAllTasks()
+            agenda.deleteAllEvents()
+            sessions.clearSummaries()
+            database.chatDao().clearRollingSummaries()
+        }
+        archive.forgetAll()
+        images?.deleteAll()
+        skipExtractionTo(archive.lastMessageId())
+        onChanged()
+    }
+
+    /** Everything above, as JSON the user can keep. Chats and the images themselves are not included. */
+    suspend fun exportJson(): String {
+        val out = linkedMapOf<String, Any?>(
+            "exported_at" to Instant.ofEpochMilli(clock()).toString(),
+            "facts" to facts.all().map {
+                linkedMapOf(
+                    "subject" to it.subject, "attribute" to it.attribute, "value" to it.value,
+                    "category" to it.category.name.lowercase(), "always_in_mind" to it.core,
+                    "origin" to it.origin.name.lowercase(), "stated_at" to Instant.ofEpochMilli(it.statedAt).toString(),
+                )
+            },
+            "names" to facts.aliases().associate { it.alias to it.subject },
+            "reminders" to agenda.allTasks().map {
+                linkedMapOf(
+                    "title" to it.title, "due" to it.dueAt?.let { at -> Instant.ofEpochMilli(at).toString() },
+                    "repeat" to it.repeatRule, "status" to it.status.name.lowercase(),
+                )
+            },
+            "events" to agenda.allEvents().map {
+                linkedMapOf(
+                    "title" to it.title, "starts" to Instant.ofEpochMilli(it.startsAt).toString(),
+                    "all_day" to it.allDay, "repeat" to it.recurrence, "notes" to it.notes,
+                )
+            },
+            "saved_images" to database.noteDao().all().map {
+                linkedMapOf(
+                    "title" to it.title, "details" to it.details,
+                    "saved" to Instant.ofEpochMilli(it.createdAt).toString(),
+                    "file" to it.imagePath?.let { path -> java.io.File(path).name },
+                )
+            },
+            "notes_and_lists" to database.userNoteDao().all().map {
+                linkedMapOf(
+                    "title" to it.title, "kind" to it.kind.name.lowercase(), "pinned" to it.pinned,
+                    "text" to it.body.takeIf { _ -> it.kind == com.local.assistant.memory.db.NoteKind.NOTE },
+                    "items" to it.items.takeIf { _ -> it.kind == com.local.assistant.memory.db.NoteKind.LIST }?.map { item -> linkedMapOf("text" to item.text, "ticked" to item.done) },
+                    "changed" to Instant.ofEpochMilli(it.updatedAt).toString(),
+                )
+            },
+            "conversation_summaries" to sessions.summarised().map {
+                linkedMapOf("started" to Instant.ofEpochMilli(it.startedAt).toString(), "summary" to it.summary)
+            },
+        )
+        return GsonBuilder().setPrettyPrinting().disableHtmlEscaping().create().toJson(out)
+    }
+
+    /** Deletes messages older than [days] (0 keeps everything). Returns how many went. */
+    suspend fun applyRetention(days: Int): Int {
+        if (days <= 0) return 0
+        val cutoff = clock() - days * DAY_MS
+        val maintenance = database.maintenanceDao()
+        val deleted = maintenance.deleteMessagesBefore(cutoff)
+        maintenance.deleteEmptyChatsBefore(cutoff)
+        if (deleted > 0) {
+            archive.onChatsDeleted()
+            onChanged()
+        }
+        return deleted
+    }
+
+    private companion object {
+        const val KEY_DISMISSED = "duplicates.dismissed"
+        const val SHORT_VALUE = 12
+
+        /** A reminder can ring a few minutes late without exact alarms; after this it is past. */
+        const val PAST_GRACE_MS = 30 * 60 * 1000L
+        const val DAY_MS = 24 * 60 * 60 * 1000L
+    }
+}

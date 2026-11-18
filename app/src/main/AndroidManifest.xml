@@ -1,0 +1,358 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- Only used to download the model file. Inference itself is fully offline. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!-- Voice input. Images come from the photo picker, which needs no permission. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
+
+    <!-- Reminders. Notifications are asked for the first time a reminder is made, not at install.
+         Exact alarms are optional: without them a reminder may arrive a few minutes late. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <!-- "Wake me up at 6", "timer for 10 minutes": set in the phone's own clock app. -->
+    <uses-permission android:name="com.android.alarm.permission.SET_ALARM" />
+
+    <!-- "Call amma", "text Priya": asked the first time a name has to be looked up. Calls and
+         messages are only prepared — the dialer or messaging app opens and the user presses the
+         button — so neither CALL_PHONE nor SEND_SMS is needed. -->
+    <uses-permission android:name="android.permission.READ_CONTACTS" />
+
+    <!-- Photo search: asked on the first-launch page or when the Photos screen is first opened,
+         and only read. Android 14 lets people share just some photos instead of all of them. -->
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+    <uses-permission android:name="android.permission.READ_MEDIA_VISUAL_USER_SELECTED" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+    <!-- File search: files found by name and read on the phone when the user asks about one
+         (Play's "Search (on device)" use). Given on Android's All files access page, offered on
+         the first-launch page. Nothing is written or sent anywhere. -->
+    <uses-permission
+        android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
+        tools:ignore="ScopedStorage" />
+    <!-- The SMS inbox, kept for search like notifications: read only while the app is the
+         phone's digital assistant (Play's default assistant exception), and never sent. -->
+    <uses-permission android:name="android.permission.READ_SMS" />
+    <!-- "Photos in Munnar": where photos were taken. Android removes it from what the app reads
+         unless this is granted; asked on the Photos screen. Matched against a place list in the
+         APK, so no location leaves the phone. -->
+    <uses-permission android:name="android.permission.ACCESS_MEDIA_LOCATION" />
+
+    <!-- A place reminder, when the app isn't the phone's digital assistant: a foreground service
+         keeps the app awake so it rings on arrival with the screen off. As the assistant, the
+         system keeps the app up itself, and the service doesn't run. Of the location type, as it
+         is there for the location fixes (reminders/PlaceLookout); Play reviews a special-use one
+         case by case, and expects this type for location. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+    <!-- "Hey Luna": the same service listens for the wake word when that is turned on (off
+         by default). Heard on the phone, by a small model in the APK; the audio goes nowhere. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <!-- Live voice (live/, off unless a server is set): a call with Luna goes on while the user
+         is in another app, so its service is of the microphone and media-playback types. Agora's
+         SDK sets the call's audio route (speaker, earpiece, a Bluetooth headset). -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+
+    <!-- "How many steps today?", "how did I sleep?": read from Health Connect, where the phone's
+         health apps (Fitbit, OHealth, a watch's app) keep them. Read only, nothing is written;
+         each kind is asked for the first time it is asked about, or from Settings → Health data.
+         What is read stays on the phone. -->
+    <uses-permission android:name="android.permission.health.READ_STEPS" />
+    <uses-permission android:name="android.permission.health.READ_DISTANCE" />
+    <uses-permission android:name="android.permission.health.READ_TOTAL_CALORIES_BURNED" />
+    <uses-permission android:name="android.permission.health.READ_ACTIVE_CALORIES_BURNED" />
+    <uses-permission android:name="android.permission.health.READ_HEART_RATE" />
+    <uses-permission android:name="android.permission.health.READ_RESTING_HEART_RATE" />
+    <uses-permission android:name="android.permission.health.READ_SLEEP" />
+    <uses-permission android:name="android.permission.health.READ_EXERCISE" />
+
+    <!-- "Remind me to buy milk near DMart": asked the first time a place reminder is made. Precise
+         location finds "here" and the nearest branches; all the time lets Android ring the reminder
+         on arrival with the app closed (geofences). The location stays on the phone. -->
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
+
+    <!-- A place alarm takes the whole screen of a locked phone, as the clock's alarms do. -->
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+
+    <!-- "Turn on Do Not Disturb": the user still has to allow it in Settings. -->
+    <uses-permission android:name="android.permission.ACCESS_NOTIFICATION_POLICY" />
+
+    <!-- Model and voice downloads keep going with the app closed (model/BackgroundDownloads): as a
+         user-initiated data transfer job from Android 14, a plain foreground service before. -->
+    <uses-permission android:name="android.permission.RUN_USER_INITIATED_JOBS" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!-- The first big photo index carrying on after the app is closed, with a notice
+         (gallery/IndexService): local processing of the user's own photos, a data sync
+         foreground service. LiteRT's asset pack service, the other user, stays removed below. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.SET_ALARM" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.SET_TIMER" />
+        </intent>
+        <!-- open_app: the apps with a launcher icon, which is what the user can name. -->
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.DIAL" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.SENDTO" />
+            <data android:scheme="smsto" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.SENDTO" />
+            <data android:scheme="mailto" />
+        </intent>
+        <intent>
+            <action android:name="android.media.action.MEDIA_PLAY_FROM_SEARCH" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.WEB_SEARCH" />
+        </intent>
+        <package android:name="com.whatsapp" />
+        <package android:name="com.whatsapp.w4b" />
+        <!-- Health Connect as an app, on Android 13 and earlier. -->
+        <package android:name="com.google.android.apps.healthdata" />
+    </queries>
+
+    <application
+        android:name=".AssistantApplication"
+        android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:largeHeap="true"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.LocalAssistant">
+
+        <!-- Required for the LiteRT-LM GPU backend. -->
+        <uses-native-library android:name="libvndksupport.so" android:required="false" />
+        <uses-native-library android:name="libOpenCL.so" android:required="false" />
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:windowSoftInputMode="adjustResize"
+            android:theme="@style/Theme.LocalAssistant">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- Long-press the app icon: "Talk to assistant". -->
+            <meta-data android:name="android.app.shortcuts" android:resource="@xml/shortcuts" />
+        </activity>
+
+        <!-- The assistant overlay. Handling ASSIST is what lets the user pick this app as the
+             phone's digital assistant, which holding the power button then opens. Its own task,
+             kept out of Recents, so it floats over whatever app was open and leaves no trace. -->
+        <activity
+            android:name=".assist.AssistActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:launchMode="singleTask"
+            android:taskAffinity="${applicationId}.assist"
+            android:theme="@style/Theme.LocalAssistant.Assist"
+            android:windowSoftInputMode="adjustResize|stateHidden"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|uiMode|density">
+            <intent-filter>
+                <action android:name="android.intent.action.ASSIST" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
+        <!-- How health data is used: Health Connect shows its permission screen only to an app
+             with this page, and links to it from there. Android 13 and earlier open it with the
+             action below; 14 and later through the alias, which only the system may start. -->
+        <activity
+            android:name=".health.HealthPrivacyActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:theme="@style/Theme.LocalAssistant">
+            <intent-filter>
+                <action android:name="androidx.health.ACTION_SHOW_PERMISSIONS_RATIONALE" />
+            </intent-filter>
+        </activity>
+        <activity-alias
+            android:name=".health.ViewPermissionUsageActivity"
+            android:exported="true"
+            android:permission="android.permission.START_VIEW_PERMISSION_USAGE"
+            android:targetActivity=".health.HealthPrivacyActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW_PERMISSION_USAGE" />
+                <category android:name="android.intent.category.HEALTH_PERMISSIONS" />
+            </intent-filter>
+        </activity-alias>
+
+        <!-- "While you were away": a pane of glass at the bottom of the screen, opened after an
+             unlock (through the assistant session, as a background app can't open a screen) or
+             from its notification. Its own task, out of Recents, like the overlay. -->
+        <activity
+            android:name=".away.BriefActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:launchMode="singleTask"
+            android:taskAffinity="${applicationId}.away"
+            android:theme="@style/Theme.LocalAssistant.Brief"
+            android:windowSoftInputMode="adjustResize|stateHidden"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|uiMode|density" />
+
+        <!-- A place alarm ringing on a locked or sleeping phone: the whole screen, over the lock
+             screen, opened by its notification. See-through like the overlay, so what's behind
+             shows frosted. Its own task, out of Recents. -->
+        <activity
+            android:name=".reminders.PlaceAlarmActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:launchMode="singleTask"
+            android:taskAffinity="${applicationId}.alarm"
+            android:theme="@style/Theme.LocalAssistant.Assist"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|uiMode|density" />
+
+        <!-- A live call with Luna (live/LiveSession): dark and full screen, kept on while it lasts,
+             and over the lock screen when it was started there. Its own task, so the call's
+             notification goes back to it from any app. -->
+        <activity
+            android:name=".ui.live.LiveCallActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:launchMode="singleTask"
+            android:taskAffinity="${applicationId}.live"
+            android:theme="@style/Theme.LocalAssistant"
+            android:windowSoftInputMode="adjustResize|stateHidden"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|uiMode|density" />
+
+        <!-- "Luna is calling" at a dose's time (live/CheckIns): over the lock screen, as a call
+             is, opened by the ringing notification. -->
+        <activity
+            android:name=".ui.live.IncomingCallActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:launchMode="singleTask"
+            android:taskAffinity="${applicationId}.live"
+            android:theme="@style/Theme.LocalAssistant"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|uiMode|density" />
+
+        <!-- Reads incoming notifications for "While you were away", once the user has turned it on
+             and given the app notification access in Android's settings. What it keeps stays on
+             the phone, in its own database, for two days. Only the system can bind it. -->
+        <service
+            android:name=".away.MessageListener"
+            android:exported="false"
+            android:label="@string/away_listener_label"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+            <!-- Music, navigation, downloads in progress: never wanted, so never sent. -->
+            <meta-data
+                android:name="android.service.notification.disabled_filter_types"
+                android:value="ongoing" />
+        </service>
+
+        <!-- The digital assistant as Android runs one: holding the power button asks it for a
+             session, which opens the overlay above, and the wake word asks for one too, which a
+             background app couldn't otherwise do. Only the system can bind these. -->
+        <service
+            android:name=".assist.AssistantInteractionService"
+            android:exported="true"
+            android:permission="android.permission.BIND_VOICE_INTERACTION">
+            <meta-data android:name="android.voice_interaction" android:resource="@xml/voice_interaction_service" />
+            <intent-filter>
+                <action android:name="android.service.voice.VoiceInteractionService" />
+            </intent-filter>
+        </service>
+        <service
+            android:name=".assist.AssistantSessionService"
+            android:exported="true"
+            android:permission="android.permission.BIND_VOICE_INTERACTION" />
+        <service
+            android:name=".assist.AssistantRecognitionService"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.speech.RecognitionService" />
+            </intent-filter>
+        </service>
+
+        <service
+            android:name=".assist.KeepReadyService"
+            android:exported="false"
+            android:foregroundServiceType="location|microphone" />
+
+        <service
+            android:name=".live.LiveCallService"
+            android:exported="false"
+            android:foregroundServiceType="microphone|mediaPlayback" />
+
+        <service
+            android:name=".model.DownloadJob"
+            android:exported="false"
+            android:permission="android.permission.BIND_JOB_SERVICE" />
+        <!-- From Android 14, the check or unpack after a download: no permission or declaration. -->
+        <service
+            android:name=".model.FinishService"
+            android:exported="false"
+            android:foregroundServiceType="shortService" />
+        <!-- Before Android 14 only, where a foreground service needs no type. -->
+        <service
+            android:name=".model.DownloadService"
+            android:exported="false" />
+        <!-- The download notification's Pause. -->
+        <receiver android:name=".model.PauseDownloadsReceiver" android:exported="false" />
+        <!-- Photos and faces indexed after the app is closed, while a big backlog is left. -->
+        <service
+            android:name=".gallery.IndexService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+        <receiver android:name=".reminders.ReminderReceiver" android:exported="false" />
+        <receiver android:name=".reminders.ReminderActionReceiver" android:exported="false" />
+        <receiver android:name=".reminders.EventReminderReceiver" android:exported="false" />
+        <receiver android:name=".reminders.PlaceReminderReceiver" android:exported="false" />
+        <receiver android:name=".live.CheckInReceiver" android:exported="false" />
+
+        <!-- Only the system can send these, so exporting the receiver lets nothing else in. -->
+        <receiver android:name=".reminders.RescheduleReceiver" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.TIME_SET" />
+                <action android:name="android.intent.action.TIMEZONE_CHANGED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+                <action android:name="android.app.action.SCHEDULE_EXACT_ALARM_PERMISSION_STATE_CHANGED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Screenshots shared to WhatsApp, email or messages (device/AndroidPhone): read only by
+             the app they're sent to, for the one file, through a grant on the share intent. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.share"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/shared_files" />
+        </provider>
+
+        <!-- See FOREGROUND_SERVICE_DATA_SYNC above. -->
+        <service
+            android:name="com.google.android.play.core.assetpacks.ExtractionForegroundService"
+            tools:node="remove" />
+    </application>
+</manifest>

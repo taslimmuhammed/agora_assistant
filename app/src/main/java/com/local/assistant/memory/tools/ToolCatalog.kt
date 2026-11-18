@@ -1,0 +1,364 @@
+package com.local.assistant.memory.tools
+
+/**
+ * The tools the model can call, as OpenAPI function declarations.
+ *
+ * Descriptions are routing rules, kept short on purpose: they sit in every conversation's prefix
+ * and count against its budget, and a 4B model follows a crisp "use when …" better than an
+ * essay. If the model misroutes a kind of request, fix it here and in [RULES] — never with regex
+ * routing that goes around the model. ([InstantCommands] isn't a fix for misrouting: it spares the
+ * model only whole messages that can mean one thing, which it already routes right, for speed.)
+ */
+object ToolCatalog {
+
+    const val ADD_TASK = "add_task"
+    const val UPDATE_TASK = "update_task"
+    const val ADD_EVENT = "add_event"
+    const val SAVE_FACT = "save_fact"
+    const val GET_UPCOMING = "get_upcoming"
+    const val SEARCH_MEMORY = "search_memory"
+    const val FORGET = "forget"
+    const val SET_ALARM = "set_alarm"
+    const val REMEMBER_IMAGE = "remember_image"
+    /** Not "call": Gemma writes a tool call as `call:<name>{…}`, and `call:call` fails to parse. */
+    const val CALL = "phone_call"
+    const val SEND_MESSAGE = "send_message"
+    const val SET_TIMER = "set_timer"
+    const val OPEN_APP = "open_app"
+    const val PHONE_SETTING = "phone_setting"
+    const val CALCULATE = "calculate"
+    /** Not "web_search": beside search_memory the model blended the two ("web_search_memory"). */
+    const val WEB_SEARCH = "web_lookup"
+    /** Not "search_photos", for the same reason. */
+    const val FIND_PHOTOS = "find_photos"
+    const val TAKE_SCREENSHOT = "take_screenshot"
+    /** Not "get_health": beside get_upcoming the model could blend the two, as it did search tools. */
+    const val HEALTH = "health_data"
+    /** Notes and lists. Not "save_note" or "update_note": beside save_fact and update_task the names could blend. */
+    const val EDIT_NOTE = "edit_note"
+    /**
+     * Files on the phone by name, read when asked about. Not "find_files" or "search_files":
+     * beside find_photos and search_memory the names could blend, as web_search and search_memory did.
+     */
+    const val READ_FILE = "read_file"
+    /**
+     * Messages that came to the phone (`inbox/Inbox`). Not "search_messages" or "read_messages":
+     * beside send_message and search_memory the names could blend.
+     */
+    const val CHECK_INBOX = "check_inbox"
+
+    /**
+     * Not a tool the model calls: the TOOL row that keeps the photos shown under a reply because
+     * the message itself was searched for (`gallery/PhotoRecall`), so the chat draws them as it
+     * draws find_photos'. Left out of what a turn is judged by (`ChunkPolicy.isUtility`).
+     */
+    const val RELATED_PHOTOS = "related_photos"
+
+    /** Tools that change something, as opposed to reading it. */
+    val WRITES = setOf(ADD_TASK, UPDATE_TASK, ADD_EVENT, SAVE_FACT, FORGET, SET_ALARM, REMEMBER_IMAGE, EDIT_NOTE)
+
+    /** The everyday tools (`DeviceTools`): they act on the phone, never on memory. */
+    val DEVICE = setOf(CALL, SEND_MESSAGE, SET_TIMER, OPEN_APP, PHONE_SETTING, CALCULATE, TAKE_SCREENSHOT)
+
+    /** Device tools with an effect a repeat would duplicate: a second dialer, a second timer. */
+    val DEVICE_ACTIONS = DEVICE - CALCULATE
+
+    /**
+     * Tools that bring another app to the front. Once one has, this app is in the background and
+     * Android stops it opening anything else, the clock app included, so a turn runs them last.
+     */
+    val HANDOFFS = setOf(CALL, SEND_MESSAGE, OPEN_APP)
+
+    /** Tools whose answer a request may go on to use: "what's 18% of 2450? remind me to pay that much". */
+    val LOOKUPS = setOf(CALCULATE, WEB_SEARCH, SEARCH_MEMORY, GET_UPCOMING, HEALTH)
+
+    /**
+     * Tools that answer from the user's messages or files: photos that only look like the question
+     * don't go under such an answer. "Do you have any latest messages" got a card of chat
+     * screenshots after check_inbox's answer, twice in one day (14 Nov 2026).
+     */
+    val ANSWERS_FROM_ELSEWHERE = setOf(CHECK_INBOX, READ_FILE)
+
+    /** Tools that carry words a lookup's answer could go into: a reminder's title, a message. */
+    val TAKES_ANSWERS = setOf(ADD_TASK, ADD_EVENT, SEND_MESSAGE, SAVE_FACT, EDIT_NOTE)
+
+    /** Tools that do something for the user: a turn that ran one was a command, however it was put. */
+    val ACTS = WRITES + DEVICE_ACTIONS
+
+    /**
+     * What runs on the lock screen (the user, 2026-10-30: "on lock-screen it'll have no access any
+     * memory including photos, but it can set reminders, alarms, etc, if user asks to do something
+     * else or remember something ask for unlocking the phone first"). These add something or act
+     * on the phone without reading anything of the user's back; any other call asks for an unlock.
+     */
+    val LOCKED = setOf(ADD_TASK, ADD_EVENT, SET_ALARM, SET_TIMER, PHONE_SETTING, CALCULATE, WEB_SEARCH)
+
+    /** Tools that don't touch memory, run outside its transaction: they wait on apps, dialogs, the network or the photo model. */
+    val OUTSIDE_MEMORY = DEVICE + WEB_SEARCH + FIND_PHOTOS + HEALTH + READ_FILE + CHECK_INBOX
+
+    /**
+     * Every tool the model is given; web search only once the user has set it up, photo search
+     * only once its model is installed and the app may see the photos, health data only on a
+     * phone with Health Connect (asking for access the first time it's used), files only with
+     * All files access, and messages only while they are kept (Settings › Messages).
+     */
+    fun declarations(web: Boolean, photos: Boolean = false, health: Boolean = false, files: Boolean = false, inbox: Boolean = false): List<String> =
+        declarations + listOfNotNull(
+            WEB_DECLARATION.takeIf { web },
+            PHOTOS_DECLARATION.takeIf { photos },
+            HEALTH_DECLARATION.takeIf { health },
+            FILES_DECLARATION.takeIf { files },
+            INBOX_DECLARATION.takeIf { inbox },
+        )
+
+    /** How to use the tools, appended to the instructions (section A) when tools are declared. */
+    fun rules(web: Boolean, photos: Boolean = false, health: Boolean = false, files: Boolean = false, inbox: Boolean = false): String = RULES
+        .replace(WEB_SLOT, if (web) WEB_RULE + "\n" else "")
+        .replace(PHOTOS_SLOT, if (photos) PHOTOS_RULE + "\n" else "")
+        .replace(HEALTH_SLOT, if (health) HEALTH_RULE + (if (web) HEALTH_OFFLINE else "") + "\n" else "")
+        .replace(FILES_SLOT, if (files) FILES_RULE + "\n" else "")
+        .replace(INBOX_SLOT, if (inbox) INBOX_RULE + "\n" else "")
+        .replace(INBOX_CANT_SLOT, if (inbox) "" else INBOX_CANT)
+
+    private val FILES_DECLARATION = function(
+        READ_FILE,
+        "A file or folder on this phone by its name or kind, or what one says. name: words from its name as said (rental agreement, resume). type: pdf, word, spreadsheet, slides, text, audio or folder. when: when it was saved, in the user's words. question: what they ask about it, or to summarise it.",
+        required = emptyList(),
+        "name" to "string",
+        "type" to "string",
+        "when" to "string",
+        "question" to "string",
+    )
+
+    private const val FILES_RULE =
+        "- A file or folder on this phone by name or kind (\"my resume PDF\", \"summarise my rental agreement\", \"my Bank folder\") → read_file. Cards and IDs they keep as photos (licence, PAN, Aadhaar, passport) stay with find_photos."
+    private const val FILES_SLOT = "{files}\n"
+
+    private val INBOX_DECLARATION = function(
+        CHECK_INBOX,
+        "What someone sent the user, or whether a message came: SMS, WhatsApp, email and other messages that came to this phone. from: who sent it, a name or group as said. query: what about, a few words. app: only when they name one. when: when it came, in the user's words.",
+        required = emptyList(),
+        "from" to "string",
+        "query" to "string",
+        "app" to "string",
+        "when" to "string",
+    )
+
+    private const val INBOX_RULE =
+        "- What someone said or sent in a message to this phone (\"what did Rahul say about the trip\", \"did the bank SMS me today\") → check_inbox. Their words are never facts about the user. Sending one stays send_message."
+    private const val INBOX_SLOT = "{inbox}\n"
+
+    /** What can't be done without the inbox: said only while there isn't one. */
+    private const val INBOX_CANT = ", reading their inbox"
+    private const val INBOX_CANT_SLOT = "{cant_inbox}"
+
+    private val HEALTH_DECLARATION = function(
+        HEALTH,
+        "Use when the user asks about their own health or fitness numbers, recorded by this phone or their watch: steps (and how many are left to their daily step goal), how far they walked, calories burned, heart rate, resting heart rate, sleep, workouts. metric: steps, distance, calories, heart_rate, resting_heart_rate, sleep or exercise. when: the user's own time words, copied exactly (today, this morning, last night, yesterday, last week); leave it out for now or the latest.",
+        required = listOf("metric"),
+        "metric" to "string",
+        "when" to "string",
+    )
+
+    private const val HEALTH_RULE =
+        "- Their own steps (or their step goal, how many are left to it), distance, calories, heart rate, sleep or workouts → health_data, once per kind asked about. Answer only from its result, with its numbers and the time they cover; when it found nothing, say so and never guess a number. The step goal is changed in Settings, under Health data, not in chat. General health questions (what's a normal heart rate, how much sleep is enough): answer yourself."
+    private const val HEALTH_OFFLINE = " Their health readings stay on the phone: never put them in a web_lookup."
+    private const val HEALTH_SLOT = "{health}\n"
+
+    private val PHOTOS_DECLARATION = function(
+        FIND_PHOTOS,
+        "Use when the user wants to see their own photos or videos of something or someone, like their sunset photos, pictures of food, beach videos or photos of themself, or to get one of their own documents or cards (driving licence, passport, Aadhaar, PAN, insurance, ticket, bill): those are photos on this phone. query: what is in the photos in one or two words, singular: beach, not beaches or beach photos. When they ask for videos, keep the word video in it: beach video, or just video for all their videos. person: only for photos showing someone: me for the user, or names; several comma-separated for photos with all of them. My photos means photos the user has, not photos of them. place: where they were taken, a town, state or country: Munnar, Kerala, Dubai. when: when they were taken, in the user's words: last December, 2023, this year. question: only when they ask what a photo says, what they asked.",
+        required = emptyList(),
+        "query" to "string",
+        "person" to "string",
+        "place" to "string",
+        "when" to "string",
+        "question" to "string",
+    )
+
+    private const val PHOTOS_RULE =
+        "- Seeing their own photos or videos of something or someone → find_photos, with person: me for photos of the user. Getting, finding or showing one of their own documents or cards (licence, passport, Aadhaar, PAN, insurance, tickets, bills, certificates) → find_photos with its name as query: they keep them as photos on this phone; not web_lookup or search_memory. Asking what one of them says (their SSLC score, licence number, passport expiry) → the same, plus question, what they asked: \"what's my passport number\" is query passport, question passport number. Call it for every such request, even one like an earlier one: only the call shows the photos, and you can't know a count without it. The app shows the photos under your reply: say in one short sentence how many it found, and don't describe them; if they asked something in them, answer it from the photo it gives you. Photos already found for a question come attached to their message, with a note: if those answer it, answer from them without calling find_photos, unless they ask to see photos."
+    private const val PHOTOS_SLOT = "{photos}\n"
+
+    private val WEB_DECLARATION = function(
+        WEB_SEARCH,
+        "Use only for things that change or are too recent for you to know: news, weather, prices, scores, schedules; or when asked to look something up online. query: a short search phrase; topic: news for recent events.",
+        required = listOf("query"),
+        "query" to "string",
+        "topic" to "string",
+    )
+
+    private const val WEB_RULE =
+        "- News, weather, prices, scores and other things that change, or when asked to look something up online → web_lookup; answer from its results and name the site. General knowledge, how-to, advice and recipes: answer yourself."
+    private const val WEB_SLOT = "{web}\n"
+
+    /** The tools declared whatever is set up; see [declarations] for the full list. */
+    private val declarations: List<String> = listOf(
+        function(
+            ADD_TASK,
+            "Use when the user wants to be reminded or to do something later (\\\"remind me\\\", \\\"don't let me forget\\\"). Put the user's own time words in when, copied exactly. place: only for a reminder on reaching a place (\\\"near DMart\\\", \\\"when I reach office\\\"), the place as said; then no when.",
+            required = listOf("title"),
+            "title" to "string",
+            "when" to "string",
+            "repeat" to "string",
+            "place" to "string",
+        ),
+        function(
+            UPDATE_TASK,
+            "Use to complete, cancel, reopen or reschedule an existing reminder. task is its id from context or words from its title.",
+            required = listOf("task"),
+            "task" to "string",
+            "status" to "string",
+            "when" to "string",
+        ),
+        function(
+            ADD_EVENT,
+            "Use for something happening at a set time that the user will attend: appointments, meetings, birthdays, trips. Not for to-dos.",
+            required = listOf("title", "when"),
+            "title" to "string",
+            "when" to "string",
+            "ends" to "string",
+            "repeat" to "string",
+            "notes" to "string",
+        ),
+        function(
+            SAVE_FACT,
+            "Use when the user states a lasting fact about themselves or people and places in their life (\\\"my dentist is …\\\"), and when they tell you how to reply from now on (\\\"reply in short answers\\\": attribute pref.reply_style, core=true). subject is user or who it is about; attribute is short, like dentist or birthday. Not for plans, moods or questions.",
+            required = listOf("subject", "attribute", "value"),
+            "subject" to "string",
+            "attribute" to "string",
+            "value" to "string",
+            "core" to "boolean",
+        ),
+        function(
+            GET_UPCOMING,
+            "Use when the user asks what's coming up or for their schedule, beyond the agenda shown.",
+            required = emptyList(),
+            "days" to "integer",
+        ),
+        function(
+            SEARCH_MEMORY,
+            "Use when the user asks about something they told you before or a past conversation, and it isn't already in context. Not for advice, hypotheticals or general questions.",
+            required = listOf("query"),
+            "query" to "string",
+        ),
+        function(
+            SET_ALARM,
+            "Use when the user asks for an alarm (\\\"wake me up at 5:30\\\"). It rings in the phone's clock app. Put the user's own time words in when, copied exactly. label: only a name the user gives the alarm (\\\"for gym\\\": gym), never words of the request itself.",
+            required = listOf("when"),
+            "when" to "string",
+            "label" to "string",
+            "repeat" to "string",
+        ),
+        function(
+            REMEMBER_IMAGE,
+            "Use when the user asks you to remember or save an image they sent: a card, bill, document, screenshot or photo. The image itself is kept and shown to you again when they ask about it later. title: a few words naming it; details: everything you can read and see in it.",
+            required = listOf("title", "details"),
+            "title" to "string",
+            "details" to "string",
+        ),
+        function(
+            EDIT_NOTE,
+            "Use to make, change or delete the user's own notes and lists: shopping, packing, ideas, anything they ask you to note down or keep. note: its name or id (note 3); a name not there makes a new one. add: items to add, comma-separated, or text to add to a note. remove, check, uncheck: items, comma-separated; all, or done for the ticked ones. text: the whole new text. title: a new name. delete: true to delete it.",
+            required = listOf("note"),
+            "note" to "string",
+            "add" to "string",
+            "remove" to "string",
+            "check" to "string",
+            "uncheck" to "string",
+            "text" to "string",
+            "title" to "string",
+            "delete" to "boolean",
+        ),
+        function(
+            FORGET,
+            "Use when the user asks you to forget or delete something they told you.",
+            required = listOf("subject"),
+            "subject" to "string",
+            "attribute" to "string",
+        ),
+        function(
+            CALL,
+            "Use when the user asks you to call someone now. It opens the dialer; the user taps call. who: their name, relation or number, as said.",
+            required = listOf("who"),
+            "who" to "string",
+        ),
+        function(
+            SEND_MESSAGE,
+            "Use when the user asks you to text, WhatsApp or email someone now, or to send a message you wrote for them. It opens the app with the message written; the user taps send. to: name, relation, number or email; text: the message to send; app: sms, whatsapp or email, no other apps; screenshot: true to send the screenshot of their screen with it.",
+            required = listOf("to"),
+            "to" to "string",
+            "text" to "string",
+            "app" to "string",
+            "screenshot" to "boolean",
+        ),
+        function(
+            TAKE_SCREENSHOT,
+            "Use when the user asks you to take or save a screenshot. Saves the screen they were on when they called you to their gallery.",
+            required = emptyList(),
+        ),
+        function(
+            SET_TIMER,
+            "Use for a countdown timer. duration: the user's words for how long, copied exactly.",
+            required = listOf("duration"),
+            "duration" to "string",
+            "label" to "string",
+        ),
+        function(
+            OPEN_APP,
+            "Use to open an app, or for directions, songs, videos or a web search. app: its name, or maps, music, youtube or browser; query: what to find.",
+            required = listOf("app"),
+            "app" to "string",
+            "query" to "string",
+        ),
+        function(
+            PHONE_SETTING,
+            "Use to change a phone setting now. setting: flashlight, ringer, volume, do_not_disturb, wifi, bluetooth, mobile_data or airplane_mode; value: on, off, silent, vibrate, up, down or a percent.",
+            required = listOf("setting"),
+            "setting" to "string",
+            "value" to "string",
+        ),
+        function(
+            CALCULATE,
+            "Use for any arithmetic or unit conversion. expression: the sum or conversion, like 2450*18/100 or 5 miles in km.",
+            required = listOf("expression"),
+            "expression" to "string",
+        ),
+    )
+
+    private val RULES = """
+        Tools — call them rather than only saying you will:
+        - Reminders and to-dos → add_task, with the user's own time words in when, or for one on reaching a place ("near DMart", "when I get home") the place in place.
+        - Alarms ("set an alarm", "wake me up") → set_alarm, which rings in the phone's clock app.
+        - "Remember this" about an image → remember_image, with everything you can read in details (not save_fact).
+        - Shopping, packing and other lists, and notes they ask you to keep or write down → edit_note (not save_fact); reminders and to-dos stay add_task. Use the names under "Notes and lists:".
+        - Calls, messages, timers, apps and phone settings only when asked for now: "remind me to call amma at 6" is add_task, "I should call her" is no tool.
+        - Screenshots: "take a screenshot" → take_screenshot; sending or sharing it with someone → send_message with screenshot=true, its text saying what's on it if they asked. Calls and messages only open the app: say it's ready to send, never that it was sent.
+        - Any arithmetic or unit conversion → calculate.
+        - Changing, finishing or moving an existing reminder → update_task.
+        - Appointments, meetings, birthdays, trips → add_event.
+        - Lasting facts about the user or their people and places → save_fact. How they want you to reply from now on ("keep answers short", "reply in Hindi") → save_fact with core=true, then follow it. Never for questions, hypotheticals, wishes, other people's opinions, passing moods or jokes.
+        - "What's coming up" beyond the agenda → get_upcoming. Something told before that is not above → search_memory. "Forget …" → forget.
+        {web}
+        {photos}
+        {health}
+        {files}
+        {inbox}
+        After a tool succeeds, confirm in one short sentence. If it returns ok:false, ask the user for what is missing.
+        You act only through these tools. Never say you did something (sent, called, booked, set, saved) unless its tool succeeded just now. If none of them can do what is asked (Teams or Slack, bookings, payments, posts{cant_inbox}), say plainly that you can't, and offer what you can.
+    """.trimIndent()
+
+    private fun function(
+        name: String,
+        description: String,
+        required: List<String>,
+        vararg properties: Pair<String, String>,
+    ): String = buildString {
+        append("{\"name\":\"").append(name).append("\",\"description\":\"").append(description).append("\",")
+        append("\"parameters\":{\"type\":\"object\",\"properties\":{")
+        append(properties.joinToString(",") { (key, type) -> "\"$key\":{\"type\":\"$type\"}" })
+        append("},\"required\":[")
+        append(required.joinToString(",") { "\"$it\"" })
+        append("]}}")
+    }
+}

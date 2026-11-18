@@ -1,0 +1,1969 @@
+# Local Assistant: technical notes
+
+How the app is put together and why: the runtime, the memory system, the tools, the power-button
+assistant, and the measurements on a real phone behind each choice. To install and use the app,
+see the [README](../README.md).
+
+## What it does
+
+- Streams replies token-by-token from a local `.litertlm` model
+- Multiple chats — create, switch, resume, delete; everything persists across restarts
+- Gets the model either by **downloading** it (resumable) or **importing** one already on the device
+- Falls back GPU + MTP → GPU → CPU if a backend fails to start
+- Stop button that interrupts generation and keeps the partial reply
+- Opens from the power button as the phone's assistant, listens, and answers out loud (see
+  [Power-button assistant](#power-button-assistant))
+- Optionally, a live voice call with Luna through Agora and a server, with the on-device model as
+  the offline fallback (see [Live voice (Agora)](#live-voice-agora))
+
+## Requirements
+
+| | |
+|---|---|
+| Android | 8.0 (API 26) or newer, `arm64-v8a` |
+| Free storage | ~4.2 GB, plus ~0.35 GB for the search model and ~0.4 GB for photo search |
+| RAM | 8 GB+ recommended (GPU backend peaks around 0.7–1 GB, CPU around 3.3 GB) |
+| JDK (to build) | 17 |
+| NDK and CMake (to build) | NDK 28.2.13676358, CMake 3.22.1 (SDK Manager), for sqlite-vec |
+
+The LiteRT-LM AAR only ships `arm64-v8a` and `x86_64` native libraries, so `abiFilters` is set to
+match. There is no 32-bit build.
+
+## Build
+
+```bash
+./gradlew :app:assembleDebug
+```
+
+`local.properties` needs `sdk.dir` pointing at your Android SDK (already generated locally).
+
+## Getting the model
+
+On first launch the app shows the model screen. Two ways in:
+
+**Download** — pulls `gemma-4-E4B-it.litertlm` (3.66 GB) from the LiteRT community repo on
+Hugging Face. The file is public, so no token is needed. Downloads resume from wherever they
+stopped, which matters at this size.
+
+> **Use the unsuffixed file.** The same repo also has `-gpu.litertlm` and `-web.litertlm`. Despite
+> the name, `-gpu` is the **WebGPU** build — it is the same size as `-web` (2.97 GB) and matches the
+> "Web" row of the model card. On Android it loads without error and then emits raw vocab tokens
+> (`<unused30>`, `[multimodal]`, `<mask>`) instead of text. The backend is chosen at runtime in
+> `EngineConfig`, not by the filename; one file serves both CPU and GPU.
+
+**Load from device storage** — pick a `.litertlm` file you already have. LiteRT-LM needs a real
+filesystem path, and a `content://` URI from the picker is not one, so the file is **copied** into
+the app's private storage. Budget room for both copies while the copy runs.
+
+Sideloading is usually faster than downloading on the phone:
+
+```bash
+adb push gemma-4-E4B-it.litertlm /sdcard/Download/
+```
+
+Then pick it from the file picker.
+
+**The memory-search model is the photo model.** EmbeddingGemma 2 (388 MB) downloads by itself
+right after the first chat model, from litert-community on Hugging Face: nothing to host, no
+account. Settings → About shows the models' licences in the app.
+
+## Architecture
+
+```
+AssistantApplication
+└── AppContainer                  manual DI; one instance per process
+    ├── SettingsStore             model path, backend prefs, system prompt
+    ├── AppDatabase (Room)        chats, messages and memory, one file (assistant.db)
+    │   ├── ChatRepository        every message written with its session and token estimate
+    │   ├── MemoryRepository      facts, tombstones, agenda
+    │   └── ArchiveRepository     every exchange as a chunk: keyword index, vectors, backlog
+    ├── ModelManager (×3)         download / import the chat model, the photo model, an imported embedder
+    ├── LlmService                owns the LiteRT-LM Engine
+    ├── LiteRtLmBackend           LlmBackend: conversations, streaming, one-shot completions
+    ├── MemoryEmbedder            memory search's model: the photo model's text side (GalleryEmbedder,
+    │                             LiteRT-LM EmbeddingEngine, text on the CPU), or an imported one (LiteRtEmbedder)
+    ├── ModelScheduler            one model job at a time; the user always first
+    ├── EmbeddingQueue            embeds the archive's backlog while the user is idle
+    ├── Retriever                 per-turn recall: facts, then keyword + vector search, fused
+    ├── ConversationManager       the live conversation, when to rebuild it, rolling compaction
+    ├── TurnRunner                one user turn: prepare, send, stream, archive
+    ├── SessionSummaries          ends sessions and summarises them (session-end job)
+    ├── Consolidation             the nightly job: backlog, summaries, extraction, aliases, upkeep
+    └── MemoryControls            what the "What I know about you" screen can see and change
+```
+
+### LlmService and the backend
+
+The piece worth understanding before extending anything.
+
+- **One `Engine` per process.** Loading costs seconds and gigabytes, so it is shared across all
+  chats. It is kept alive while the app is in use, and released under memory pressure once the
+  app is in the background (`onTrimMemory`); coming back loads it again.
+- **Everything above the engine talks to `LlmBackend`**, not LiteRT-LM, so another runtime can be
+  added later. `LiteRtLmBackend` is the only implementation.
+- **One live `Conversation`, for the chat in use.** It holds the KV cache, so continuing the chat
+  only prefills the new turn. `ConversationManager` rebuilds it — system prefix plus the last few
+  turns through `ConversationConfig.initialMessages` — only at natural boundaries: switching
+  chats, after a restart, when a turn was interrupted, or when something outside the chat changed
+  what the prefix would say.
+- **Interrupted turns invalidate the cache.** If generation is stopped or fails, the native cache
+  no longer matches what was persisted, so it is dropped and rebuilt from the database next turn.
+
+Prompt templating, BOS tokens and turn markers are handled inside LiteRT-LM — the app passes plain
+strings and roles, never raw template text.
+
+### Prompt layout
+
+The system instruction is byte-stable for a conversation's life: instructions, the "always keep
+in mind" block rendered from core facts, a summary carried over from earlier, and an agenda
+snapshot dated to the day. Anything that changes per turn — the current time, facts recalled for
+this message — goes in front of the user's words in the user turn, as `[Now: …]` and
+`[Memory: …]` lines. Only the user's own words are stored.
+
+The instructions open with who the model is: "You are Luna, a helpful assistant running entirely
+on the user's device." Luna is the wake word's name (`WakeWord.NAME`). The user asked on
+2026-10-30: "since the model is now named as luna, it should be aware of it … also tell it to
+behave as an assistant if it's not present". The persona is a setting (`systemPrompt`) with that
+sentence as its default. If a persona never says "assistant", `Instructions.identity` puts "You
+are a helpful assistant running entirely on the user's device." before it, and if it never says
+"Luna", "Your name is Luna." after. In `RoutingEvalTest` on the phone at temperature 1.0, the
+change cost 2 tokens (instructions 901 → 903) and left routing where it was: 88 of 94 right
+before and after, with 78/79 tool requests either way. "I live in Bengaluru" now calls
+`save_fact`, and "what's my dentist's name?" now goes to `find_photos` (it has gone both ways
+before). "What's your name?" and "hey Luna, who are you?" get "I am Luna, a helpful assistant
+running entirely on your device."
+
+Every token limit lives in `memory/prompt/MemoryBudget.kt`, with a 16K profile and an 8K one,
+chosen from the window the engine runs with (8K unless changed in Settings). The prompt is planned to stay well under the window
+(12,000 of 16,384 at most) and shed in a fixed order when it would not: recalled snippets, then
+recalled facts, then the summary, then the oldest turns, then core facts by priority — never the
+user's response preferences.
+
+### Recall and the archive
+
+Every exchange — the user's message and the first 300 characters of the reply — is stored as a
+chunk in `chunks`, keyword-indexed (FTS4) at once and embedded later by `EmbeddingQueue`, only
+while the user is neither generating nor typing. Voice notes are archived by their words when they
+were written down (see "Writing voice messages down"), never otherwise; greetings and
+"ok thanks" are stored and keyword-searchable but not embedded. Existing chats are archived on the
+first start (`ArchiveRepository.backfill`). Sums, working the phone and photo searches are left
+out (`ChunkPolicy.isUtility`), with or without their tool: recalled, an old sum's digits got mixed
+into a new one, and an old photo answer was repeated instead of searching again ("I found 0
+photos in Kashmir", no photos shown). Raising `UTILITY_CLEANUP_VERSION` takes such exchanges out
+of an existing archive once; on the test phone, adding photo searches took 62 out, and repeated
+photo questions then searched 8 times in 8 (4 in 8 before).
+
+Before each turn, `Retriever` recalls, across all chats:
+
+1. nothing at all for trivial messages (fewer than three words, acknowledgements), nor for
+   commands (`QueryText.isCommand`: an alarm, a timer, a reminder, a call, a message, an app, a
+   setting, a list), which are acted on rather than answered (the user's call, 30 Oct 2026). Only
+   what is plainly put as a command counts: "remind me what I said about Goa" and "send me my PAN
+   number" are questions, since a question taken for a command would lose its memory. On the
+   phone a command's recall took 0–87 ms and brought at most one snippet (about 40 tokens);
+   commands get no photos either (below);
+2. non-core facts whose subject, alias or text matches the message (`[Memory: …]`);
+3. archived exchanges: the keyword top 20 (BM25 from FTS4's `matchinfo`) and the vector top 20,
+   leaving out exchanges already in the conversation, fused by reciprocal rank (k = 60, newer wins
+   ties). One goes in only if its cosine similarity reaches the model's threshold (0.6 to start)
+   or it contains one of the message's rare words — a name, an acronym, a number. They appear
+   dated, as `[Memory (3 Sep 2026): …]`, and the instructions say newer beats older and facts beat
+   both.
+
+**While the message is typed.** Once typing pauses for 400 ms, what's typed so far is embedded
+(`ConversationManager.typing(draft)` → `Retriever.prepareQuery`), opening the embedding model
+first if it was let go. Sent as it stood, the message's recall finds its vector waiting: the
+retriever keeps the last one, and the photo model keeps its last text vector too, so photo search
+reuses it. Nothing is embedded ahead for what recall skips: small talk and commands. On the phone
+(`MemoryEvalTest -e eval memory`, `recallTiming`, 14 Nov 2026) embedding a message took ~55 ms
+once the model was warm, so memory recall took 73 ms with a new message and 16–18 ms with its
+vector waiting, and photo search 64–105 ms against 10–27 ms. It matters most when the embedding
+model had been let go: opening it took 340–470 ms and its first embedding 535 ms, ~1 s that now
+passes while the user is still typing.
+
+Vectors are the embedder's first 256 dimensions (Matryoshka), L2-normalised and stored as int8 —
+256 bytes a chunk. `chunks.embedding` is the source of truth; the search index is derived and
+rebuilt whenever it might disagree. That index is [sqlite-vec](https://github.com/asg017/sqlite-vec)
+v0.1.9, compiled from source in `src/main/cpp` and loaded into the bundled SQLite as an extension;
+on a device where it fails to load, `KotlinVectorIndex` scores the same bytes with the same
+arithmetic (`VectorParityTest` checks both return identical neighbours). Vectors from different
+models are never compared: changing the embedder sends the archive back to the backlog.
+
+The embedder is optional and set up under Settings → Model and memory search. It is the photo
+model's text side, **EmbeddingGemma 2** (see Photos): one engine, `gallery/GalleryEmbedder`,
+serves both, so they share one download and one copy in memory (`memory/embed/PhotoModelEmbedder`).
+Memory search holds it while the app is in front: it loads as the app or the overlay comes up
+(`EmbeddingQueue`, about half a second) and goes once the app is out of sight and the backlog
+is done (on every phone since 7 Nov 2026, so the home screen has ≈190 MB less to take back when
+the app is left; before, only on phones of 8 GB or less). Photo search
+releases it when done, which reopens it without the vision encoder if an image had loaded it
+(≈350 MB of the engine's memory). It downloads by itself right after the first chat model
+(`AppContainer.fetchPhotoModelAfterFirstModel`), and from the screen above. An embedder imported
+from storage is used instead when there is one (`memory/embed/MemoryEmbedder`);
+[Granite Embedding 311M multilingual](https://huggingface.co/litert-community/granite-embedding-311m-multilingual-r2)
+(332 MB, Apache-2.0), the download in the first builds, is recognised by its name. Without one,
+recall still works on keywords and rare words.
+
+EmbeddingGemma 300M did memory search until 2026-11-07, as a model of its own. On the target
+phone the two were both loaded during chats, ≈250 MB each; now one is. On 61 labelled pairs
+(`TextEmbedderEvalTest`) both recall 73% of related pairs at their thresholds, at a precision of
+≈0.90 for EmbeddingGemma 2 against 0.95; with no wrong pair allowed, 54% against 69%. The first
+launch after the change deletes the old file and its cache, and the archive is embedded again.
+
+EmbeddingGemma 2's similarities sit high and close together (related pairs' median 0.79,
+unrelated 0.66), so its inject threshold is 0.75, and search_memory's 0.68, just under the
+lowest related pair. Measured on the target phone:
+
+| | |
+|---|---|
+| EmbeddingGemma 2 load, text side (once, on CPU) | 0.6 s |
+| Embedding the user's message before a reply | 51 ms median |
+| Recall without vectors (FTS, fusion, facts) | 44 ms |
+| KNN over 55,000 chunks, k = 40 | 18–31 ms sqlite-vec, 30–51 ms Kotlin |
+
+**Photos with a question** (`gallery/PhotoRecall`). Asked "did I ever participate in push to prod
+hackathon?", the model searched memory and said it had no record, and "when is corniche resto's
+anniversary celebration" went to the web, while Photos found both for "push to prod" (30 Oct
+2026). So each question is also run against the photo index, whole, beside memory's recall, and
+up to two photos go with the message, as attachments, with a line saying they were found for it
+and to leave them unmentioned if they aren't about it (`PromptAssembler.renderPhotos`).
+
+- **The closest photos are shown either way.** Under the reply, as a "Related photos" card drawn
+  like find_photos' (a TOOL row of its own, `ToolCatalog.RELATED_PHOTOS`, which the archive
+  ignores): those within 0.04 of the best of the 10 closest, when the best scores at least 0.75
+  (`PhotoRecall.SHOWN_FROM`), below the bar for sending them, so the user can find the answer in
+  one the model wasn't sent. At first shown whatever they scored (the user's call, 1 Nov 2026),
+  then given that lower bar: on the phone's photos it shows for 11 of 16 questions the photos
+  answer and 2 of 30 general ones. Not when a photo
+  search in the turn showed its own, nor for commands or over the lock screen. A command is also
+  known by what the turn did: one that ran a tool in `ToolCatalog.ACTS` (a reminder, an alarm, a
+  call…) gets no card, however it was put; "set alarm at 4:30" written down as "sarlamat 4:30
+  p.m. today" got one before. Greetings ("good morning Luna", "hi, how are you?",
+  `QueryText.isSmallTalk`) aren't searched for photos at all; memory still is.
+- **Not with messages or files.** "Do you have any latest messages" got a card of chat
+  screenshots under check_inbox's answer, twice on 14 Nov 2026. While messages are kept, a
+  question that names them ("messages", "texted", "SMS", "WhatsApp"…, with no photo or screenshot
+  named: `QueryText.asksAboutMessages`) isn't searched for photos, and a turn that ran check_inbox
+  or read_file (`ToolCatalog.ANSWERS_FROM_ELSEWHERE`, from `LoopEvent.Done.tools`) gets no card
+  however it was put. In VoiceChatReplayTest the two "latest messages" turns had the card before
+  and none after, in two runs.
+- **Only a clear match goes to the model.** A whole question scores differently from a short search: of 30
+  general questions on the test phone's 2,685 photos ("what is the capital of France?", "tell me a
+  joke") the best photo scored up to 0.777, so the search's own floor (0.72) would have sent
+  photos with 6 of them. A photo goes when the best scores 0.80 or more, or stands 0.065 above the
+  10th best (`PhotoRecall.passes`): 7 of 16 questions the photos answer passed, the user's two
+  among them (0.809 and 0.840), and none of the 30 general ones (`PhotoRecallCalibrationTest`,
+  `-e eval photorecall`; the model was shown each best photo and said yes or no to "does it help",
+  so nobody looked at the photos). The second photo goes only within 0.04 of the first.
+- **Not for commands, ID numbers or a message with its own attachment.** An ID number (PAN, card,
+  licence…) is left to find_photos, whose reader copies and checks it: read inside the chat the
+  PAN came out wrong in one run of two. A saved image the message is about counts towards the two.
+- **A photo isn't sent twice in one conversation** (a second copy garbled numbers); the line points
+  back at it instead. When the window is full, photos go after snippets, before facts.
+- **The rules say to answer from them.** Told only that they "may be about this message", the
+  model searched the photos again every time (4 of 4), and the find_photos rule then has it say
+  only how many it found ("I found one photo related to…"). The line now says they were found for
+  this message, and the find_photos rule says attached photos that answer a question are answered
+  from without searching again, unless they ask to see photos (instructions v8). Yes/no questions
+  about the user ("did I…", "have I…", "is my…") count as questions to read a found photo for.
+- **Measured on the phone** (`-e eval photoanswers`, through the app's own chat sender and the
+  user's memory): "when is corniche resto's anniversary celebration" was answered from the
+  attached poster in 11.3 s and "what tests did the doctor advise?" in 17.4 s, neither searching
+  again; "did I ever participate in push to prod hackathon?" searched and its reader answered from
+  a chat screenshot (22.6 s); general questions got no photos and took 8 s as before. The search
+  itself takes 75–160 ms (0.6 s when the photo model loads); each photo sent adds roughly 3 s of
+  reading for the model.
+
+### Summaries, compaction and the nightly job
+
+Background model work never shares the model with a chat: it asks `ConversationManager` to
+close the live conversation first (`withModelFree`), runs one short call at temperature 0.2 with
+thinking off, and the next turn rebuilds. Every such job goes through the `ModelScheduler` below
+the user's own turns and stops the moment they start typing.
+
+- **Rolling compaction.** After a reply, once the chat has been quiet for 30 seconds, a
+  conversation past `compactionTrigger` (4,000 tokens on the 8K profile) — or one rebuilt without
+  turns that no summary covers, like a long chat reopened after a restart — has its older turns
+  folded into the chat's "Earlier in this chat" summary (≤ 300 tokens), keeping the newest turns
+  that land the rebuilt prompt near `compactionTarget`. If a send would overflow before that
+  happened, it compacts first and the chat shows "Tidying up…".
+- **Session summaries.** Ten minutes after the app goes to the background, a WorkManager job
+  ends the sessions that went quiet and summarises them (topics, decisions, open loops, in the
+  user's language) if the engine is still loaded; otherwise they wait for the nightly job. The
+  newest summary opens later conversations as "Last time you talked". Summaries are context only:
+  nothing reads facts out of them.
+- **The nightly job** runs on the charger with the phone idle, eight minutes at a time with a
+  continuation for the rest, every step resuming where it stopped: embed the backlog, fill pending
+  summaries, extract, merge names, SQLite and FTS upkeep, and delete history past the retention
+  setting. It skips warm nights.
+- **Extraction** reads user messages after a watermark, a batch at a time, and asks for a
+  constrained JSON array of facts, tasks and events. Messages whose turn already made a tool call,
+  trivial ones, voice notes and paused ones are skipped. The examples in the prompt include what
+  must yield nothing (questions, hypotheticals, other people's opinions, moods, sarcasm), and every
+  item is checked in code (`ExtractionRouter`): it must point at a message in its batch; facts go
+  through the usual upsert rules with the message's own time, so tombstones and the user's edits
+  win; only reply preferences may be core; tasks and events need a time still ahead and are not
+  added twice.
+- **Names.** "amma", "mummy" and "mom" are filed under `mother` when written; the nightly job
+  merges any keys that normalise together, and anything that only looks alike ("priya" and
+  "priya_sharma") becomes a question on the memory screen rather than a merge.
+
+### Your profile
+
+The first time the app opens it asks, before anything else, for a few optional details: name,
+age, work, city, languages and interests (`memory/core/UserProfile.kt`). They are ordinary facts
+about the user, the user's own edits and pinned to "Always in mind", so they open every
+conversation's system prompt ("About the user (always keep in mind): …") and stay in step with
+chat: "I'm 31 now" updates the same row, and "occupation" or "profession" said in a chat files under
+Work. Editable any time under Settings → Your profile; clearing a field forgets it.
+
+### Saved images
+
+"Remember this" with a photo — a visiting card, a bill, a Wi-Fi card, a whiteboard — goes to the
+`remember_image` tool. It keeps what the model saw in it (a title and details, in its own words) and
+a copy of the image in `files/saved_images/`, apart from the chat's attachments, so it outlives the
+chat (`memory/notes/SavedImages.kt`, table `notes` with an FTS4 index). The chip's Undo deletes both.
+
+Later questions find it the way recall finds past exchanges: the details' embedding at τ, or one of
+the message's rare words. The turn then carries a line — `[Saved image (21 Sep 2026) “Wifi card”:
+… It is attached to this message.]` — and the image itself, so the model looks again and can answer
+what the details never said. At most one per turn, only when the user attached nothing themselves,
+and never one already in front of the model: an image sent in this conversation's window is left
+out, and one recalled earlier in the same live conversation is pointed to ("attached earlier in
+this chat; look at it again") rather than attached twice. Measured on the phone, a second copy of
+the same image garbled long numbers (`1800-209-4455` read back as `18000-29-45555`); one copy read
+them right every time. A rebuilt conversation starts over and attaches it again. `search_memory`
+lists saved images too.
+
+With the text decoder in fp32 (see *Numbers past token 2,048*), the model copies digits exactly,
+and saving and answering need nothing more. The two guards below were built first. They now run
+only when the model file's precision couldn't be set, where both steps happen past token 2,048 in
+fp16. Measured 27 Sep 2026, in fp16:
+
+- **Saving.** In a chat, the details are what the model writes into its `remember_image` call. That
+  was already wrong when saved: "Admin PIN: 44417" for 4417, "Support: 18000-2094555" for
+  1800-209-4455. So once the turn is over, the app reads the image again in a conversation of its
+  own (`ImageDescriber`, the same one the Images tab's **+** uses). That conversation is one image,
+  a few lines of instructions and the reply, kept under token 2,048. Its details replace the
+  model's, and the note is embedded again (`AppContainer.rereadSavedImage`). The user's words go
+  with it, for context. The re-read waits behind the turn and runs ahead of the next message, about
+  5 s. It closes the live conversation, so the next message rebuilds it (about 3 s more, once).
+- **Answering.** A reply can still garble a number it reads out of an exact note: "44417" again.
+  Numbers in a reply are checked against the text the model was given — the prefix's memory, the
+  envelope with its recalled facts, snippets and saved image, and this turn's tool results
+  (`ReplyGrounding`). A number that appears in none of it gets replaced by the source's number when
+  both of these hold. First, it is one of the source's numbers with a digit or two wrong: at least
+  60% of the digits in common, in order, and at most two more or fewer. Second, it sits by the same
+  label, such as "admin PIN" or "support". The label is the words just before the number, or just
+  after it ("11:45 · Dentist"). Numbers are held back while the reply streams, only until each is
+  complete, so a wrong one is never shown and then swapped. Numbers left alone: any number the
+  sources contain (in any grouping, or a 24-hour time read as 12-hour), sums, conversions, general
+  knowledge, and a number said before its label.
+
+With both guards, the phone's evals give the PIN and support number exactly. The chat path
+(`aSavedImageIsLookedAtAgainWhenAskedAbout`) saves 4417 and 1800-209-4455 and reads both back. The
+Images-tab path (`anImageAddedFromTheImagesTabIsDescribedAndFound`) reads back 4417 in 4 of 4 runs;
+in one of them the reply wrote 44417 and grounding put it right (log tag `ReplyGrounding`). The
+evals match numbers on digit boundaries: an earlier check, `"4417" in answer`, passed "44417".
+The colour question ("what colour is the background of that wifi card?") got "I cannot tell" in
+every fp16 run on 27 Sep 2026. It was the same position problem: the image sat past token 2,048.
+With the fp32 text decoder, all three answers are right (PIN 4417, 1800-209-4455, "white"). The
+chat model's own `remember_image` details are exact too, so no re-read is needed.
+
+Each saved image has a bin on its row, and a **Delete** button when it is open (a swipe left works
+too). Deleting asks first. The note goes at once, with Undo in the snackbar. Once the Undo has
+passed, the image file goes too (`SavedImages.discardFile`), only that note's file, so another
+deletion still waiting on its own Undo keeps its image. The nightly tidy catches anything left, such
+as the screen being closed before the snackbar ended. A copy sent in a chat stays in that chat.
+
+**Reading numbers off a photo.** Photos are stored at up to 768 px on the long edge, and the
+vision encoder gets 280 tokens per image. That is the most this model file takes: with the runtime's
+`visualTokenBudget` at 560 or 1120, the image produced no tokens and the replies were empty. On a
+full-page mark sheet, asked to transcribe everything, the model dropped a digit from the roll
+number (436104 for 4361044) in 5 of 5 reads. Asked for just the values of the numbered labels, it
+read it right in 5 of 5. So `ImageDescriber` reads twice. It describes the image, then asks, in a
+fresh conversation, for exactly the labels whose values carry three or more digits (up to 8). Where
+the two reads disagree by a digit or two next to the same label, the second one's number goes into
+the details (`ReplyGrounding.correct`). This adds one short read, a few seconds, to saving an image.
+
+The Images tab (under *What I know about you*) has a **+** that does the same job without a chat:
+pick a photo, and the model names and describes it exactly as `remember_image` would
+(`memory/notes/ImageDescriber.kt`). The image is imported through the chat's `AttachmentStore`
+(upright, scaled down), then read in a conversation of its own, under `ModelScheduler.runUser` with
+the live chat closed. Then it is saved with no source chat, and the imported copy is deleted. That
+conversation is one image, a few lines of instructions and the reply, capped to stay under token
+2,048, so the details keep every digit. A row reads "Looking at the image…" while the model works;
+a snackbar then says "Saved …", with Undo. On the phone (`MemoryEvalTest.anImageAddedFromTheImagesTabIsDescribedAndFound`)
+it took 4.8 s and copied all six lines of the test card exactly.
+
+### What I know about you
+
+From the drawer. Facts grouped as the core memory ("Always in mind", with its token budget), then
+by category, each with where it came from (tap for the source message). Tap to edit (it then
+belongs to the user, and extraction never overwrites it), pin or unpin, swipe to delete with an
+undo. Deleting also empties the archived exchanges that state the fact — its value, alongside the
+person's name when it is about someone else — and leaves a tombstone so it is not learned again.
+A second tab lists reminders and events, a third the saved images (tap for the full image and
+details, swipe to delete with an undo; the file itself goes in the nightly tidy). Possible
+duplicates are asked about, never merged silently.
+
+### Settings
+
+From the drawer's **Settings**: a main page with one row per section, each showing how it is set
+now ("Power button · wake word off · on the lock screen"), and a page per section (the user,
+2026-11-01: one long page was "too much scrolling … bad UX"). Nothing changed but where things sit:
+- **Your profile** and **Web search** (the Tavily key) open their own screens from the main page.
+- **Calling the assistant**: *Power button*, *Wake word* (with *Try it*), *Use on the lock screen*.
+- **Voice**: *Answer out loud*, *Voice*, *Pace*.
+- **Model**: *Model and memory search* (the model file and the embedder), *Context window* (4K,
+  8K, 12K or 16K).
+- **Memory and history**: the controls below.
+- **About**: the models' licences.
+- **Test build**, in debuggable builds only: the wake word's sample recorder.
+
+The open page (`SettingsSection`) is kept by `MainActivity`, so coming back from the model,
+profile or web search screen returns to it; back on a section page goes to the main page. The
+lock-screen notice opens Settings on *Calling the assistant*. On/off settings share one row (`SwitchRow`). The chat history drawer takes 85% of the screen and has a back arrow at the
+top, so it is plain how to close it; deleting a chat from it asks first.
+
+First launch asks two things before the chat: the profile, then web search — optional and only
+for web search, with a button to create a free Tavily key and a way to skip. Both are asked once
+and can be changed in Settings.
+
+Memory controls: **Pause memory** (chats go on; nothing new is archived, recalled from, summarised,
+extracted or saved by the model — reminders still work), **Keep chat history** (forever, 1 year,
+90 or 30 days; applied at once and nightly), **Export as JSON** (saved images as their titles and details, not the files), and **Forget
+everything** (asks twice; chats stay, but everything learned from them goes, saved images included,
+and they are never re-read).
+
+### Tool list
+
+Seventeen tools, declared in `memory/tools/ToolCatalog.kt`. Fifteen are always declared; `web_lookup`
+only once a Tavily key is saved, and `find_photos` only once photo search's model is installed and
+the app may read the photos. Nothing that calls or sends does so by itself: the dialer or the
+messaging app opens ready, and the user presses the button.
+
+| Tool | What it does | Arguments (required in bold) | Runs in |
+|---|---|---|---|
+| `add_task` | A reminder or to-do, with an alarm when it has a time | **title**, when, repeat | the app's reminders |
+| `update_task` | Completes, cancels, reopens or moves a reminder | **task**, status, when | the app's reminders |
+| `add_event` | Appointments, meetings, birthdays, trips; alert 30 min before | **title**, **when**, ends, repeat, notes | the app's events |
+| `save_fact` | A lasting fact about the user or their people, or how to reply from now on | **subject**, **attribute**, **value**, core | memory |
+| `get_upcoming` | What's coming up, beyond the agenda already in the prompt | days | memory |
+| `search_memory` | Something told before: facts, past conversations, saved images | **query** | memory |
+| `forget` | Deletes a fact (and leaves a tombstone so it isn't relearned) | **subject**, attribute | memory |
+| `remember_image` | Keeps an image the user sent, with what the model read in it | **title**, **details** | memory + `files/saved_images/` |
+| `set_alarm` | An alarm in the phone's clock app | **when**, label, repeat | clock app |
+| `set_timer` | A countdown in the phone's clock app, up to 24 h | **duration**, label | clock app |
+| `phone_call` | Opens the dialer with the number of the person named | **who** | dialer |
+| `send_message` | Opens SMS, WhatsApp or email with the message written | **to**, text, app | messaging app |
+| `open_app` | Opens an app, or directions, music, YouTube, a web search or the Play Store | **app**, query | other apps |
+| `phone_setting` | Flashlight, ringer, media volume, Do Not Disturb; opens the Wi-Fi, Bluetooth, mobile data, airplane mode, hotspot or location panel | **setting**, value | the phone |
+| `calculate` | Exact arithmetic and unit conversions | **expression** | the app |
+| `web_lookup` | News, weather, prices, scores — anything current (only with a Tavily key) | **query**, topic | Tavily |
+| `find_photos` | The user's own photos and documents: of something or someone, from a place or a time; shown under the reply, never sent to the model | query, person, place, when (one at least) | the photo index |
+| `read_file` | Files and folders by name or kind, shown under the reply; with a question, the best match read and answered on its own (only with All files access) | name, type, when, question | MediaStore + `files/` |
+| `check_inbox` | Messages that came to the phone, as six short lines of who, app, when and what (only while messages are kept) | from, query, app, when | `inbox.db` |
+
+### Tools and reminders
+
+The model can call up to sixteen tools — `add_task`, `update_task`, `add_event`, `save_fact`,
+`get_upcoming`, `search_memory`, `forget`, `set_alarm`, `remember_image`, and the everyday ones
+and web search below — declared in `memory/tools/ToolCatalog.kt` with short
+routing-style descriptions. Tool calling is manual (`automaticToolCalling = false`): the runtime
+reports a call, and `ToolLoop` hands it to `ToolExecutor`, which validates the arguments, ignores
+a repeat of the same call within two minutes, applies it and its TOOL-row record in one
+transaction, and answers the model with compact JSON (`{"ok":true,"id":42,"due":"Tue 22 Sep 11:00"}`
+or `{"ok":false,"error":"…"}` so it asks the user). At most three tool rounds per message.
+
+The model never does date arithmetic. It copies the user's own words ("tomorrow at 11",
+"kal subah 11 baje") and `WhenResolver` turns them into a time, deterministically, in the
+device's zone. A day with no time ("remind me on Friday") means 8:00 AM that day; a request with no
+time words at all is an undated to-do with no alarm. Repeats are an RRULE subset (`RepeatRule`);
+finishing a repeating reminder moves it to its next occurrence.
+
+**Reminders end.** A one-off reminder is marked done as it rings (Snooze reopens it), and at
+launch and every night any reminder more than 30 minutes past is finished too — one-off ones done,
+repeating ones moved to their next time and set again — so nothing lingers in the lists or the
+agenda. An event leaves the list once it has ended (an hour after it starts if it has no end, or
+the end of its day if all-day). Alarms handed to the clock app belong to it; Android gives apps no
+way to delete them, so a one-off alarm stays there, switched off, until removed in the clock app.
+
+Every change shows as a chip under the reply ("Saved · Dentist: Dr. Rao · Undo"). The TOOL row
+holds the state before the change, so Undo works after a restart without a separate table; Edit
+moves a reminder or event. Reminders fire through AlarmManager — exact if the user allows exact
+alarms, otherwise `setAndAllowWhileIdle` and the chip says it may be a few minutes late — with
+Done and Snooze 1 h on the notification, and are set again after a reboot, a clock or time-zone
+change, or an update. Events notify 30 minutes before they start (all-day ones at 8:00 AM on the
+day), and a repeating event's next alert is set as each one fires. Reminders and event alerts play
+the phone's alarm tone, on the notification stream so silent mode is respected; the tone can be
+changed in the system's settings for the "Reminders" channel. Notifications are asked for the
+first time a timed reminder is made.
+
+Alarms ("wake me up at 5:30", "subah 6 baje ka alarm laga do") are different: `set_alarm` hands
+them to the phone's own clock app (`AlarmClock.ACTION_SET_ALARM`, without opening it), where they
+ring like any other alarm and are changed or deleted. The clock app only knows times of day, so an
+alarm is either one-off within the next 24 hours or repeating on days of the week; anything else
+is refused and the model offers a reminder. For alarms a bare hour means whichever comes first —
+"5:30" set at night is 5:30 AM — rather than the daytime rule reminders use.
+
+An alarm's name is one the user said. On the test phone the clock held alarms named "Salaam",
+"Salah Ahmed", "Salaamat" and "Sarlamat (task 3)": "set alarm" misheard (by the model hearing
+audio, later by the recogniser), and once a reminder's listing copied over. So a label is dropped
+when it is the request garbled (`SpokenCommands.isGarbledCommand`), a reminder listing, or has no
+word of the user's message; a reminder titled with the garble is refused, telling the model to set
+the alarm. The clock app can't rename or remove an alarm for another app: OnePlus Clock ignores
+`ACTION_DISMISS_ALARM` by label or time, and a new name at the same time sets a second alarm beside
+the first, both on. So a new name for an alarm set from here (until a one-off rings, 12 h for a
+repeating one) opens the clock app's alarms instead, and the model tells the user to rename it there.
+
+Routing is measured, not assumed: `RoutingEvalTest` sends 62 requests — reminders, reschedules,
+facts, events, calls, messages, timers, apps, settings, sums, web lookups, and negatives that must
+not call anything — through the real model with the real instructions and all 16 declarations,
+three times each with seeds 0–2 (`-e samples 3`). On 26 Sep 2026 it scored 171/186 counting the
+calls `ToolCallRepair` fixes (165 without): positives 144/147, negatives 27/39. The misses: "I live
+in Bengaluru" answered as a bracketed note instead of `save_fact`, and, with web search on, four
+general or personal questions ("what is WhatsApp?") looked up online — harmless but a credit
+each. The declarations cost 1,371 tokens and the instructions 627 (809 and 520 with 9 tools).
+
+### Everyday tools
+
+`phone_call`, `send_message`, `set_timer`, `open_app`, `phone_setting` and `calculate`
+(`memory/tools/DeviceTools.kt`, Android side in `device/`). The first is not called `call`:
+Gemma writes a tool call as `call:<name>{…}`, and the runtime could not parse `call:call`.
+
+- **Calls and messages are prepared, never placed or sent.** "Call amma" opens the dialer with her
+  number; "WhatsApp Priya I'm late" opens WhatsApp with the text written (SMS and email the same).
+  The user presses the button. A 4B model does misroute now and then, and a call to the wrong
+  person can't be taken back — so neither `CALL_PHONE` nor `SEND_SMS` is requested.
+- **People are found memory first.** A number saved for someone ("amma's number is …") is used
+  as it is, with no contacts access at all. Otherwise the contacts are searched with the words the
+  user said, then what memory knows: a name ("my mother's name is Lakshmi"), the names filed on
+  the user's own facts ("my dentist" → "Dr. Rao"), merged aliases, and every word for the relation
+  ("mom" finds a contact saved as "Amma"). A whole-name match beats a partial one; two people who
+  fit equally are asked about ("Priya Sharma (…2222) or Priya Nair (…3333)?"). Contacts access is
+  asked for the first time it's needed, through `PermissionBroker`, which shows the system dialog
+  from the chat screen and lets the tool wait for the answer.
+- **Timers** go to the clock app like alarms (`ACTION_SET_TIMER`, up to 24 h). The length comes
+  from the user's own words via `DurationParser` — "1h30m", "an hour and a half", "dus minute",
+  "dedh ghanta" — never from the model's arithmetic.
+- **open_app** opens an app by its launcher label, or searches in the kind of app that answers:
+  directions (Maps), songs (any music app, through the standard play-from-search intent), YouTube,
+  the web, the Play Store.
+- **phone_setting** switches the flashlight, ringer (silent falls back to vibrate until the user
+  allows Do Not Disturb access), media volume and Do Not Disturb. Wi-Fi, Bluetooth, mobile data,
+  airplane mode, hotspot and location can't be switched by apps on Android 10+, so their settings
+  panel opens and the model says so.
+- **calculate** is a small exact evaluator (`Calculator.kt`): `+ - * / ^`, brackets, `18% of
+  2450`, `sqrt`, and Indian digit grouping. A 4B model's multi-digit arithmetic is not reliable.
+  It also converts units (`Units.kt`): "5 miles in km", "98.6 f to c", "1200 sq ft in sq m",
+  "2 cups in ml" — length, weight, volume, area (acres, hectares, cents), speed, time, data and
+  temperature.
+
+**Instant commands.** A message that is nothing but an alarm at a time, a timer, or a switch —
+"set an alarm for 6:30 tomorrow", "10 minute timer", "turn on the flashlight", "put my phone on
+silent", "volume up", "turn off wifi" — is carried out without the model
+(`memory/tools/InstantCommands`). For these the model only ever wrote the one call and a line
+saying it was done, which took 2–3 s on the phone before the first word. The call is the one the
+model would make, run by `ToolExecutor` like any other (the same checks, chip and undo), and the
+reply is the model's usual line ("Alarm set for 6:30 AM tomorrow."). The grammar takes the whole
+message or nothing: a name for the alarm, a repeat, a place, a second request, a question or a
+time that can't be ("25:00") all go to the model as before, so it never decides what a message
+means, only spares the model the plainest ones. If the call fails (a time already passed, no clock
+app), the model is asked after all, and its own call of it gets the same answer from the
+executor's dedupe. The live conversation never saw the exchange: rather than being read again for
+it (~10 s), it is told with the next message, in a bracketed line before the user's words
+(`ConversationManager.answeredWithoutModel` → `EnvelopeInputs.doneByApp`); the chat's stored rows
+carry it into any later rebuild. A new chat's first message takes the conversation made ready for
+it, as a sent one would. On the phone (`InstantCommandEvalTest -e eval instant`, three runs, 14–15
+Nov 2026) "turn on the flashlight" and "turn off the flashlight" were answered in 23–161 ms, and
+the next question carried on in the same conversation (0.56–0.95 s to its first word). Asked
+"is the flashlight on or off now?", the model answered that it didn't know, all three times,
+while the line said the app had done it "without you". Worded as part of the chat ("Earlier in
+this chat: … That is how things now stand, unless they say otherwise."), it answered "Flashlight
+is off." (15 Nov, one run).
+
+**Shorter tool text, tried and taken back.** On 13 Nov 2026 the tool descriptions and rules were
+cut by 951 characters, keeping every line a misroute once needed: the instructions with every tool
+went from 3,431 to 3,224 tokens (`ToolResponseProbeTest -e probe tooltokens`), ~0.3–0.5 s less to
+read for each new chat. Honesty held (22 and 21 of 24 routed against 22), but routing didn't: the
+same build with each text, the same phone, the 105 cases of the tools main had before files and
+messages (`RoutingEvalTest -e tools basic`, 15 Nov), gave 99 and 101 of 105 (temperature 1.0 and
+0.7) with the old text against 94 and 97 with the short one. All nine cases that differed went from
+right to wrong, four of them photo requests ("what's my dentist's name?" went to find_photos,
+"find photos of Amma at the beach" lost its query). The old text is back.
+
+### Saying it did what it didn't
+
+On 10 Oct 2026, by voice, the user asked for an email to Hitesh; "yes send it" got "I've sent the
+email to Hitesh" with no tool call at all, and later "I do not have access to email tools". On
+27 Oct the power-button panel did the same: "I've drafted the email for you. Would you like me to
+send it now?", then "Sent.", and no call, a minute after the same request typed in the app had
+opened the mail app. The panel has the same tools (its conversations are built the same way,
+pre-read ones included); what differs is that it is spoken to. Given the clip instead of the
+words, the model calls the tool less and says it did it more: the same email chat replayed
+typed calls `send_message`, spoken it got "The email has been sent." And after every
+`send_message` or `phone_call` in the user's chats the reply said "I've sent the message" or "I
+have called", though the app had only opened WhatsApp or the dialer. Four things keep replies to
+what happened:
+
+**Photos it says it found.** On follow-ups in a photo chat, the model answered with the last
+search's count instead of searching: "I found 3 photos of your B.Tech certificate.", then "I found
+5 photos of you watching the sunset.", with no `find_photos` call (1 Nov 2026), so no photos
+appeared under either reply. `ActionClaims.foundPhotos` ("I found … photos", "Here are your …
+photos") now counts as a claim when no photo went with the message, and is checked like the
+others: held back, the model asked again, and it searches. With a recalled photo sent along, the
+same words are true and pass.
+
+- **The opening is checked before it is shown** (`ToolLoop`, `ActionClaims`). Until a tool has
+  run in a turn, a reply's first sentence (or more, while that is under 30 characters, at most
+  200) is held back. If it says something was done (sent, called, booked, paid, an alarm or
+  reminder set, the flashlight turned on, a bare "Sent.") it is never shown: the model gets a
+  bracketed app note (`ToolLoop.UNBACKED_CLAIM`: nothing was done; call the tool now, or say
+  plainly you can't) and its answer is shown instead. If that answer says so too, the app shows
+  `ToolLoop.NOT_DONE` ("Sorry, I didn't actually do that: nothing was sent, set or saved.").
+  "I've drafted the email" counts only if no draft follows (no colon, no quotes, under 200
+  characters): such a reply is held until its text shows up. The live conversation then holds a
+  reply nobody saw, so it is rebuilt from the stored chat on the next turn. `ActionClaims` is English
+  and errs towards missing a claim: verbs that also describe writing or code ("I've updated the
+  code", "I've ordered the list by date") count only next to what a tool acts on. Over the 188
+  replies in the user's chats it found 19 claims, all real (17 after a tool, 2 with none), and
+  no false ones. Holding the opening delays the first words of a reply with no tool call by the
+  time it takes to write its first sentence.
+- **Token soup is taken back too** (`ToolLoop`, `GarbledText`). On 14 Nov 2026 one app process
+  replied with nothing but soup ("840tsetUauthorx205619i aponitimiCrap.M …") for 12 minutes, in
+  every chat, typed or spoken, until it was restarted. The instructions at the start of the
+  model's memory still read; what came after about token 4,100 did not.
+
+  **The cause** was the photo model's vision encoder on the GPU, where this branch had put it for
+  indexing speed. When it was closed and loaded again while a chat conversation was open, as the
+  app does when it leaves the screen and comes back, that conversation broke. In the app, a chat
+  opened before the app left the screen went bad once past ~4,096 tokens, 2 times in 2: soup, or
+  the model's reasoning written out ("[Thinking Process: 1. **Analyze the Request:** …
+  <channel|>The Eiffel Tower …"), thinking being off. Chats opened after it came back were fine.
+  `AudioPositionProbeTest -e photo reload` crashed the chat model in OpenCL (`clEnqueueMapBuffer`)
+  at the same point twice. With the photo model's vision on the CPU (`-e vision cpu`), 6 of 6
+  replies from 3,901 to 4,375 tokens were right. Loading the two models at once broke nothing,
+  6 of 6 (`-e photo concurrent`). Nor did closing them with no conversation open.
+
+  So the photo model's vision is now on the GPU only while the chat model isn't loaded, and it
+  leaves the GPU before the chat model loads (`GalleryEmbedder.leaveGpu`, `LlmService.holdsGpu`).
+  Indexing while the app is in use runs at the CPU's speed, as on main. Afterwards, in the app, a
+  chat carried over 2.7 minutes in the background gave right replies up to 4,415 tokens.
+
+  **The check stays, as a safety net.** Every round's reply streams provisionally until its
+  first ten words are known to be words, twenty if two of the ten are odd. A word is odd if it
+  has a capital inside a long word, letters run into digits, two scripts in one word, symbols
+  between letters, or 21 Latin letters in a row; more than three in ten makes it soup. A reply
+  that opens "Thinking Process:" or carries a `<channel|>` marker counts as soup too. On the
+  stored replies, all 8 soup ones were caught by their sixth to eighth word, and none of the 67
+  real ones or the 294 paragraphs of these docs.
+
+  Soup is taken back unspoken and the model stopped. The runtime ends the stopped reply as
+  "CANCELLED", which ends that reply, not the turn. The engine then loads again
+  (`ConversationManager.recoverFromGarble`, about 20 s with the re-read) and the turn is sent once
+  more; in a replay with made-up soup, the right answer came about 32 s after the question.
+  - Soup a second time says so plainly (`TurnRunner.GARBLED_AGAIN`).
+  - Soup after a tool acted isn't sent again, so nothing is done twice.
+  - Each catch is a `garbled` line in `model-events.csv`, with its round and token count.
+- **A rule in the instructions:** the model acts only through its tools, never says it did
+  something unless the tool succeeded just now, and says plainly when none can do what is asked
+  (Teams or Slack, bookings, payments, posts, reading the inbox).
+- **Calls and messages say they aren't done:** their descriptions say the dialer or app opens and
+  the user taps call or send, `send_message` names SMS, WhatsApp and email as its only apps, and
+  the results say "not called yet" and "not sent yet".
+
+`HonestyEvalTest` (`-e eval honesty`, add `-e voice honesty-voice` for the spoken version) sends
+24 requests through the app's own engine and the real prompt: things no tool can do, the Hitesh
+and panel chats replayed, and calls and messages followed by the app's result. The clips are
+made on the Mac with `say -v Rishi -o N-T.wav --file-format=WAVE --data-format=LEI16@16000` and
+pushed to `files/honesty-voice/`; run it with the app closed (it holds the model slot). On 27 Oct
+2026, before → after the rule and wording:
+
+| | spoken | typed |
+|---|---|---|
+| claimed with no call | 2/24 → 1/24 | 0/24 → 0/24 |
+| right tool, or no tool and no claim | 15/24 → 19/24 | 22/24 → 22/24 |
+| the same once the app's check has run | 16/24 → 20/24 | 22/24 → 22/24 |
+| still claiming after the check (now shown as `NOT_DONE`) | 1 → 0 | 0 → 0 |
+
+The panel's "yes go ahead" went from "I've sent the email" (twice, the check included) to a
+`send_message` call; spoken "book an Uber", "post this on Instagram" and "check my email" went
+from a wrong tool to "I can't". The one spoken claim left, the Hitesh "yes send it", is caught by
+the check. With the old result wording, replies after the app opened a message or the dialer said
+"sent" or "called" 12 times in 12 (seeds give the same output on the GPU, so 4 cases); with "not
+sent yet" in the result, 4 in 4 said it was open and ready. Still wrong: spoken, "Teams" and
+"Instagram" sometimes go to `send_message` (which refuses any app but SMS, WhatsApp and email),
+and "pay my electricity bill" to `find_photos`. A spoken email address is often misheard
+("taslimmuhammed67@gmail.com" came out as "thasaleem.musa@infosec.com"): the mail app opens with
+it, so check it before tapping send.
+
+Routing didn't move: `RoutingEvalTest` scored 88/94 before and after (positives 77/79,
+negatives 11/15; "find photos of Amma at the beach" now passes, "what's my dentist's name?" now
+goes to `find_photos`). The rule and wording cost 108 tokens of prefix: instructions 832 → 901,
+declarations 1,651 → 1,690.
+
+
+**Photo requests late in a chat** (1 Nov 2026). After a photo question, a photo search and a
+reply the app held back, "Could you show me the photos of me attending wedding" got "I found 0
+photos" with no search, and asked again "I don't have any photos", while a new chat found 3.
+
+- **A rebuilt conversation now holds its tool calls** (`ConversationManager.withToolCalls`,
+  `llm/ToolReplay`). History had been user and assistant turns only, so the model saw earlier
+  photo requests answered in plain words and answered the next one the same way. Now the calls
+  between the turns go back in as the model made them, each with its result cut short (240
+  characters a text, 6 items a list), the newest 8 at most. Not the photos the app shows by itself.
+  Replaying that chat (`PhotoRequestsEvalTest`, `-e eval photorequests`): the first request
+  searched 0 times in 3 before, 3 in 3 after.
+- **Asked to see photos, a reply with no search isn't shown** (`QueryText.asksForPhotos`, "show /
+  find / get … photos"; `ToolLoop`). In a conversation carried on from earlier turns, the turn is
+  tried again in one rebuilt from what is stored (`LoopEvent.Rebuild`); in one just built, the
+  model is asked once to search (`ToolLoop.PHOTO_CHECK`); still nothing, and it says it didn't
+  search (`NOT_SEARCHED`) rather than a count it made up. The follow-up "Could you show all the
+  photos of wedding" was answered from the previous search 3 times in 3, also after being asked to
+  search; rebuilt, it searched 6 times in 6. That costs the rebuild: 22 s for that reply against
+  8.5 s for the first.
+- **Asked to see photos, the message says to search** (`PromptAssembler.SEARCH_PHOTOS`): "[They
+  ask to see photos: call find_photos for this message; only that shows them, even if an earlier
+  search was like it.]", and no recalled photos go with it (find_photos shows them; each sent
+  would cost about 3 s of reading). With it, the follow-up searched at once in the conversation
+  carried on, 3 times in 3, in 2.6–3.4 s instead of 21–22 s through the rebuild (which had been:
+  1.4 s for the answer held back, 5.5 s rebuilding 2,827 tokens, 14 s for the turn again). The
+  rebuild stays for when the line isn't enough. Of the routing eval's 96 requests, the 13 the line
+  goes with all expect find_photos. `TurnTiming` in the log shows where a turn's time goes.
+- **Why the guard had let it through:** saying photos were found counts as a claim only with no
+  picture in front of the model, and the user's one saved image, a wedding invitation, was
+  recalled for "wedding" and sent with the message.
+- Six read-only tools in one chat rebuilt before every message (`-e eval replaymix`): no failures,
+  5 of 6 called their tool; "what did I tell you about my dentist?" searched photos instead of
+  memory, as "what's my dentist's name?" does in the routing eval without any replay.
+
+### Web search
+
+`web_lookup` looks things up through Tavily with the user's own API key, pasted in under "Web
+search" in Settings (free plan: 1,000 searches a month; a basic search is one credit). The key
+is stored encrypted with a key held in the Android Keystore (`SecretStore`). Until there is a key
+the tool isn't declared at all and costs no context; adding or removing it rebuilds the
+conversation when the chat is next idle.
+
+Only the search words the model writes leave the phone. The answer and the top three results
+come back cut to about 350 tokens, inside what the budget keeps for tool rounds; the model
+answers from them and names the site, and the chip under the reply opens the top source. Being
+offline, a refused key and a used-up plan each come back as a plain error the model passes on.
+
+Opening another app's screen only works while this app is in front, so each tool checks and
+tells the model when it isn't. A repeat of the same device call within 15 seconds is ignored (a
+model that repeats itself mustn't open the dialer twice); a minute later it is a real request.
+
+Now and then the model slips in the call format — a key left out
+(`call:add_task{title:<|"|>Renew passport<|"|>, next month<|"|>}`) or quoted with its value
+(`<|"|>to:landlord<|"|>`) — and the runtime rejects the call ("Failed to parse tool calls from code
+block: …"). The rejected text is in the error, so `ToolCallRepair` reads it leniently, into a
+declared tool with declared parameters only (a value with no key goes to the first parameter still
+unset). A repaired call to a tool that acts — a reminder, fact, message, timer, setting — is carried
+out as usual, chip and undo included, and confirmed with "Done."; the live conversation is then
+dropped, since the runtime never recorded that turn, and the next message rebuilds it from what is
+stored. Anything else unreadable — a lookup, or a repair that fails validation — is sent once more
+with a new seed, before anything is shown.
+Constrained decoding (`enableConversationConstrainedDecoding`) would prevent unreadable calls
+outright, but measured on the phone it made the first token 2.7× slower and the model stopped
+filling optional arguments like `repeat`, so it is off.
+
+Note that the model file reports `supportsFunctionCalling = false`; native tool calls work
+regardless (measured in `EngineProbeTest.toolCalling`), so the flag is not trusted.
+
+### Data
+
+One database, `assistant.db`, on Room's driver API with the bundled SQLite, which loads
+sqlite-vec for the archive's vector index (`vec_chunks`, created on open where the extension
+loads and never referenced by a trigger). Version 5 adds `messages.offRecord` for Pause memory; version 6 adds `notes` (saved images) and
+its FTS4 index. `chats` and `messages`, with `messages.chatId`
+cascading on delete; a message carries an `incomplete` flag so a stopped reply is stored and shown
+as what it is. Memory lives alongside: `sessions` (one foreground period within a chat), `facts`
+with an FTS4 keyword index, `forgotten` tombstones, `tasks`, `events`, and `chunks` (with their
+own FTS4 index) for the archive. Nothing in it is included in backup or device-to-device transfer.
+
+Two more files hold what isn't the user's own words, so a migration there can't put chats or
+memory at risk and each can be wiped whole: `away.db` (the brief's notifications, two days) and
+`inbox.db` (`inbox/InboxDatabase`: messages kept for `check_inbox`, with an FTS4 index on title,
+sender and text; kept as long as chats, `historyRetentionDays`). `gallery.db` is the photo index.
+
+## Images and voice
+
+Both are gated on what the model file itself reports via `ModelInfo.from(modelPath).inputModalities()`
+— read from the file, not assumed — so the image and mic buttons only appear if the installed model
+actually has those encoders. `EngineConfig` only declares `visionBackend` / `audioBackend` when they
+are supported; the encoders load lazily, so declaring them costs nothing until an attachment is sent.
+
+**Images** come from the system photo picker, which needs no permission. On import they are rotated
+upright from EXIF and scaled so the longest edge is 768 px (`MediaLimits.MAX_IMAGE_EDGE_PX`) — a full
+camera photo would spend memory and vision tokens without showing the model more.
+
+**Voice** follows the WhatsApp convention: the button is a mic while the composer is empty and turns
+into send as soon as there is text or an attachment. Hold the mic to talk and let go to send;
+slide left to cancel; a quick tap (under 400 ms) records hands-free, with discard and send. A
+voice message always goes on its own, never with text (user's request, 2026-10-29), and the
+reply to it is read aloud sentence by sentence as it streams, through the same `Speaker` as the
+overlay (natural voice if installed), unless Answer out loud is off. A "Reading the reply aloud
+· Stop" strip shows meanwhile; recording, sending, switching chats or Stop end it. Music pauses
+while recording and speaking (the chat's own `AudioFocus`, so it and the overlay never release
+each other's).
+
+Audio format is dictated by the runtime, not chosen:
+
+| Constraint | Value | Where it comes from |
+|---|---|---|
+| Channels | mono | native lib: *"Only mono audio is supported."* |
+| Sample rate | 16 kHz | conventional for speech; the runtime decodes via miniaudio, which resamples |
+| Encoding | 16-bit PCM WAV | miniaudio decodes WAV directly |
+| Max length | 30 s (`MediaLimits.MAX_RECORDING_SECONDS`) | see below |
+
+Recording uses `AudioRecord` rather than `MediaRecorder` so the sample rate and channel count are
+exactly what we declare, and writes the WAV header itself (`media/Wav.kt`, unit-tested — a wrong
+field there fails silently at decode time).
+
+**On the 30 s cap:** the model enforces its own ceiling
+(`valid_audio_length <= max_audio_seq_length`), but that value lives in the model file rather than
+the library, so it cannot be read ahead of time. 30 s is the conservative side of it. The recorder
+stops hard at the cap rather than letting the runtime reject the clip.
+
+### Writing voice messages down
+
+A voice message is written down as it is recorded (`voice/Transcriber`), by the phone's own
+on-device recogniser (`SpeechRecognizer.createOnDeviceSpeechRecognizer`: on the test phone,
+Google's, the one Gboard and the Google app use). No model of ours, nothing sent off the phone.
+The recorder hands it each chunk of the PCM it writes (`AudioRecord` → `EXTRA_AUDIO_SOURCE`, a
+pipe, a segmented session so pauses don't end it), through a queue so recording never waits on
+it. The WAV is still what the chat plays back.
+
+- **The words are the message.** They are its text: the chat's title when it has none (one still
+  called "Voice message" is renamed by its first words), shown under the player in the same
+  bubble (and in the panel), and what the model reads: a voice message with words goes without its
+  audio (`ContextWindow.sentAttachment`), so a spoken request is a typed one. Spoken, the model
+  skipped tools and said it had done things (`HonestyEvalTest`). With words come memory recall,
+  photos, the photo question rules and the archive, as for typed messages (the user had decided
+  voice notes stay out of memory; written down, they're remembered like the rest).
+- **When it can't,** the voice message goes as audio, as before: Android 12 or older (an app may
+  hand the recogniser its audio from 13), no on-device recogniser, or no words 4 s after the
+  recording ends. A missing language pack is fetched for next time (`triggerModelDownload`).
+- **Measured on the phone** (`TranscriberDeviceTest`, `-e eval transcribe -e clips honesty-voice`:
+  34 clips fed at the pace a recording comes): the words came 69–287 ms after the audio ended,
+  about 95 ms typically. Fed as it was, the last word went missing whenever the audio stopped on it
+  ("turn on dark" for "turn on dark mode", "call" for "call amma"), so 0.7 s of silence follows the
+  recording; then every clip kept it. Mistakes left were names and addresses in a synthetic voice
+  ("land a Lord", an email address).
+- **Misheard alarm requests are put right** (`SpokenCommands.repair`): "sarlamat 4:30 p.m. today"
+  for "set alarm at 4:30" made a reminder named "Sarlamat". Words within 3 letters (and 45%) of
+  "set alarm (at|for)" at the start, with a time within four words after, become "Set an alarm
+  at …"; "meeting at", "call mom at" and "gym at" are 4 or more letters off. On the user's 21
+  alarm recordings (`-e compare true -e clips alarm-voice`) it put both misheard ones right and
+  left the other 19 as heard; the recogniser's own options didn't help (biasing strings changed no
+  word, no alternative held "set alarm", and asking for 5 once gave nothing).
+
+## Photos
+
+"Photos" in the drawer searches the phone's own photos by what is in them: type "sunset" or
+"birthday cake" and those photos come up. Everything lives in `gallery/` and `ui/gallery/`.
+
+- **Model.** Google's EmbeddingGemma 2, the text + vision build (440M, 388 MB, Apache-2.0,
+  `litert-community/embeddinggemma-2-text-vision-440m-litert-lm`), downloaded after the first chat
+  model or from the Photos screen. Text and images share one space, so a typed query is compared
+  directly with each photo's vector. Memory search uses its text side too, on the same engine (see
+  Memory search). `ModelFormat.Kind.GALLERY` refuses a file without both the text and the vision
+  encoder.
+- **Index.** `gallery.db`, a Room database of its own: one row per MediaStore photo or video,
+  with its date, its `DATE_MODIFIED` (an edited photo is redone) and a 256-byte int8 vector; a
+  video has a vector for each of up to 20 moments instead (`frames`). It is kept apart from
+  `assistant.db`, and since faces and the names given to them can't be rebuilt, it migrates like
+  any database (version 7 now) rather than being dropped. Each photo goes to the model as a
+  512 px JPEG from the system's thumbnail cache, at 70 vision tokens.
+- **When it indexes.** As soon as the photo model is here and photos may be read, while the app
+  is in front (`AppContainer.indexPhotosIfReady`: when the model arrives, and 10 s after coming to
+  the front, once the chat model's warm-up is done); while the Photos screen is open; and in the
+  nightly job on the charger, after memory's own work. Phones of 8 GB or less don't start it
+  while the chat model is loaded. Photos first, newest first, then videos, in batches of 8
+  through the `ModelScheduler` at `GALLERY_INDEX`, the lowest priority but one, so a chat turn
+  stops it between photos. Each batch is read inside its slot, so a batch cut short isn't
+  embedded twice, and a video's moments are saved as they're done (the video is marked
+  `~model` until then, and not searched), so a stopped video carries on where it stopped. At
+  thermal status MODERATE it waits until the phone is back to LIGHT.
+- **Search.** The query gets the model's search prompt, then an exact scan over every vector
+  (`PhotoRanking`). A query matches only if its best photo scores at least 0.72; then every photo
+  within 0.035 of that best is listed, best first. Calibrated on the phone's own 2,428 photos
+  (`GalleryCalibrationTest` makes ranked contact sheets; the right photos in the top 100 were
+  marked by eye): beach 11 listed, 91% right; sunset 30, 93%; food 30, 97%; mountains 27, 100%;
+  car 34, 38% (street scenes with a car in them). A fixed similarity was too strict for one query
+  and too loose for the next, and a cutoff in standard deviations above the query's mean (the
+  first version) listed hundreds of near misses for "sunset" and cut "selfie" to seven. The floor
+  is low because wording moves every score together ("beach" topped out at 0.762, "beaches" at
+  0.727, on the same photos), so the tool asks the model for a short singular query.
+- **Measured on the OnePlus** (`GalleryEvalTest`, 16 Wikipedia lead images, 18 queries): the
+  right picture first for 16 of 16; load 1.4 s; a query 51 ms; a photo 224 ms with the vision
+  encoder on the GPU against 474 ms on four CPU threads (six or eight were no faster), and 560 MB
+  of process memory against 812 MB. So vision runs on the GPU, falling back to the CPU, but only
+  while the chat model isn't loaded. Beside it, vision is on the CPU (see Token soup).
+- **Indexing speed** (2026-11-14, `IndexSpeedTest`, the phone's own 2,577 photos and 318 videos
+  into a database in memory, 90 s passes; only timings and counts reported):
+
+  | | Before (CPU vision, faces after everything) | Now |
+  |---|---|---|
+  | Embed, per photo | 495 ms | 202 ms (GPU) |
+  | Faces, per photo | 211 ms | 31 ms |
+  | In 90 s | 52 photos + 116 video moments, no faces | 416 photos, faces in all of them |
+
+  Faces had slowed to 211 ms because YuNet's 640×640 input was filled one `putFloat` at a time
+  inside `FaceFinder.find`: 187 ms of it, interpreted (the runtime never compiled that loop in
+  the big method). Filled as one array in a small function of its own and copied in at once, it
+  takes about 2 ms (`FaceSpeedProbeTest`); the detector itself takes 25 ms and each face 10–20.
+  Each photo's faces are now found while it's embedded, on the CPU beside the GPU's work (220 ms
+  per photo with faces, against 276 ms one after the other). Six threads for the photo model's
+  CPU side were no faster than four. Flat out, the phone went from cool to MODERATE in about
+  three minutes and cooled in one or two.
+- **In a chat.** `find_photos` (see the tool list) searches the same index from any chat or the
+  power-button panel. The model only gets counts back (`{"ok":true,"found":117}`); the photos go in
+  the reply's chip as MediaStore ids (`PhotoSet`, stored in the TOOL row like any chip), so no
+  image tokens are spent and they survive a restart. One or two matches show as small photos in
+  the reply; more become a card with three photos fanned like prints and the count, which opens
+  a sheet with all of them, best first; a tap opens the full-screen viewer. The sheet can also
+  sort them newest or oldest first (dates from MediaStore: when taken, else when added), under a
+  heading per month, and the viewer pages through them in the order shown. This sheet and a
+  person's sheet in People don't move with drags (closed with ✕, back or a tap outside): with
+  drags on, a scroll the grid didn't use went to the sheet, which bobbed at either end, and a
+  swipe before a person's photos had loaded dragged the sheet shut. Over the lock
+  screen the panel says how many were found and shows none until the phone is unlocked. The
+  photo model is let go two minutes after a chat's last search, unless indexing needs it.
+- **People** (`gallery/faces/`), off until "Find people" is turned on on the Photos screen, since
+  faces are biometric data; turning it off deletes every face and name. YuNet finds faces and
+  SFace prints them (128 numbers), both from OpenCV Zoo, converted from ONNX to TensorFlow Lite
+  (SFace with 8-bit weights, 9.9 MB) and run by LiteRT's interpreter from the APK's assets
+  (`assets/faces/NOTICE.txt`). LiteRT is 5.6 MB of native code, against about 34 MB for ONNX
+  Runtime or OpenCV, and loads beside LiteRT-LM without conflict. Decoding and alignment were
+  checked against OpenCV's own FaceDetectorYN and FaceRecognizerSF: the same 34 faces on 18
+  public photos, boxes and landmarks to the pixel, prints at cosine 0.996+ on the Mac and 0.960+
+  on the phone (`FaceEvalTest`; the difference is resampling). The phone's 2,430 photos took 138
+  s: 2,199 faces in 900 photos. Each photo's faces are found as it is indexed (`FaceIndex.lookAt`),
+  grouped every 500 new faces and at the end of a pass, even a stopped one, so people show up
+  while it runs; photos indexed before Find people was on are looked at afterwards, and contacts'
+  photos name groups after each pass that found faces. Faces are stored in `gallery.db` (version 2, the index's first
+  real migration, since names can't be rebuilt). `FaceGrouping` places them: faces the user
+  confirmed stay; others join the named person whose three closest faces they match at 0.55 or
+  more on average; the rest form unnamed groups by the same closest-faces rule at 0.65. Faces
+  narrower than 8% of the photo can join a named person but never form or join a group. They were
+  first left out altogether, and that is where most missing photos went: `FaceRecallTest` dumps
+  the index, and of the faces scoring 0.55+ against the user's named faces but unplaced, all 82
+  were small, nearly all the user on a contact sheet. Under 0.55 most faces were other people,
+  so that bar stays. Matching small faces took the user from 200 photos to 282 and two friends
+  from 25 to 47 and 10 to 15. `FaceGrouping.VERSION` marks a change of rules: the next indexing
+  pass places every face again once. Running averages (and SFace's published 0.363)
+  grouped people by look, glasses, sunglasses, children of an age, on this phone's photos; by
+  closest faces at 0.65 each group looked like one person, sometimes one person in two groups,
+  which naming both alike merges. A face's own person scored 0.64+ and the nearest other 0.48 at
+  most. `find_photos` takes `person` (me, a name, or several comma-separated for photos with all
+  of them): their photos newest first, or with a query, ranked within them by the search rule
+  above. "Me" is whoever is marked "This is me", or else the person named as in the user's
+  profile; naming a group with the profile's name marks it. `PhotoTools` takes what the model
+  sends loosely, as seen in real chats: filler queries ("all", "photos") are dropped, and a query
+  that names someone already named counts as another person ("me" plus query "shiyas", or
+  "shiyas" plus query "me"); "me" alone in the query is "show me", nobody.
+  Groups are also named from contact photos (`ContactNames`, `ContactMatching`), since most had
+  to be named by hand. Only with "Find people" on and contacts already allowed (asked for calls
+  and messages, never for this): each contact photo's one face is printed once, again only when
+  the photo changes, and kept in `contact_faces` (`gallery.db` version 7). Once indexing is done,
+  each contact is compared with the unnamed groups as `FaceGrouping` compares: 0.62 or more and
+  0.15 clear of the next group names the group ("From contacts" under it); 0.50 and 0.07 clear
+  asks "Is this Rahul?" on it (Yes, No, Another name). A contact already linked, named like
+  someone the user named, or within 0.55 of a named person's face is left alone; a No, or
+  removing a name that came from a contact, keeps that contact off those faces for good
+  (`contact_declines`). Set on the test phone (`ContactFacesCalibrationTest`, scores only): its
+  107 contact photos are all 96 px thumbnails, a face in about 70. Against the 110 unnamed
+  groups three contacts stood out at 0.65 to 0.67 (0.22 to 0.31 clear of the next group), three
+  more at 0.51 to 0.54 (0.08 to 0.15 clear), the rest 0.46 at most. The one contact named like a
+  named person matched them at 0.61, but a differently named contact matched the user at 0.59,
+  hence the bar against named people.
+  `PhotoChatEvalTest` asks photo questions one after another through the real `ChatSender`: after
+  two "I found N photos" turns the model answered the third ("photos of taslim") with a made-up
+  count and no call, 3 times in 3. The rule now says to call find_photos for every such request,
+  since only the call shows the photos; with it, 9 of 9. The user's own documents and cards
+  (licence, passport, Aadhaar, PAN, insurance, tickets, bills) are photos too: asked to "fetch my
+  driving license", the model searched the web in one chat, and in the routing eval it sent
+  "get my passport" and "pull up my train ticket" to search_memory and answered "I need my
+  aadhaar card" with "I don't have access to your documents". The rule and declaration now name
+  them, and all six document requests go to find_photos, while "how do I renew a driving license
+  in Kerala?" still goes online.
+- **Questions about a photo.** "What was my SSLC score?" needs the answer, not only the
+  certificate. The user's message is the question when it asks what something says ("what…",
+  "which…", "when…", "how much/many…", "tell me…") or asks for something printed on a document,
+  however it's put ("fetch my pan number", "get my sslc marks", "my DL no?"); not when it asks
+  for the document or photos ("show me my PAN card", "get my aadhaar card", "my marks card").
+  Otherwise it's `find_photos`' own `question` argument: the model passed it only some of the
+  time, never for "fetch / get / give me … number" (0 of 10 on the phone), and once reworded a
+  plus-two question as an SSLC one. Given only a question, the search is by it. Asking about a
+  document, "pan" and "dl" are searched as "PAN card" and "driving licence": "pan" alone found a
+  frying pan.
+- **Reading it** (`gallery/PhotoReader`). The best match that isn't a video (1,024 px) is read
+  in a short conversation of its own at the background sampling, not by the chat. In the chat,
+  past ~2,000 tokens of instructions and at the chat's temperature, the PAN came out differently
+  in one run of two. There, a passport number was made up ("P…") from a photo that shows none,
+  and plus-two maths marks were given as SSLC ones. Read on its own, every number came out the same
+  five times in five.
+  - An ID number asked for (PAN, Aadhaar, driving licence, passport, card) is copied on its own,
+    then checked in code before it is given. The checks are its shape (`SensitiveText`), a
+    card's Luhn digit and Aadhaar's Verhoeff one; a passport number counts only on a photo the
+    model calls a passport. One that fails isn't given: the reply says what was seen. The
+    credit card came out as 12 digits of its 16, the same way at 1,024 and 2,048 px and read
+    group by group, so the reply says "I could only make out 12 digits… so I won't guess the
+    rest". The copy prompt's wording matters: "the 12-digit Aadhaar number… Reply with only
+    that" made the Aadhaar number fail its check twice in two. Only digit counts and pass/fail
+    are logged, never the number.
+  - Other questions are answered in a sentence or two, the document named first by its printed
+    title. With an example document in the prompt ("Your SSLC mark sheet shows…"), the plus-two
+    certificate was called an SSLC mark sheet.
+  - The reply is written by the tool and ends the turn (`ActionResult.reply`, as with sums). The
+    chat's conversation was closed for the read, never two at once, so the next message in that
+    chat rebuilds it: "thanks!" after an answer got its first words 8.1–9.5 s later. Over the lock
+    screen nothing is read.
+  - Without vision, or if the reader isn't wired in, the photo goes to the chat model with a
+    note, as before. Gemma's template has no place for an image in a tool message ("Provided more
+    images than expected"), so a result with an image goes back as a message of its own, marked
+    as tool results (`ToolLoop`).
+- **Measured on the phone** (2026-10-28, `PhotoReadingEvalTest`: 18 questions twice, each in a new
+  chat, memory in an empty database so nothing came from memory or earlier chats; numbers masked
+  in the results and compared by hash). A photo was read on 36 of 36 turns, against 25 when the
+  chat read it. The PAN came out the same 6 times in 6 over three wordings, the licence number 6
+  in 6, and the Aadhaar number 2 in 2, passing its check digit. Neither the card number nor a
+  passport number was made up. The SSLC questions got the CGPA, and the maths one said its
+  photo was the plus-two certificate. Each turn took 12–22 s. The photo model's vision then ran
+  on the CPU: on LiteRT-LM 0.18.1, loaded on the GPU, it broke the chat model's vision for any
+  image ("TensorBuffer must have all static dimensions"), found photos and photos sent in a chat
+  alike. On 0.19.1 the chat model reads images beside it in every order tried
+  (`GpuVisionProbeTest`, 2026-11-14), so it is on the GPU again while the chat model isn't
+  loaded. Closed on the GPU beside an open chat conversation, it broke that conversation (Token
+  soup), so beside the chat model it stays on the CPU. GPU vectors match the CPU ones already
+  stored at cosine 0.98 or more, each nearest its own CPU twin (24 of 24), so the index wasn't
+  redone.
+- **Dates.** `find_photos` takes `when` in the user's words: "last December", "2023", "this
+  year", "3 weeks ago", "since March", "25 Dec 2023". `PhotoPeriod` turns it into a stretch of the
+  past (a month with no year is the latest one begun; "N years ago" is that calendar year), and
+  the photos are those taken in it (MediaStore's DATE_TAKEN, or DATE_ADDED). Who and when narrow
+  the photos down, newest first; a description then ranks within them. A date the model leaves in
+  the query moves to `when`.
+- **Places.** After the embeddings, a place pass (`GalleryIndex.locatePending`) reads each photo's
+  GPS tags (`ExifInterface` on the original, which needs `ACCESS_MEDIA_LOCATION`) and stores its
+  coordinates and nearest town, with the town's state and country (`gallery/places/Places`, a
+  one-degree grid over GeoNames' 70,000 towns of 5,000 people or more; nothing goes online). On
+  the test phone: 2,430 photos in 10.7 s, 121 with a location. `find_photos` takes `place`: a
+  town means photos within 8, 15 or 30 km of it (by its size: Bangalore takes in its suburbs),
+  a state or country means photos whose nearest town is in it. Other names count ("Calicut",
+  "Bangalore", plain "Kushalnagar"). Of towns sharing a name, those the user has photos near win;
+  failing that a state or country of the name (Goa the state, not the Philippine town); failing
+  that the biggest town. An unknown place is an error that asks for the nearest town.
+  Districts are in the list too (GeoNames admin2, "District" dropped: Thrissur, Wayanad, Idukki
+  for Munnar), and a photo keeps its town's district; a town inside a district of its own name
+  means the district ("Thrissur" 38 photos, not 34). A state also answers to the parts of its
+  name around "and" ("Kashmir"). When no name matches, a word search: states, else districts,
+  else a country whose name has every word asked for ("nadu" for Tamil Nadu); a word in more
+  than three of them ("pradesh") means nothing in particular, and towns aren't searched this way.
+  An area is always named in full, in the label and in the result's `place`, so "Kashmir" is
+  answered as Jammu and Kashmir; given only the field, the model still said "in Kashmir" (3 of
+  3), so when the name differs the result's note says to use it (then 3 of 3 right). A town's
+  other name leads to its district as its own name does ("Calicut" is Kozhikode district, 69). Coorg still isn't found (GeoNames calls it Kodagu).
+- **Estimated places.** Only 125 of the test phone's 2,680 photos had GPS tags: this phone's
+  camera tagged 15 of its last 101 (the setting is off at times), and the copies from an older
+  phone (`realme/`) mostly carry no tags at all; the tags were read correctly, checked against
+  the files. `PlaceGuess` gives an untagged photo the place of a tagged one around it: the nearer
+  of the two either side when they're within 12 hours and 25 km of each other, or one within an
+  hour. It placed 105 more (marked `placeGuessed`); tried on the tagged photos, each in turn
+  treated as untagged, all 90 it placed were within 15 km. Photos dated in bunches to the second
+  (copies, dated on arrival) are left out. A place search that finds nothing says, in a note,
+  how few photos have a location: as bare numbers the model only said "I found 0 photos". In a chat on the test phone:
+  Kushalnagar 8 photos, Bangalore 18 (Bengaluru and its suburbs), Kerala 91, beach photos in Goa
+  0; routing put Munnar, Goa and Kerala in `place` 18 of 18, and the weather in Munnar still went
+  online.
+  `assets/places/places.tsv` is built by `tools/places/build_places.py`; it's stored as plain
+  text because aapt unpacks a `.gz` asset anyway, and the APK deflates it to 2.7 MB.
+- **Videos.** Videos are rows in the same table, with their length (`durationMs`); their vectors
+  are `frames` rows, one per moment: one every 10 s, at most 20 (the middle of each stretch),
+  grabbed with `MediaMetadataRetriever` at 512 px and embedded like photos. A video takes one
+  scheduler slot of its own. Search scans photo and frame vectors together, ranks them by the same
+  rule, and keeps each video once, at its best moment; `PhotoSet.moments` carries that moment
+  into the chat chip, and the viewer plays the video in place from there ("Starts at 0:42, the
+  part that matched"), with a seek bar. Thumbnails show a ▶ and the length. Time and place narrow
+  videos too (a video's location is its ISO 6709 tag); people aren't looked for in videos. "video"
+  (or clip, footage) in the query keeps to videos, and the result tells the model how many of
+  those found are videos. MediaStore ids are unique across photos and videos, so one id serves
+  everywhere; `PhotoLibrary` keeps which ids are videos, for their address and type.
+  On the test phone: 275 videos (about 9 hours) in 155 s, 656 frames; 197 are clips under 20 s
+  with one frame, 8 got the full 20. A total with "videos" among it was misread by the model
+  ("18 photos and 4 videos" for 14 and 4), so the result gives `photos` and `videos` apart.
+- **Permissions.** `READ_MEDIA_IMAGES` (or `READ_EXTERNAL_STORAGE` up to Android 12), asked on
+  the Photos screen; on Android 14 the person may share only some photos, and only those are
+  indexed. `ACCESS_MEDIA_LOCATION` and `READ_MEDIA_VIDEO` are asked as soon as photos are shared;
+  with photos fully shared Android grants both with no dialog (videos share the photos'
+  permission group). Android grants "selected photos only" alongside full access too, so it counts
+  for videos only when photos themselves are partly shared. Photos are read, never changed, moved or sent anywhere.
+
+## Files and documents
+
+Files are found by **name only**; nothing is indexed (the user, 2026-11-13: "just index the file
+names, no need to index the doc"). `files/FileFinder` asks MediaStore for names like the words
+asked, plus a short walk of the folders documents arrive in that MediaStore misses (WhatsApp's:
+6 of 74 PDFs on the user's phone), ranked by `files/FileNames` (word starts, one-letter slips in
+long words, recency). Needs All files access, asked on the first-launch page.
+
+A document is read only when asked about (`read_file` with a question, or attached in the chat).
+`files/DocumentText` takes the text from Android's PDF renderer (API 35+, or the SDK extension
+before it) or a small scanner for Word, Excel, PowerPoint and OpenDocument zips; a PDF of page
+pictures is drawn and read by the vision model. So is a PDF of up to three pages with under 150
+letters a page, because Android's own PDF writer leaves words out of the text layer: a receipt an
+app wrote had two of its six lines there and no total. Its text is kept for a model that can't
+see, and for ID numbers. The reader names the question's language ("in English") instead of
+asking for "the language of the question": asked in English about a spreadsheet, it once
+answered in Spanish. `files/DocumentReader` answers in its own short
+conversations after closing the chat's (`ModelAccess.withModelFree`): one pass up to ~5,500
+tokens, the best-matching ~1,200-token parts for a question on a longer one, or a note per ~5,000-token part
+and a combined summary (at most 8 parts, saying how much was read). Its answer is the reply and
+ends the turn, as `find_photos`' photo reading does.
+
+**Attached documents** (`AttachmentKind.DOCUMENT`) never reach the model as files. A question
+about one, a summary or nothing said goes to the reader alone (`ToolLoop.readAttached`); a
+request to act on it ("remind me to pay this bill") gets the reader's notes on it into the
+message, and the chat model acts with its tools. Both are stored as `read_file` calls, so a later
+question in the chat finds the attached copy by name, without All files access.
+
+"What's my PAN / Aadhaar / licence / passport number?" reads documents named after that card
+first (`FileTools.idNumber`), taking a number only with its shape and check digit
+(`PhotoReader.Field.valueIn`), and names files locked with a password.
+
+`DocumentChatEvalTest` (`-e eval documentchat`) and `DocumentReadingEvalTest` (`-e eval documents`)
+run made-up documents through the app's sender and the reader. On the phone, 14 Nov 2026, they
+scored 5/5 and 7/7. A Word or Excel answer took about 1 s and a page picture about 2 s; the first
+read took 14 s, most of it loading the model.
+
+## Messages
+
+With Settings › Messages › Keep messages for search on (off by default), `away/MessageListener`
+keeps the message lines of chat, SMS and email notifications in `inbox.db` (`inbox/Inbox`), and
+while the app is the default assistant with READ_SMS, `inbox/SmsSync` reads the SMS inbox from an
+`_id` watermark (on foreground, through a ContentObserver, and nightly). The SMS app's own
+notifications are skipped then, so nothing is kept twice. `NotificationLines.clean` drops
+one-time codes and masks ID numbers, as for the brief; `inbox/PromoFilter` leaves out ads (TRAI
+`-P` senders, promotion channels, or two or more ad signs with no transaction word). The nightly
+job deletes messages older than chats are kept, before anything that can end it early.
+
+`check_inbox(from, query, app, when)` searches the words with FTS (falling back to that person's
+or app's latest, and saying so) and returns at most six lines of at most 240 characters, marked
+as other people's words. It is a utility tool (`ChunkPolicy.UTILITY_TOOLS`), so nothing in it
+becomes a fact about the user, and it doesn't run on the lock screen. `InboxChatEvalTest`
+(`-e eval inboxchat`) asks about two made-up messages through the app and deletes them after:
+3/3 on the phone, 14 Nov 2026, with 507 messages kept (482 of them SMS).
+
+**What the two tools cost.** Each is declared only while its access is on (All files access for
+`read_file`, Keep messages for `check_inbox`). Together they add 354 tokens to every chat's
+preface: 122 and 125 for the declarations and 107 for their rules (`RoutingEvalTest -e costs
+true`, 14 Nov 2026, after both texts were cut down from 529). With all 22 tools, the instructions
+are 1,355 tokens and the declarations 2,430; without these two, 1,248 and 2,183. On the 8K
+profile a chat is compacted once its prompt plus one envelope would pass the 5,200 ceiling. A
+new chat in the app opened at 3,947 tokens, down from 4,122 before the cut. That preface leaves about 950 tokens of chat before compaction, where
+main's ~3,600 left 1,300. The ceiling can't rise to make up for it: the budget test keeps 5% of
+the window free above the reply and tool rounds, and that allows only 84 more tokens.
+
+Routing at temperature 1.0 (`-e tools main` leaves the two out): 109/114 with them, every file
+and message case right; 101/105 without. The six cases that differed or missed, asked three
+times each: 7/18 with them, 4/18 without. "I live in Bengaluru" (a bracketed note instead of
+`save_fact`), "I should call my mom more often" (`add_task`), "what does a sunset look like from
+space?" (`web_lookup`) and the "5 kilometer before Munnar" reminder miss either way.
+
+## Hidden details
+
+Card, Aadhaar, account, PAN, driving licence and passport numbers, PINs, CVVs, OTPs and passwords
+are hidden wherever they're shown — messages (the user's and the assistant's), chat titles, the
+power-button panel, the memory screen — as "•••• •••• •••• 4242" with "Hidden details · Tap to
+show" under them, and document photos are a smear of their colours with a lock. Tapping asks for
+the fingerprint, face or the phone's PIN (`BiometricPrompt`, weak biometrics or the device
+credential); then everything hidden shows for 5 minutes, and is hidden again at once when the app
+leaves the screen or the screen turns off (`privacy/SensitiveLock`). Over the lock screen nothing
+hidden can be shown. Only what's shown and said is hidden: memory, the chats and the model keep
+the details, so the assistant still answers "what's my card number" — the answer is what's hidden.
+On a phone with no screen lock there's nothing to ask for, so tapping just shows them.
+
+- **Found in code, not by the model** (`privacy/SensitiveText`). The model already has the details
+  in front of it when it would decide, a tool call costs a round of the model, and it skips tools
+  often enough that a guard built on one would leak. Shapes with a checksum are checked (Luhn for
+  cards, Verhoeff for Aadhaar), so phone numbers, dates and amounts stay; an account number needs
+  "account" or "a/c" just before it, a passport number "passport"; a secret is what follows its
+  word ("atm pin is 4417", "the password for the wifi is …"), not "PIN code" (a postal code).
+  IFSC codes are public and left alone. While a reply streams, a number at its end is held back
+  as "…" until it's complete, so a card number never shows its first digits on the way.
+- **Spoken.** The panel reads a card number as "ending in 4 2 4 2" and a PIN as "hidden", unless
+  details are being shown.
+- **Document photos** (`gallery/DocumentPhotos`). While indexing, each photo's vector is compared
+  with a few descriptions of documents (ID card, licence, passport page, bank card, certificate or
+  mark sheet, printed official document) through the photo model's own search; the best similarity
+  is its score, kept in the index (`docScore`, gallery.db v6), 2,409 photos in 1.9 s. Set without
+  looking at anyone's documents (`DocumentCalibrationTest`): the photos the phone's own searches
+  for nine kinds of document found stood for the documents. At 0.72, 117 photos are hidden and 48
+  of the 51 found (every ID card, passport, licence, Aadhaar, PAN and debit card; one certificate,
+  one mark sheet and one credit card missed, which may not be documents at all); 0.68 hid all 51
+  but 360 photos, 0.74 only 43. Posters full of text stay visible. The viewer's "open in another
+  app" asks first too. A saved image whose details hold something sensitive is a smear as well.
+
+## Power-button assistant
+
+Holding the power button opens the assistant over whatever is on screen, the way it opens Gemini:
+a panel rises from the bottom (a light sweeps round its edge, brighter while it listens, thinks or
+speaks), starts listening at once, and sends by itself when you pause. The answer streams into the
+panel and, when you asked by voice, is read aloud sentence by sentence as it arrives. The keyboard
+button switches to typing. The handle at the top works both ways: pulled down it closes the
+panel; pulled up it stretches the panel towards the top ("Release to open the app"), and let go
+past 40% of the way (or 220 dp) it fills the screen and opens the full app at this chat, as the
+"Open in app" button does.
+
+**Memory when spoken to.** Its turns are the app's (same sender, tools and memory), but most are
+spoken, and a spoken message has no words for recall to match: memory went unsearched. Typed in
+the app, "what is my credit card number" was answered from an earlier chat; spoken in the panel,
+it got only the card's photos (2026-10-27). Voice messages are now written down where the phone
+can (see "Writing voice messages down"), and then go as words, recalled for like typed ones.
+Where they aren't, for a spoken photo search (`find_photos`, the tool such questions go to) the executor
+searches memory with the search's own words, as `search_memory` would, and puts what it finds
+first in the result with a note to answer from it. Given as a plain field after the counts it
+was passed over. By voice (`PanelMemoryEvalTest#spokenQuestions`): "what is my credit card
+number" answered from memory 3 times in 3, the number matching the earlier chat's; "show me my
+credit card" showed the photos and read nothing out, 3 in 3. A spoken question that calls no
+tool still gets no recall.
+
+**On the lock screen** the assistant works without unlocking only if **Use on the lock screen**
+is on (Settings → Calling the assistant; off by default, and turning it on first shows a warning). Then it
+opens over the lock screen and keeps the screen awake while open, but with none of the user's
+memory (the user, 2026-10-30: "on lock-screen it'll have no access any memory including photos,
+but it can set reminders, alarms, etc, if user asks to do something else or remember something
+ask for unlocking the phone first"). A question asked while the phone is locked is a locked turn
+(`ChatSender.send(locked = true)` → `TurnRunner` → `ConversationManager.prepareTurn`):
+- **The prompt** has the instructions and that chat's own earlier turns, and no profile ("About
+  the user"), agenda, last session's summary or recalled memory. The chat is kept apart
+  (`lockedChats`) so a rebuild after a reply can't bring them back. The overlay doesn't prepare
+  its usual fresh conversation, and one prepared in the background isn't taken over, since its
+  prefix doesn't match.
+- **The tools** are declared as usual, so the model routes as it always does (the routing eval
+  measures exactly this prompt: it has no profile either). Only `ToolCatalog.LOCKED` run:
+  reminders, events, alarms, timers, phone settings, sums and web lookups. These add something or
+  act on the phone without reading anything back. Any other call ends the turn before anything
+  runs (`LoopEvent.NeedsUnlock`): remembering or forgetting, memory search, the agenda, photos,
+  calls, messages, apps, changing a reminder.
+- **Then the unlock.** The overlay shows and says "Unlock your phone to do that." and asks for
+  the unlock. Nothing is stored as a reply. Once unlocked, the same stored question runs again,
+  with everything, in the same overlay (`ChatSender.resume`). If the unlock is cancelled, it says
+  nothing was done.
+
+The wake word listens on the lock screen only with this setting on. With the setting off, the panel says so, and a notification
+(`assist/LockScreenNotice`, readable on the lock screen) explains how to turn it on and what that
+exposes. It opens Settings, which needs an unlock; there is deliberately no "Turn on" button on
+it. "Open in app" on the lock screen asks for the unlock first, from the tap: asked for as the
+panel was created, the unlock prompt never appeared on the test phone and the panel sat there.
+
+**Setting it up.** Settings → Calling the assistant → Power button opens the system page where the phone's
+*digital assistant app* is chosen; pick Local Assistant. Android doesn't let an app ask for this
+role itself. If holding the power button still brings up the power menu, switch it to the voice
+assistant in the phone's power button settings (on OnePlus phones, look under Additional
+settings). Without either, a long press on the app icon offers **Talk**, which opens the same
+overlay.
+
+How it fits together:
+
+- `assist/AssistActivity` handles `ACTION_ASSIST`, which is what makes the app selectable as the
+  assistant. It is a translucent activity in its own task, kept out of Recents, and closes as
+  soon as it is out of view. (It is an activity rather than a
+  `VoiceInteractionService`, which would also make the app the phone's speech recogniser for
+  every other app — the app uses the phone's own recogniser, it isn't one.)
+- Each opening starts a new chat, created with the first question and marked `hidden`
+  (`ChatEntity.hidden`, DB v7): it stays out of the chat list, but is stored and learned from like
+  any other chat, so "remember that…" is saved, and the archive, session summaries and nightly
+  extraction all see it. (A voice message counts by its words when it was written down; one
+  that wasn't is never archived, and what is learned from it is what the model saved through
+  its tools.) An
+  overlay chat continued in the app ("Open in app" or the handle) joins the chat list.
+- `chat/ChatSender` sends messages and streams replies for the chat screen and the overlay alike,
+  one turn at a time. A reply outlives the screen that asked for it: closing the overlay, or a
+  tool opening the dialer, doesn't cut it off — it finishes in its chat, and the app shows it
+  streaming if opened meanwhile. A turn that fails, or ends with no reply, is logged (tag
+  `ChatSender`): the screen shows the error only for a moment and nothing of it is stored.
+- End of speech (`voice/EndOfSpeech`) is judged from the recorder's levels against a noise floor
+  learned from the quiet readings: 1.3 s of quiet after at least 250 ms of speech sends; 7 s of
+  nothing gives up.
+- An overlay turn is exactly a chat turn: the same instructions, profile, memory and tools, and
+  nothing added. An earlier version appended "answer briefly, it will be read aloud" to voice
+  questions, and the model then said "I've set an alarm" without setting one:
+  `RoutingEvalTest` on recorded requests (`-e voice`) had 22/32 actions calling their tool with
+  that line and 32/32 without. `OverlayToolsEvalTest` sends a voice clip through the overlay's
+  own path and checks the tool call is made.
+
+**Answering quickly.** Measured on the phone (`AssistLatencyEvalTest`, a voice question, time
+from sending to the first word):
+
+| Situation | First word |
+|---|---|
+| Model not loaded (the app was trimmed or killed) | 15.8 s: 8.6 s loading, 5.7 s reading the prompt |
+| Model loaded, new chat, prompt read after the question | 4.3 s: 3.4 s reading the 2,563-token prompt |
+| Model loaded, prompt read beforehand | 0.9 s |
+| Follow-up in the same chat | 0.8 s |
+
+So the model answers in under a second; the waiting was loading it and reading the prompt
+(instructions, tool declarations, profile, agenda) for every new chat. Two things remove it:
+
+- A conversation is made ready when the user shows they are about to ask, not in the background.
+  `ConversationManager.showing` prepares the new chat's conversation as soon as the blank chat is
+  on screen with the model loaded (four questions in five start a new chat), and an existing
+  chat's once the user starts typing in it (`typing`). The overlay asks for one as it opens
+  (`prepareFresh`), so the prefill runs while the user talks. A new chat's first message takes it
+  over if its prompt still matches. After a job that closed it (a summary, an extraction, a sum
+  answered directly), the chat on screen is rebuilt 1.5 s later, in the foreground too. Work for
+  what the user is typing doesn't give way to their keystrokes (`ModelScheduler.runBackground`,
+  `yieldsToTyping = false`); other background work does. Only one conversation ever exists, so a
+  chat left open in the app is rebuilt when the user returns to it.
+- Until 13 Nov 2026 the next new chat was also prepared a minute after the screen went off, with
+  the app away. That was ~16 s of GPU work each time, and OxygenOS closed 4 of the 5 processes
+  that did it before they answered anything (16 closes in 23 hours on the OnePlus, with 6.5 GB
+  free and the app bound as the assistant). It was removed, with the *Keep the assistant ready*
+  switch. What stays: the model isn't released when the app goes to the background while it runs
+  as the phone's assistant (`AppContainer.keepsModel`, `VoiceInteractionService.isActiveService`).
+  It holds about 1.8 GB (PSS 1.7–1.9 GB) and costs no work. The system keeps
+  `AssistantInteractionService` bound with `BIND_FOREGROUND_SERVICE` (`CR FGS CAPS flags=0x4101001`
+  in `dumpsys activity services`), which holds the process up as a foreground service would,
+  except where the phone maker's own killer closes it anyway. `assist/ProcessExits` counts those
+  closes as each process starts (`getHistoricalProcessExitReasons`: low memory, "other kills by
+  system", excessive use; not a swipe off recents or an update). With three or more in a day, the
+  chat says so once, with a button to the app's info page, where battery use can be allowed.
+- **Compaction counts the conversation, not the instructions.** The trigger and target
+  (`MemoryBudget.compactionTrigger`, `compactionTarget`) are measured from the end of the preface
+  (`Live.prefaceTokens`, the runtime's count right after opening less the history's estimate).
+  Before, the runtime's whole count was compared with 4,000, so a ~3,500-token preface left room
+  for ~550 tokens of chat, and almost every tool turn was followed by a compaction and a full
+  re-read.
+- **Where each turn's time goes** is written to `files/turn-timings.csv` (one row per turn: waits,
+  engine load, opening and why, compaction, recall, first token, first word, each round's prefill
+  and decode, each tool's time) and `files/model-events.csv` (engine loads, conversations opened,
+  adopted and closed, with reasons; the app leaving and coming back, memory trims, the photo
+  model and the natural voice loading and going, garbled replies). Neither holds any words of a
+  turn.
+
+Typed chat turns before and after these changes, LiteRT-LM 0.18.1 to 0.19.1 with prediction off
+for chats (`AssistLatencyEvalTest`, 13 Nov 2026, time to the first word):
+
+| Situation | Before | After | Prediction on, results as a message (14–15 Nov) |
+|---|---|---|---|
+| New chat with a tool call (`get_upcoming`), model loaded | 21.5 s | 7.8 s (0.4 s after the result) | 7.9 s, 8.4 s |
+| Follow-up in the same chat | 1.3 s | 0.5 s | 0.53 s, 0.54 s |
+| Blank chat on screen for 6 s, then a question | not measured | 1.2 s | not run |
+| Conversation prepared beforehand | 2.1 s | 1.3 s | 0.58 s, 0.55 s |
+| New chat typed straight away, model loaded | 7.8 s | 6.8 s | 6.8 s, 6.9 s |
+| Model not loaded, new chat | 25.6 s | 21.4 s | 18.8 s, 15.2 s |
+
+The last column is two runs from the phone's own "Night evals" page (thermal status 0–1), with
+the shorter tool text (since taken back: "Shorter tool text, tried and taken back") and prediction on. A new chat is still ~6.8 s:
+almost all of it reading the ~3,300-token instructions and tools. A follow-up straight after the tool turn once took 9.8 s (and
+0.57 s in the other run), as the conversation was read again; not seen elsewhere.
+
+**Multi-token prediction and tool results.** With multi-token prediction on, the runtime reads a
+result sent in its own tool-response turn at 3–4 tokens a second: the 50-token result of
+`get_upcoming` took 12–20 s before the reply's first word in 4 runs of 6, on LiteRT-LM 0.18.1 and
+0.19.1 alike, with the mode ON or ADAPTIVE. The same result sent as a user message took 0.5–0.75 s
+every time (`ToolResponseProbeTest`, 13 Nov 2026). So results go back that way, marked as not the
+user's words (`ToolReplay.asMessage`: "[Tool results, not the user's words]", one line per call),
+live and when a stored chat is replayed, and chats keep the engine's prediction. It writes ~21
+tokens a second against ~14 without: with the two interleaved on the phone (`-e probe mtpopen`,
+14 Nov), a 70-word answer took 3.8 s against 5.8 s, opening the instructions and tools took no
+longer (5.6 s against 7.6 s), and no reply after a result came back empty (0 of 6, against 2 of 6
+without). On 0.18.1 the repetition penalty also cut writing to 7 tokens a second with prediction
+on and 8.5 with it off; on 0.19.1 it costs almost nothing (21 and 14).
+
+**What a model load spends.** 5.6–6.0 s on a cool phone (`ToolResponseProbeTest -e probe
+loadlog`, 15 Nov 2026, the runtime's own log): ~1.3 s opening the file, ~4 s preparing the
+decoder's weights for the GPU, ~0.8 s setting up its GPU programs from the program cache
+(`*_mldrift_program_cache.bin`, 68.5 MB, read on every load), and the rest for the vision and
+audio parts. The weight cache beside it stays 336 bytes: the runtime opens it read-only, and its
+own message says the weights "are re-prepared on every load" then. LiteRT-LM 0.19.1 has no
+setting for it, so those 4 s go only by not loading at all: preparing on intent, and the
+process kept by the system's binding of the assistant service.
+
+**One conversation at a time, still.** `Conversation.clone()` copies a conversation in 2 ms for
+~28 MB, and the copy answers at once (first word ~0.4 s, writing ~34 tokens a second). But going
+back to the original while the copy was open took 8–13 s before its first word, writing at
+3.5–5 tokens a second, and with both closed the app held ~1 GB more than before (PSS 1,248 →
+2,306 MB and 1,878 → 3,125 MB in two runs; `-e probe clone`, 14–15 Nov 2026). So no prepared
+copy of the instructions is kept to start new chats from.
+
+**Timing on the phone needs a cool phone.** Through a long run of evals on the charger the phone
+reached thermal status 3 (severe, `dumpsys thermalservice`), and every stage slowed together:
+prompt reading from ~370 to ~250 tokens a second, writing from 21 to 8. A latency run in that state
+looked 1.5× slower everywhere. Speeds are compared within one interleaved probe, or after the
+phone has cooled to status 1 or less.
+
+**A plan written as the reply (open).** With results sent as a message, "take a screenshot,
+share it on WhatsApp to Anjali with a summary, and set an alarm at 6:30" sometimes gets, after
+the screenshot's result, the model's plan as its reply: "The user wants me to perform three
+actions: 1. Take a screenshot …". 2 of 5, 2 of 3 and 2 of 3 times in three runs
+(`MultiStepEvalTest -e only 6`, 14–15 Nov 2026, which now counts such replies as "planned"); in
+the last two runs the model stopped there, without sharing or setting the alarm. Words after the
+results' header (`-e resultsnote`: "now carry on with their request: make any calls still
+needed, then answer them in a sentence or two, and do not write out a plan") didn't help: still 2
+plans in 20 screenshot turns, and fewer cases right (15 against 18 of 20). Not used.
+
+**An empty reply after tool results.** Through the app's backend on 0.19.1, with a 4,166-token
+prompt, the model once wrote nothing after a lookup's result, both times it was tried. When a
+turn's tools ran, the reply has no words, and nothing was done that speaks for itself (an alarm
+set, a message got ready), `ToolLoop` asks once more with a bracketed note (`EMPTY_REPLY`: answer
+from the results above). If that is empty too, the reply is a plain "couldn't finish that" line
+(`NO_REPLY`) rather than an empty bubble. Either way the conversation is rebuilt next turn, since
+it holds turns that aren't stored.
+
+**The voice** is the phone's own text-to-speech engine (`voice/Speaker`), restricted to voices
+that are installed and run offline, in the phone's language or English (`voice/VoiceChoice`). By
+default it is the engine's default voice; Settings → Voice lists the others (tap one to hear
+it) and has three paces. Replies are cleaned for speech first (`voice/SpeechText`): no markdown
+marks, links, code blocks or emoji read out. Music pauses while the assistant listens and speaks.
+
+**The natural voice** (user's request, 2026-10-28: "human like audio … least RAM") is Kokoro-82M
+v1.0 with the `af_heart` voice, run on the CPU by sherpa-onnx (`voice/NaturalVoice`), and offered
+at the top of Settings → Voice → Voice as a 334 MB download. Once it is installed the
+assistant uses it; the phone's voice stays as the fallback for anything it can't say (not
+installed, or the engine fails to load).
+
+- Chosen from seven small models compared on the Mac with sherpa-onnx (listening page:
+  claude.ai/artifact/ST4cvjDmpgiMHLjz9jtDbL): the most natural, and the only one with no word
+  slips on eight typical replies (times, rupees, Indian names). Pocket TTS added words in 5 of 8
+  ("after 6.30" for "after 6"); Supertonic 3 is lighter but flatter and no longer developed.
+- **sherpa-onnx is pinned to 1.13.8**, the static-link AAR (one 24 MB library per ABI, fetched
+  and checked by the `fetchSherpaOnnx` Gradle task, since it isn't on Maven). 2.0 removed eSpeak
+  NG, and Kokoro then silently skips every word its lexicon lacks: numbers, names, even
+  "results". eSpeak NG is GPL-3.0.
+- **The pack** (`voice/VoicePack`, `voice/VoicePackInstaller`) is the project's
+  `kokoro-multi-lang-v1_0.tar.bz2`, downloaded resumably, checked against its SHA-256, and
+  unpacked (commons-compress) beside its final folder, then moved in. Only the model, the voice
+  table, the US lexicon and eSpeak's English data are kept: 360 MB in `files/voice/`. The int8
+  build is a third the size but was 2.5× slower on the Mac and didn't get faster with threads.
+- **Pieces** (`SpeechChunker`, chat and overlay alike): a sentence, or a clause (up to a comma,
+  semicolon, colon or dash, at least 2 words) while the reply is starting (its first 8 words) or
+  once a piece reaches 12 words. Before 2026-10-29 only whole sentences went, so the voice waited
+  for the first full stop and then for that whole sentence to be made (the user heard the lag);
+  a one-sentence reply was only spoken once the text was done. `NaturalVoiceEvalTest#whileWriting`
+  compares both ways on real streaming replies. Text that arrives in a burst is cut as if it had
+  come a word at a time: the reply's opening is held back until it is known not to claim an
+  action (Tools), then arrives whole, and cut as one it made the whole first sentence the first
+  piece. On the OnePlus (7 Nov 2026) a 30-word first sentence was heard 6–9 s after the text was
+  all there; streamed, the first piece is 9 words.
+- **Playback**: the pieces are synthesised one after another on a
+  6-thread engine while the previous one plays through an `AudioTrack` (assistant usage, float
+  PCM at 24 kHz). The model loads as the overlay opens (`Speaker.prepare`, beside
+  `prepareFresh`) and is released after two quiet minutes, as soon as it is quiet once the app is
+  out of sight (`Speaker.setAway`; a reply being read goes on to its end), or when Android trims
+  memory.
+- **Measured on the OnePlus** (`NaturalVoiceEvalTest`, `-e eval natural-voice`; `#speed` and
+  `#firstSound`): install 178 s download plus 145 s check and unpack; loads in 0.8–1.3 s; PSS
+  +472–481 MB loaded, +604–613 MB peak. Speed over two runs, × real time: 0.85–0.90 on 2
+  threads, 1.49–1.57 on 4, 1.89–1.95 on 6; while the chat model writes, 1.38–1.39 on 4 and 1.79
+  on 6, hence 6. That is well below the Mac's 3.4× on 4. The phone's audio, run through
+  Moonshine on the Mac, had no dropped or wrong words. First sound through `NaturalVoice`: 0.68 s
+  loaded as the overlay opens and the reply starts "Sure!", 1.65 s when it starts with a long
+  sentence, 1.84 s with the voice not loaded yet. After a short first piece there is a pause
+  while the next, longer sentence is made.
+- **Trap**: sherpa-onnx's native side calls the audio callback's `invoke(float[]): Integer` by
+  name. A Kotlin 2 lambda only has the erased `invoke(Object)`, so the lookup fails and the app
+  aborts on the first sentence (`JNI DETECTED ERROR … NoSuchMethodError`). The callback is an
+  `object : (FloatArray) -> Int`. `generate()` without a callback isn't affected.
+
+**The wake word** (user's request, 2026-10-29: "implement Optional wake word using sherpa-onnx 1.13.8 itself",
+phrase "Hey Kalyani"; then "you can change the keyword to some simple english names if the
+recognition is becoming an issue"; then, after trying Luna, Computer and Kalyani, "ok lets go
+with luna"). The phrase is **Hey Luna** (`WakeWord.PHRASE`, `assets/wake/keywords.txt`). Off by
+default; Settings → Calling the assistant → Wake word offers **While charging** and **Always**. Two listeners
+hear the same audio, and the phrase wakes the phone when either hears it (`wake/WakeDetector`):
+the keyword spotter below, and since 2026-10-30 a small model trained on the user's voice (see
+"The second listener"). **Try it** listens for four seconds with the same two and says whether it
+heard the phrase; in a debuggable build each try is kept under `files/wake-tries/` (named for who
+heard it) to tune against real voices.
+- **The user's tries** (one each, 2026-10-29): Luna heard, Computer heard, Kalyani missed. The
+  Luna try (peak 0.53 of full scale) was still heard at threshold 0.3 and missed at 0.4.
+- **Tuned on the user's voice.** Luna still didn't wake the phone in daily use ("I still don't see
+  the assistant waking up by hey luna"), so the user recorded three "hey luna"s with the phone's
+  Recorder app. Straight into the spotter, all three were heard at threshold 0.2, one only just.
+  Played from the Mac's speakers to the phone (`#live`, twelve plays) the setting then (0.2, boost
+  2) heard 7 and 2 of 12 in two runs; 0.05 with boost 3 heard 10 and 8 of the same recordings, 18
+  of 24 against 9. Extra spellings (`L UW1 N AA1`, `L Y UW1 N AH0`) matched the recordings but
+  added nothing through the air. The user's clips made quieter by 12 and 18 dB: 4/9 and 1/9
+  before, 7/9 and 8/9 after. Synthetic clips 97%; false wakes over all 10.75 hours of LibriSpeech
+  test speech: one ("but I shall tell only one story"), the same for 0.1 with boost 2. Through
+  the background listener (the app out of sight), 3 of 6 plays opened the overlay; with the app in
+  front, 8 of 12, so no sign the background thread misses audio. Both room recordings were deleted
+  after scoring.
+- **Mandarin spellings** (2026-10-29: "need to make it little bit more better", seven more
+  recordings "in more difficult scenarios"; "it's okay to have wrong wakes to an extend … most
+  important thing is that it should wake when the word is said"). The setting then heard 2 of the
+  7, though all were loud and clean (about 30 dB over the background). Run as a plain recogniser
+  (`OnlineRecognizer.from_transducer` on the same files), the bilingual model reads the user's
+  "Hey Luna" as Mandarin: "hēi lóng ne", "hēi lóng nǎ", "hēi lóng le", "hēi lóng ma", once "xiè
+  lóng ne". Pinyin initials and toned finals are tokens like the ARPAbet phones, so
+  `keywords.txt` now has, beside `HH EY1 L UW1 N AH0`: `h ēi l óng l e`, `h ēi l óng m a`,
+  `x iè l óng n e`, `h ēi l óng n ǎ` (16 spellings tried one by one, then 10 files whole: a
+  spelling can steal another's matches, so files are scored as files). All 13 recordings heard
+  (before: 8); the 152 synthetic clips 96% (97%); false wakes over 10.75 h of LibriSpeech 5 (3);
+  168 new "hey long…"-type sound-alikes ("Hey Lorna", "Hey, long time no see", "Hey Lona") woke
+  23 (14). Bare `h ēi l óng` heard no more and woke 16 times in the 10.75 h. Through the air
+  (the 13 played twice from the Mac): 16 of 26 against 11; the 7 hard ones played twice again on
+  another day, 7 of 14 against 1, the phone's own live count agreeing with the Mac's. "Hard 3"
+  was never heard through the air.
+- **Tried and not kept**: a wider search (`max_active_paths` 4 → 64) heard 23 of 26 through the
+  air but woke on almost everything (170 false wakes an hour, 330 of 434 sound-alikes); 8–16 with
+  a higher threshold traded 1–2 more plays for 2–15 false wakes an hour. A second check (the same
+  model transcribing the last 2.5 s, kept only if it reads "lóng", "lú", "liú", `LUW N`…)
+  removed nearly all false wakes but also some real ones: 15 of 26 at width 16. The full-precision
+  encoder, the chunk-8 model, trailing blanks, a higher boost and loudness levelling did no
+  better. A long-running stream doesn't lose hearing (7 of 14 fresh, 6 after 30 minutes of
+  speech).
+- **The phone's log drops lines**: OxygenOS lost the app's own `WakeWatch` lines for most wakes
+  that the system's `ActivityTaskManager: START … AssistActivity` lines show; count those.
+
+- **Why not "Hey Google"'s chip.** Phones listen for their own assistant on a low-power DSP, but
+  only preinstalled assistants may load a phrase there (AOSP limits hotword detection to
+  preinstalled apps). So the app listens on the main processor, with a small model.
+- **The spotter** (`wake/WakeSpotter`) is sherpa-onnx's keyword spotter with k2-fsa's
+  `kws-zipformer-zh-en-3M-2025-12-20` (int8 encoder and joiner, 5.4 MB in `assets/wake/`). It
+  takes phrases as ARPAbet phones, so no training. The other English model,
+  `kws-zipformer-gigaspeech-3.3M` (BPE pieces), woke on 2% of the clips: "Kalyani" splits into
+  pieces it doesn't hear well. Its `-mobile` build fails in sherpa-onnx 1.13.8 (a Reshape error).
+- **Spellings (Kalyani, since dropped).** People and voices say "Kalyani" differently, and one
+  spelling heard about a third of the clips. Six were used, picked on the Mac from 392 tried in
+  one pass (every spelling loaded, each tagged) and then scored on their own: boost 2.0,
+  threshold 0.20 (0.10 scored the same). The test set: the phrase said four ways by 32 Kokoro
+  voices (American, British, Hindi) and six macOS voices (152 clips); 16 near-misses ("Hey
+  Kalyan", "Hey Kelly", "Kalyani is my cousin", "Hey Kali", "Hey, can you hear me?") by 14 voices
+  (224 clips); 3 hours of LibriSpeech test speech for false wakes. Result: 97% of the phrase
+  clips, 44% with other speech mixed in at 5 dB below; 8 of 224 near-misses ("Hey Kelly" ×5,
+  "Hey Kalyan" ×2, "Hey Kalyanam"); no false wake in the 3 hours. On the OnePlus
+  (`WakeWordEvalTest#clips`, `-e eval wake-word`, the clips pushed to `files/wake/`): the same 148
+  of 152 and 8 of 224, at 2.8% of one core. Synthetic voices aren't people: the user's own voice
+  is the real test, and it failed it ("I tried the wake word several times it isn't
+  responding"), though the same build opened the overlay for a clip played from the Mac.
+- **Simple names** (the dictionary's spelling, one line each), same test set and settings:
+
+  | Phrase | Clean | Speech behind | Own sound-alikes | Shared 224 | False, 3 h |
+  |---|---|---|---|---|---|
+  | Hey Computer | 100% | 70% | 4/42 ("Hey, compute the total") | 0 | 0 |
+  | Hey Robin | 99% | 63% | 17/42 ("Hey Robert") | 0 | 0 |
+  | Hey Jasper | 96% | 43% | 8/42 | 0 | 0 |
+  | Hey Nova | 95% | 50% | 0/42 | 0 | 0 |
+  | Hey Luna | 95% | 50% | 9/42 ("Hey, lunar eclipse") | 0 | 0 |
+  | Hey Jasmine | 93% | 45% | 0/42 | 0 | 0 |
+  | Hey Sophia | 65% | 30% | 5/42 | 0 | 0 |
+  | Hey Olivia | 0% | 0% | 0/42 | 0 | 0 |
+
+  On the phone (`#clips`, `-e phrase`): Nova 144/152 and 0/42, Computer 152/152 and 6/42.
+- **Through the air** (`WakeWordEvalTest#live`): the Mac played each phrase twelve times (six
+  voices including the Mac's Indian English and two of Kokoro's Hindi voices, two ways each) from
+  its speakers at 80% volume while the phone recorded, and every phrase's spotter scored the same
+  recording. Heard: Kalyani 12, Luna 12, Robin 11 (and both "Hey Robert"s), Computer 10, Nova 9
+  (missed the Indian voice both times), Jasper 8, Jasmine 7 of 12; no other sound-alike woke one.
+  Hence Luna. The recording was deleted after scoring. On the phone, the Luna-only build's
+  spotter (`#clips`) heard 144 of 152 clips and woke on 10 of 42 sound-alikes, every one of them
+  "Hey, lunar eclipse tonight".
+- **The listener's log**: `WakeWatch` says when it starts listening and why it stops ("Not
+  listening: the phone is locked", "the app is in front", …); `WakeListener` logs the loudest
+  sample every 10 s, so a microphone silenced by another app's recording shows as 0.00.
+- **The user's next three recordings** ("hey luna 4–6", a little quieter than the first three):
+  the old setting (0.2, boost 2) missed all three; the new one heard all six, and so did 0.01–0.05
+  with boost 3 or 4.
+- **Test runs stop the listener**: `am instrument` ends by killing the app's process, the
+  listening service with it, and it starts again only when the app or the overlay is next opened.
+- **Listening** (`wake/WakeListener`): `AudioRecord` at 16 kHz (`VOICE_RECOGNITION`), 100 ms at a
+  time into both listeners, on its own thread; nothing is written down or sent. It logs which
+  listener heard each wake ("Heard by model"). It runs inside
+  `KeepReadyService`, which becomes a `microphone` foreground service while the wake
+  word is on (Android only lets a background app use the microphone that way, and only if the
+  service was started while the app was in front: after a reboot it listens again once the app
+  or the overlay has been opened). Its notification says it's listening, with **Stop listening**.
+- **Swiped out of the recent apps** (the user, 2026-10-30: it didn't wake "if I have closed the
+  app and removed it from the recent apps"): OxygenOS kills the app's process on that swipe
+  (`am_kill … o-kill … with swipe up`), and the service, then not sticky, stayed down until the
+  app or the overlay was opened. Now it is sticky (it runs only for the wake word or a place
+  reminder; a restart loads only the wake word's models), and the assistant service starts it
+  whenever Android binds it (`onReady`). Android
+  lets the assistant app take the microphone from the background ("The service starts by an app
+  which provides the VoiceInteractionService", the FGS while-in-use exemptions). On the phone:
+  after a reinstall the service started by itself with the microphone type and listened; after
+  the process was killed it was back in 1 s and listening in 2, and a wake 4 s after the kill
+  opened the overlay through the assistant service (`START … result code=0`).
+- **Battery**, on the OnePlus (7,300 mAh), listening with the screen on and the app in the
+  background for 18 minutes: the listening thread took 10% of one core (1,185 ticks in 120 s),
+  on the small cores (the clip test's 2.8% ran on fast ones). Android's estimate for the app:
+  1.66 mAh of processor, 5.6 mAh an hour. It also booked 16 mAh to "audio" for the same
+  minutes, 54 mAh an hour, from the phone's power profile rather than a measurement: taken at
+  face value, the two make 0.8% of the battery an hour, which is what Settings says ("up to
+  about 1%"). Not measured with the screen off.
+- **When it listens** (`WakeConditions`, `wake/WakeWatch`): everywhere, the app and the overlay
+  included (the user: "it's not working when app or pop up is up, it should work always"; at
+  first it paused whenever one of the app's screens was in front, and while the assistant spoke).
+  It pauses only while the app's recorder is recording (the shared `AudioRecorder`: a question in
+  the overlay, a voice message in the chat), while Settings' **Try it** listens, and during a
+  call; with **While charging**, off the charger; and on a locked phone unless **Use on the lock
+  screen** is on (screen off counts as locked, since the lock follows with no broadcast). For 3 s
+  after it hears the phrase it stays quiet, so the overlay gets the microphone. Said over the
+  app, it opens the overlay on top; said with the overlay open, `AssistActivity.onNewIntent`
+  starts a new question, even from typing, and cuts off an answer being read out. On the phone
+  (2026-10-29), with the chat open: "Hey Luna" opened the overlay over it; once the overlay's own
+  listening ended the listener was back; "Hey Luna" again started a new recording in the same
+  overlay (`dumpsys audio`: the listener's capture stops, the overlay's starts); after closing it
+  the listener re-armed 3.7 s after the next wake.
+- **Two ways it stopped for good, fixed**: the quiet after a wake ended with one delayed
+  `update()`, which could land a millisecond early, find it still quiet, and never run again
+  (hidden while the app going to the background triggered another look; once the app no longer
+  paused it, the listener stayed off after a wake). Now every `update()` inside the quiet
+  reschedules the look. And a microphone that fails to open makes the listener look again 5 s
+  later instead of staying off.
+- **Opening the overlay.** Android 16 blocked the service's `startActivity` ("Background
+  activity launch blocked"), assistant role or not. A digital assistant may open itself through
+  its `VoiceInteractionService`, so the app has one (`assist/AssistantInteractionService`): the
+  power button now asks it for a session, which opens the same `AssistActivity`, and the wake
+  word calls `showSession`. Android also requires a `RecognitionService`; the app's declines
+  every request. Android reads an app's assistant service only when the app is picked as the
+  digital assistant, so a phone that picked it before has to pick it again (Settings says so,
+  through `VoiceInteractionService.isActiveService`).
+- **The second listener: a model trained on the user's voice** (the user, 2026-10-30: "look into
+  training a dedicated Hey Luna wake word model on my voice", then "go ahead with the
+  microWakeWord plan", then "build v3 into the app alongside today's spotter, waking when either
+  hears Hey Luna, at cut-off 0.9"). `wake/WakeModel` runs microWakeWord's streaming MixedNet
+  (Apache-2.0; 60 KB, int8, `assets/wake/hey_luna.tflite`) on the app's LiteRT. It listens to
+  TensorFlow Lite Micro's audio frontend (40 channels, 30 ms windows every 10 ms), built from
+  source (`src/main/cpp/microfrontend`, called through `wake/MicroFrontend`) from the same files
+  and flags as pymicro-features 2.0.2, which computed the training features. Every 30 ms the model
+  scores the last three frames; the phrase is heard when the mean of the last five scores reaches
+  0.9 (`WakeWord.MODEL_CUTOFF`), as on the Mac. It keeps its own state between calls, and a reset
+  starts a fresh interpreter. Training is in `tools/wakeword` (README there).
+  - **Synthetic voices weren't enough.** Trained on 13.5k Piper and Kokoro clips, 6.25k
+    sound-alikes and 10.75 h of LibriSpeech, the first model heard 10 of the user's 13 Recorder
+    clips at 0.9 and woke 7 times an hour on dev-other. With 100 h more speech it woke 1.8 times
+    an hour but heard 4: it grew stricter about what "Hey Luna" sounds like, and no synthetic
+    voice says it the way the user does.
+  - **The user's recordings** (Settings › Test build, test builds only; the
+    user: "I have created 53 x hey luna as of now please proceed with that"): 53 phrases (28
+    close, 25 with noise, none yet across the room) and 161 s of talk. Every fourth phrase was held
+    back, 40 trained, at 50 varied copies each (room echo, noise, gain), sampled twice as often as
+    all the synthetic phrases together; the talk counts as speech not to wake on. 31 minutes on
+    the M2. The recordings stay on the Mac, not in the repository.
+  - **Results**, cut-off 0.9: the 13 held-back phrases 11 (spotter 10); the 13 older Recorder
+    clips 11 (spotter 13); unseen macOS voices 18 of 24 (spotter 24); sound-alikes 10 of 434
+    (spotter 33); dev-other 1.2 false wakes an hour (spotter 0). At 0.8 it heard both
+    near-misses among the Recorder clips (0.82, 0.86) but woke 3.1 times an hour. The two miss
+    different phrases: the model's misses (scores 0.45 and 0.46) were heard by the spotter, and
+    the spotter's three misses scored 1.00 with the model, so together they heard all 26. The
+    held-back phrases come from the same sessions as the training ones, so the Recorder clips
+    from earlier days are the fairer test.
+  - **On the phone** (OnePlus, 2026-10-30): `WakeModelTest` feeds a Kokoro "Hey Luna" in light
+    noise (`androidTest/assets/wake/golden.*`, from `tools/wakeword/make_golden.py`) and gets
+    Python's features value for value (257 frames) and its 85 scores exactly. The scores are the
+    same whether the audio comes whole or 100 ms at a time; it hears the phrase and stays quiet on
+    silence. `#clips` on the phone: the user's 26 recordings, spotter 24, model 22, either 26;
+    sound-alikes, spotter 33, model 10, either 39 of 434. Processor time: the model 1.8 ms per
+    second of audio (0.18% of one core), the spotter 28.1 ms, so listening costs about 6% more.
+    The user's clips were deleted from the phone after the run.
+  - **Through the air** (`#live`, the 13 held-back phrases played from the Mac at its 19% volume,
+    twice): wherever the room was quiet, the model woke on 7 of 7 plays and then 7 of 8, the
+    spotter on 2–3 of them. While other sound filled the room (peaks of 0.4–0.5, mostly under
+    1 kHz, there with nothing playing too), neither heard the phrase over it: 1 of 5 plays. Through
+    the background listener, a phrase the spotter never hears was heard ("Not listening: just
+    heard it").
+  - **A test run leaves the overlay shut**: `am instrument` force-stops the app, which also
+    unbinds its assistant service, and Android doesn't bind it again when the app is reopened. A
+    wake then falls back to `startActivity`, which Android blocks (`START … AssistActivity … BAL_BLOCK
+    result code=102`). After tests, use the power-button assistant once, which should have Android
+    bind the service again (not yet confirmed on the phone), before checking that a wake opens the
+    overlay.
+
+## Live voice (Agora)
+
+Off unless a server is set: with `live.serverUrl` (and `live.appKey`) in `local.properties`, or
+typed in Settings → Live voice (Agora), the power button, "Hey Luna" and the chat's **Call** button
+start a voice call with Luna instead of the panel, while the phone is online. Offline, with the
+switch off, or with no server, everything runs on the phone as before, and the Call button and
+the Settings demo buttons that need the server stay hidden or greyed out. The server lives in
+`server/` (Node); this is the phone's side, in `live/` and `ui/live/`.
+
+- **The call.** Agora Conversational AI hears the user (ARES, `en-IN`), sends the words to the
+  server as a custom LLM (Gemini Flash with its own tools: the family hub, orders), and speaks the
+  answer with Murf Falcon. The phone joins the call's channel as uid 1001 with the voice SDK
+  (`io.agora.rtc:voice-sdk` 4.6.4, AI echo cancellation and noise suppression) and reads the
+  transcript and the agent's state over RTM (`rtm-sdk-lite` 2.3.0) through Agora's
+  `agora-agent-client-toolkit` 2.10.1. `LiveSession.connect` keeps the toolkit's order:
+  `loadAudioSettings(AUDIO_SCENARIO_AI_CLIENT)`, RTM login, `subscribeMessage`, then the RTC join,
+  then the tool bridge, then `POST /session/start`. The three libraries share
+  `io.agora.infra:aosl`, so the APK has one `libaosl.so` and no `pickFirsts` are needed.
+- **What the call knows** (`LiveContext`, sent once in `/session/start`): the prompt prefix the
+  phone's own model would have (`ConversationManager.liveContext`: core facts, the last summary,
+  the agenda, the notes index), pinned lists in full, today's steps and last night's sleep when
+  already allowed (`HealthTools.briefing`, which never asks), the phone's time with its offset,
+  and the phone's tool declarations and rules from `ToolCatalog`, without `remember_image` and
+  `take_screenshot`. On the lock screen it is only `ToolCatalog.LOCKED`'s tools and nothing about
+  the user: no name, memory, lists or health.
+- **The phone's tools** (`LiveToolBridge`, WebSocket `bridge_url`): the server's model calls a
+  phone tool as `tool_call`; it runs through the same `ToolExecutor` as the on-device model's, with
+  `heard = true` (the recogniser's words, as for a voice message), so it is checked,
+  deduplicated, logged with Undo, and shown as the same chips; the result goes back as
+  `tool_result` within the server's 8 s. A tool's facts and tasks point at the user's message, so
+  `LiveTranscriptLog.ensureUserMessage` stores it first when the transcript hasn't arrived yet;
+  the transcript for the same turn (by Agora's turn id, else by its words) isn't stored again.
+  The server's own `action`s ("Asked Rahul") and the family's `hub_update`s show as cards.
+- **Kept as a chat.** Each call is one chat ("Call with Luna, 9:02 AM"), stored as the transcript
+  becomes final, and each exchange is archived for recall as a typed one is
+  (`AppContainer.exchangeStored`, shared with `TurnRunner`). A reply cut off is kept as incomplete.
+- **Check-ins** (`CheckIns`): the doses the family set in the hub (`GET /family`) are kept in
+  Settings and rung at their times with exact alarms, re-set at every start. "Luna is calling"
+  rings over the lock screen with the ringtone (`IncomingCallActivity`); Answer asks to unlock and
+  starts a `purpose = "checkin"` call with the dose's id (a locked call if the user doesn't
+  unlock), Later rings again in 15 minutes. No ring while a call is on.
+- **While the call is on**: `LiveCallService`, a foreground service of the microphone and
+  media-playback types, keeps it going in another app; its notification goes back to the call or
+  ends it. The wake word stops listening (`WakeWatch` counts the call as a call), and the call
+  screen keeps the screen on and asks for tools' permissions itself.
+- **Demo** (Settings → Live voice): **Simulate check-in** rings now, without the server;
+  **Skip to 9:30** and **Reset demo** call `POST /demo/missed-dose` and `/demo/reset`.
+
+The tests (`app/src/test/.../live/`) cover the bridge against the real `ToolExecutor`, the context
+and the transcript log; the call itself needs Agora and the server, so it is checked on a phone.
+
+## Per-reply speed
+
+Each model reply carries a small footnote: `19.4 tok/s · 0.5s to first token`.
+
+The numbers come from the runtime's own `Conversation.getBenchmarkInfo()`, not from timing the
+stream from outside. That matters because multi-token prediction emits several tokens per
+callback, so counting stream emissions would undercount the decode rate. Enabling it costs only
+timing instrumentation (`ExperimentalFlags.enableBenchmark`).
+
+They are stored on the message (`tokensPerSecond`, `timeToFirstTokenMs`), so they survive a
+restart, and they are read before the conversation can be recycled — including after a stopped
+generation, which still reports what it managed.
+
+`DecodeSpeedProbeTest` (`-e speed true`) times a 268-token reply by clock, with MTP on and off,
+using only API that exists in both 0.17.1 and 0.18.1. On the OnePlus on 25 Oct 2026, warm from
+testing, LiteRT-LM 0.18.1 wrote 33 tok/s with MTP and 16 without; 0.17.1 under the same conditions
+wrote 21.6 and 8.8. The runtime's own count agreed with the clock on both. Long prompts full of
+digits (`digitPrecision`) decode at about 15 tok/s on 0.18.1: MTP's drafts are accepted less often
+there.
+
+## Tuning generation
+
+All four live in `SettingsStore` and are read on the next engine load / message:
+
+| Setting | Default | Notes |
+|---|---|---|
+| `contextTokens` | 8192 | The window the engine runs with; 4K, 8K, 12K or 16K from Settings, which restarts the model. |
+| `maxOutputTokens` | 2048 | Ceiling on one reply, also capped by the memory budget's reply reserve. |
+| `repetitionPenalty` | 1.1 | Damps degenerate loops. 1.0 disables. Keep it low — generated code and markup legitimately repeat. |
+| `repetitionWindow` | 256 | How many recent tokens the penalty looks at. |
+
+Leaving `maxNumTokens` unset in `EngineConfig` falls back to the runtime's own small default, which
+is why the app always sets it.
+
+## Startup
+
+The model starts loading the moment the app does (`AssistantApplication`, and again from
+`ChatViewModel` for a model installed just now), and the chat opens straight away. It takes a few
+seconds when the model file is in the page cache (about 3 s on the test phone). While it loads, a
+blank chat says "Getting ready…" in its hint line, so the starter tiles stay where they are; a chat
+with messages says it in the banner at the top. A message sent before it is ready shows at once
+(`ChatSender.Live.asked`: the stored copy came back from the database over a second later while the
+model loaded) and waits for the model. The line under it says "Loading the model · about 6 s left",
+counted from the last load's time (`SettingsStore.lastEngineLoadMs`), and the banner steps aside.
+
+**What it's doing** is shown beside the dot while a reply is worked on, and under the reply when a
+tool runs partway through it (`memory/tools/ToolSteps`, `TurnEvent.Step`, `ChatSender.Live.step`,
+in the chat and the power-button panel): "Reading the instructions…" (a new chat's conversation
+being made) or "Reading the conversation…" (one rebuilt from its history), "Checking your
+memories…" (recall), "Thinking…", then the tool: "Searching your photos…", "Searching the web…",
+"Setting a reminder…" and so on. The moment the tools are done it says so while the model reads
+their results: "Reminder set · writing the reply…" (`ToolSteps.done`). After 3 s of waiting the
+seconds show too: "Reading the instructions · 8 s". The model doesn't think aloud here (thinking is off, and the model
+reports none), so these are the steps the app can see. What a tool did stays as its chip. On the
+phone, a follow-up "show me my beach photos" showed "Checking your memories…" at 0.7 s, "Thinking…"
+at 2.0 s, "Searching your photos…" at 2.5 s and the reply with its photo card at 3.1 s. If the model
+fails to start, the banner says so in red. Tapping it tries again.
+
+## Context window
+
+The engine runs with an 8K window unless the user picks 4K, 12K or 16K under Settings → Context
+window, which restarts the model. 4K is for phones short on memory: the instructions and tool
+declarations alone are about 2,000 tokens, so it keeps only the last exchange or two in view. Nothing is measured: the app used to find the largest window each
+phone could hold by filling it for real, which took minutes on first launch and — through its crash
+guard — could quietly shrink the window after a few app updates installed mid-load. What it
+measured is why the choices stop at 16K: the 15.5 GB test phone held 16384 and was killed filling
+24576 (the KV cache grows as the window fills, so a clean `initialize()` proves nothing).
+
+A larger window costs memory the embedder and a voice model share — measured on that phone, 16K
+takes about 200 MB more than 8K and prefills 10–25% slower — and the prompt budget
+(`MemoryBudget`) has a profile for each. If a larger window fails to load, the app falls back to 8K
+on the same backend and Settings says so. A native out-of-memory leaves no exception to catch, so
+the size being loaded is written down first (`initInFlightTokens`, with `commit`); if it is still
+there at the next launch and was above 8K, the setting goes back to 8K before loading.
+
+**Token estimates.** There is no tokenizer API, so prompts are planned from an estimate. Latin
+text starts at a pessimistic 3.5 characters per token; after each rebuild the runtime's own count
+is compared with what went in, and the Latin rate is learned from it (`MeasuredTokenEstimator`,
+bounded between 3.5 and 6, quick to tighten and slow to relax). Indic scripts keep a dense 1.8. If
+the runtime ever rejects a prompt as too long, the learned rate is discarded and the turn is
+replanned and retried once.
+
+### Overflow
+
+A rebuilt conversation carries only the newest whole turns that fit the budget (at most 12 on the
+16K profile); images are charged at the model's own `maxVisionTokenBudget()` and audio by its
+length (`llm/ContextWindow.kt`). If a live conversation would pass the prompt ceiling, it is
+rebuilt smaller before the turn is sent rather than letting the runtime reject the input. Dropping
+is silent by nature, so the chat shows a quiet "N earlier messages no longer fit the context
+window" marker.
+
+The line above the composer shows real context consumption from `Conversation.getTokenCount()` —
+not an estimate. If a chat misbehaves, look there first to tell a genuine context overflow apart
+from a sampling problem.
+
+### Degenerate repetition
+
+If output collapses into a repeating fragment (`G4wG4wG4w…`), that is usually **not** context
+exhaustion. It happens in high-entropy stretches where the model has no real signal — hallucinated
+URLs, hashes, base64, long random IDs — and the loop is self-reinforcing once started. Raise
+`repetitionPenalty` toward 1.2, and check the token meter to rule out context before assuming it.
+
+## Where to extend
+
+| Want to add | Start at |
+|---|---|
+| A different or second model | `model/ModelCatalog.kt` |
+| Sampling, thinking | `llm/LlmBackend.kt` (`Sampling`) + `LiteRtLmBackend.openChat` |
+| What goes into the prompt, and its limits | `memory/prompt/PromptAssembler.kt` + `MemoryBudget.kt` |
+| Summarising dropped turns instead of discarding | `memory/prompt/ConversationManager.kt` |
+| A new tool | `memory/tools/ToolCatalog.kt` (declaration + routing rule) and `ToolExecutor` |
+| Time words the resolver misses | `memory/tools/WhenResolver.kt`, with a row in `WhenResolverTest` |
+| Photo search: model, cutoff, when it indexes | `gallery/GalleryModel.kt`, `gallery/PhotoRanking.kt`, `gallery/GalleryIndex.kt`; `GalleryEvalTest` on the phone |
+| Memory search's thresholds, or another embedding model | `memory/embed/PhotoModelEmbedder.kt` (thresholds), `EmbedderCatalog.kt` (imported ones); `TextEmbedderEvalTest`, then `EmbedderProbeTest` on the phone |
+| What counts as trivial, or a rare word | `memory/retrieval/QueryText.kt` |
+| What extraction looks for | `memory/extract/Extraction.kt` (prompt and examples), `ExtractionRouter` (what may be written) |
+| When compaction runs | `MemoryBudget` (`compactionTrigger`, `compactionTarget`, `rollingSummaryCap`) |
+| What the nightly job does | `memory/work/BackgroundJobs.kt` (`Consolidation`) |
+| Camera capture | `ui/chat/ChatScreen.kt` — only the photo picker is wired up; camera needs a FileProvider |
+| Longer voice notes | `media/MediaLimits.kt`, once you know the model's real audio ceiling |
+| More Markdown (tables, images, nested quotes) | `ui/chat/Markdown.kt` — parser; `MarkdownText.kt` — renderer |
+| Download surviving process death | `ModelManager` runs on an app-scoped coroutine; promote to a foreground service |
+
+## Markdown rendering
+
+Model replies render through a small hand-written renderer in `ui/chat/Markdown.kt` (parser) and
+`ui/chat/MarkdownText.kt` (composables). Supported: `#`–`######` headings, `**bold**`, `*italic*`,
+`***both***`, `~~strikethrough~~`, `` `inline code` ``, fenced code blocks with a language label
+and a copy button, bullet and numbered lists with nesting, blockquotes, `---` rules, and
+`[links](url)`.
+
+It is hand-written rather than a library for one reason: it renders text that is **still
+arriving**. Half of a `**bold**` span is a normal intermediate state, so every unmatched delimiter
+falls back to literal text instead of swallowing the rest of the message, and an unclosed code
+fence renders as an open code block. `app/src/test/.../MarkdownTest.kt` covers those cases,
+including parsing every prefix of a rich message.
+
+Two deliberate choices worth knowing:
+
+- **Single `_` is never emphasis.** Only `__double__` is. This keeps `max_output_token` and
+  `snake_case` intact, which matters when the model is writing code.
+- **Single newlines are preserved** rather than collapsed into spaces as strict Markdown would,
+  because chat models use them to mean a line break.
+
+## Numbers past token 2,048 (GPU)
+
+**The cause.** On the GPU backend, once text sits past token position 2,048 of the conversation,
+the model stops copying digits reliably. Words come through, but digits are dropped, doubled or
+reordered: "11:45" became "1:45", "4361044" "43610104", "09/08/2001" "09/08/20001". The model
+file (Gemma 4 E4B `.litertlm`) asks LiteRT-LM to run its text decoder with **fp16 activations**
+(the `tf_lite_prefill_decode` section's `prefer_activation_type: "fp16"`). In fp16, whole numbers
+are exact only up to 2,048. Past that, neighbouring token positions round to the same value: two
+at a time up to 4,096, four at a time after. The rotary position encoding then can't tell those
+tokens apart. Gemma gives every digit a token of its own, so a run of digits is exactly what falls
+apart, while a word spread over one or two tokens mostly survives. The instructions and 16 tool
+declarations alone are about 2,000 tokens, so every chat was past the line from its first message.
+It isn't MTP, the window size or the sampler: it was the same at 4K, 8K and 16K, with MTP on or
+off, and at any temperature. The CPU backend (fp32) was always exact.
+
+**How it's done elsewhere.** Server-side models (GPT, Claude, and open stacks such as vLLM or
+llama.cpp) keep positions as integers and compute the rotary angles in fp32, even when the rest of
+the model runs in 16 bits. Their tokenizers also group digits, so there are fewer digit tokens
+side by side. Speculative decoding and MTP draft tokens at the same positions and are checked by
+the main model, so they don't change this.
+
+**The fix.** `llm/ModelPrecision` sets the text decoder's `prefer_activation_type` to "fp32" in the
+model file's header before the engine loads it. LiteRT-LM 0.17.1 reads the preference from the
+header (`runtime/util/litert_lm_loader.cc`) and offers no API for it. (0.18 added
+`EngineConfig.activationDataType`. On 0.19.1, asked for FLOAT16 there over the fp32 header
+(`MemoryEvalTest#activationModes`, 14 Nov 2026), the prompt was read 1.2–1.6× faster (711 against
+589 tokens a second at 1,882 tokens, 724 against 443 at 3,312), but 14 of 16 numbers came back
+right at 1,882 tokens and none at 3,312, against 16 of 16 with the header's fp32. So the header
+patch stays.) "fp16" and "fp32" are the
+same length, so it is a 2-byte write in place, and nothing else in the 3.6 GB file moves. The
+vision encoder keeps its fp16. The runtime keys its GPU program cache on the file's mtime, so it
+rebuilds the fp32 programs once. A file it can't read, or one that asks for something else, is
+left as it is, and the app falls back to the checks below.
+
+Measured on the phone (`MemoryEvalTest.digitPrecision`: eight numbers — phone numbers, dates, a
+PIN, an amount — copied after a digit-free prompt, twice each, GPU with MTP):
+
+| Numbers copied after | fp16 (as shipped) | fp32 | Decode, fp16 → fp32 | To first token, fp16 → fp32 |
+|---|---|---|---|---|
+| 232 tokens | 16/16 | 16/16 | 52 → 48 tok/s | 0.4 → 0.5 s |
+| 1,398 tokens | 16/16 | 16/16 | 58 → 54 tok/s | 1.5 → 2.2 s |
+| 1,882 tokens | 14/16 | 16/16 | 56 → 53 tok/s | 2.0 → 3.1 s |
+| 3,334 tokens | 0/16 | 16/16 | 39 → 51 tok/s | 3.7 → 5.9 s |
+| 4,786 tokens | 0/16 | 16/16 | 31 → 45 tok/s | 5.5 → 10.4 s |
+
+Decoding runs at about the same speed; at long positions fp16 was slower only because it was
+writing garbage. In a real chat (`MemoryEvalTest.precisionCostInAChat`, with the app's full prompt
+of about 2,300 tokens), a new chat's first reply starts after 5.3 s instead of 3.7 s. A follow-up
+("…the insurance renews on 09/08/2027. what's the renewal date?") took 3.1 s in all and came back
+exact. The app uses about 220 MB more memory (1,390 against 1,171 MB). Reading a prompt (prefill) takes 1.6–1.9× as long, which shows at the first
+message of a chat and after a rebuild. Later turns only read their own new text. `"fp32_fp16"`
+(fp32 with mixed precision) was just as exact but no faster (12.5 s to the first token at 4,786),
+so plain fp32 is used.
+
+**What fp16 left behind.** Everything the model wrote before the fix could hold garbled numbers:
+archived replies ("Your Roll No. was 43610104"), session summaries ("25th October 026"), and saved
+images' details ("Roll No: 436104", "12:0:05 PM"). The fp32 model copies what it is given exactly,
+so recalled into a new chat, those old mistakes came back word for word.
+`memory/work/PrecisionUpgrade` puts them right once, the first time the model loads in fp32:
+
+- Archived exchanges keep the user's words, but lose a reply with digits in it.
+- Summaries with digits go.
+- Saved images are read again from their photos.
+
+What the user typed was never garbled, so facts and the chats' own messages are left alone. A chat
+from before the fix still shows its old replies, and continuing it replays them; a new chat
+doesn't. The start of fp32 is stored, so a restart part-way through doesn't strip newer replies.
+
+**Checks kept as fallbacks.** These were written before the cause was found. Some stay on always;
+others run only when the model's precision couldn't be set (`LlmService.exactDigits` false):
+
+- Always: **a message that is only a sum never reaches the model.** "whats 25 * 2", "what is root
+  of 25", "18% of 2450?" are worked out by `NumberGrounding.directAnswer` and answered at once:
+  "25 × 2 = 50". A `calculate` turn is answered by the app itself ("3450 ÷ 4 = 862.5"). Both are
+  faster than the model and can't be wrong.
+- Always: **tool arguments are grounded in the user's words** (`NumberGrounding`). An argument that
+  differs from the user's message only in its digits is taken from the message. With exact digits
+  it no longer changes anything.
+- Always: **sums and phone commands are kept out of the archive** (`ChunkPolicy.isUtility`).
+- Only in fp16: **reply numbers are checked against what the model read** (`ReplyGrounding`, see
+  *Saved images*), and **a saved image is read again** after "remember this" in a chat. With exact
+  digits, the first could only change a number that was right, and the second would cost 5 s and a
+  rebuild for nothing.
+
+## Known limitations
+
+These are deliberate omissions, not bugs:
+
+- Markdown covers the common subset; no tables, images or footnotes
+- The renderer re-parses the whole message on every streamed token — fine at chat length, but it
+  is the first thing to optimise if very long replies feel sluggish
+- Downloads stop if the process is killed (they resume on the next attempt)
+- No editing or regenerating messages, and no search or export of chats (memory can be exported)
+- Images come from the gallery only; no camera capture
+- One attachment per message
+- Light theme only

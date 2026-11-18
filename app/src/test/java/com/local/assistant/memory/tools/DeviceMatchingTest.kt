@@ -1,0 +1,202 @@
+package com.local.assistant.memory.tools
+
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+class DeviceMatchingTest {
+
+    private fun contact(name: String, vararg numbers: String, primary: Int = -1, mobile: Int = -1) =
+        Contact(name, numbers.mapIndexed { i, n -> ContactPhone(n, primary = i == primary, mobile = i == mobile) })
+
+    private val book = listOf(
+        contact("Amma", "+91 98450 11111"),
+        contact("Amma Home", "080 2222 3333"),
+        contact("Priya Sharma", "98450 22222"),
+        contact("Priya Nair", "98450 33333"),
+        contact("Dr Rao Dentist", "080 4444 5555"),
+        contact("Anjali", "98450 66666", "080 7777 8888", mobile = 0),
+        contact("Ravi Kumar", "080 1111 2222", "98450 99999", primary = 1),
+    )
+
+    private fun find(vararg candidates: String) = ContactMatcher.find(candidates.toList(), book)
+
+    @Test
+    fun `a whole name beats one that merely contains it`() {
+        assertEquals("Amma", (find("amma") as ContactMatcher.Match.One).contact.name)
+        assertEquals("Anjali", (find("Anjali") as ContactMatcher.Match.One).contact.name)
+    }
+
+    @Test
+    fun `two people with the name are asked about, with digits to tell them apart`() {
+        val several = find("Priya") as ContactMatcher.Match.Several
+        assertEquals(listOf("Priya Sharma (…2222)", "Priya Nair (…3333)"), several.labels)
+        assertEquals("Priya Nair", (find("priya nair") as ContactMatcher.Match.One).contact.name)
+    }
+
+    @Test
+    fun `what memory knows is tried when the words the user said find no one`() {
+        // "my dentist" → the user's dentist fact says "Dr. Rao".
+        assertEquals("Dr Rao Dentist", (find("my dentist", "Dr. Rao") as ContactMatcher.Match.One).contact.name)
+        // "mom" → the other words for mother.
+        assertEquals("Amma", (find("mom", "mummy", "amma") as ContactMatcher.Match.One).contact.name)
+        assertEquals(ContactMatcher.Match.None, find("the plumber"))
+    }
+
+    /** As on 4 Nov 2026: "Umma" was heard as "Uma", and no contact matched. */
+    @Test
+    fun `a name written down with a letter too few or too many still finds them`() {
+        val book = book + listOf(contact("Umma", "98450 12121"), contact("Jaffar Khan", "98450 13131"))
+        fun one(vararg candidates: String) = (ContactMatcher.find(candidates.toList(), book) as ContactMatcher.Match.One).contact.name
+        assertEquals("Umma", one("Uma"))
+        assertEquals("Jaffar Khan", one("jafar"))
+        assertEquals("Amma", one("Ama"))
+        // Only once nothing matches as written: what memory knows still comes first.
+        assertEquals("Anjali", one("Ama", "Anjali"))
+        assertEquals(ContactMatcher.Match.None, ContactMatcher.find(listOf("Uma"), this.book))
+    }
+
+    private val spelled = book + listOf(
+        contact("Fathima Riyas", "98450 20001"),
+        contact("Shiyas", "98450 20002"),
+        contact("Winod Menon", "98450 20003"),
+        contact("Muhammad Ajmal", "98450 20004"),
+        contact("Abdulla Rahman", "98450 20005"),
+        contact("Sunit Office", "98450 20006"),
+        contact("Rani", "98450 20007"),
+        contact("José Thomas", "98450 20008"),
+    )
+
+    private fun one(vararg candidates: String) =
+        (ContactMatcher.find(candidates.toList(), spelled) as? ContactMatcher.Match.One)?.contact?.name
+
+    @Test
+    fun `a name spelled the way it sounds finds them`() {
+        assertEquals("Fathima Riyas", one("Fatima"))
+        assertEquals("Shiyas", one("Siyas"))
+        assertEquals("Winod Menon", one("vinod"))
+        assertEquals("Muhammad Ajmal", one("Mohammed Ajmal"))
+        assertEquals("Muhammad Ajmal", one("Mohd Ajmal"))
+        assertEquals("José Thomas", one("jose tomas"))
+        assertEquals("Fathima Riyas", one("Fatimah"))
+    }
+
+    @Test
+    fun `the start of a name finds them, from four letters`() {
+        assertEquals("Abdulla Rahman", one("Abdul"))
+        assertEquals("Abdulla Rahman", one("abdul rahm"))
+        assertEquals(ContactMatcher.Match.None, ContactMatcher.find(listOf("Ab"), spelled))
+        // A whole word still beats the start of one.
+        assertEquals("Amma", one("Amma"))
+    }
+
+    @Test
+    fun `a name merely like the one said is offered, never picked`() {
+        val near = ContactMatcher.find(listOf("Sunil"), spelled) as ContactMatcher.Match.Near
+        assertEquals(listOf("Sunit Office (…0006)"), near.labels)
+        assertTrue(ContactMatcher.find(listOf("Anjaly"), spelled) is ContactMatcher.Match.Near)
+        // Too far apart, or too short to tell.
+        assertEquals(ContactMatcher.Match.None, ContactMatcher.find(listOf("Ravi"), listOf(contact("Rani", "1"))))
+        assertEquals(ContactMatcher.Match.None, ContactMatcher.find(listOf("Uma"), listOf(contact("Ama", "1"))))
+        assertEquals(ContactMatcher.Match.None, ContactMatcher.find(listOf("the plumber"), spelled))
+    }
+
+    @Test
+    fun `sound keys and likeness`() {
+        assertEquals(soundKey("fathima"), soundKey("fatima"))
+        assertEquals(soundKey("shiyas"), soundKey("siyas"))
+        assertEquals(soundKey("phiroz"), soundKey("firoz"))
+        assertEquals(soundKey("deepak"), soundKey("dipak"))
+        assertEquals(soundKey("roopa"), soundKey("rupa"))
+        assertEquals("chandra", soundKey("chandra"))
+        assertTrue(soundKey("ravi") != soundKey("rani"))
+        assertEquals(1.0, jaroWinkler("anjali", "anjali"), 0.0)
+        assertTrue(jaroWinkler("sunil", "sunit") >= 0.88)
+        assertTrue(jaroWinkler("ravi", "rani") < 0.88)
+        assertEquals(0.0, jaroWinkler("abc", "xyz"), 0.0)
+    }
+
+    /** A few thousand contacts, as on a well-used phone: every way through, timed. */
+    @Test
+    fun `matching a few thousand contacts is quick`() {
+        val first = listOf("Arun", "Fathima", "Shiyas", "Priya", "Muhammad", "Anjali", "Ravi", "Suresh", "Deepa", "Jaffar", "Vinod", "Lakshmi")
+        val last = listOf("Kumar", "Nair", "Menon", "Rahman", "Sharma", "Pillai", "Khan", "Thomas", "Reddy", "Iyer")
+        val many = (0 until 3000).map { i -> contact("${first[i % first.size]} ${last[i / first.size % last.size]} ${i / 120}", "98450 ${10000 + i}") }
+        val asks = listOf("Fathima Nair 3" to "written", "Fatima Nair 3" to "sound", "Fath Nair 3" to "prefix", "Fatma Nayr 3" to "near", "Nobody Here" to "none")
+        repeat(3) { asks.forEach { (said, _) -> ContactMatcher.find(listOf(said), many) } } // warm up
+        for ((said, way) in asks) {
+            val runs = 20
+            val start = System.nanoTime()
+            repeat(runs) { ContactMatcher.find(listOf(said, "mummy"), many) }
+            val ms = (System.nanoTime() - start) / 1e6 / runs
+            println("ContactMatcher 3000 contacts, $way: %.2f ms".format(ms))
+        }
+        assertEquals("Fathima Nair 3", (ContactMatcher.find(listOf("Fatima Nair 3"), many) as ContactMatcher.Match.One).contact.name)
+    }
+
+    @Test
+    fun `a name as written by the model goes back to the user's spelling`() {
+        assertEquals("umma", ContactMatcher.asSaid("Uma", "Send to umma and turn on flashlight"))
+        assertEquals("Uma", ContactMatcher.asSaid("Uma", "send it to Uma and then turn on the flashlight"))
+        assertEquals("Priyaa Sharma", ContactMatcher.asSaid("Priya Sharma", "message Priyaa"))
+        // Nothing alike in their words, or two: left as the model wrote it.
+        assertEquals("Amma", ContactMatcher.asSaid("Amma", "call mom"))
+        assertEquals("Uma", ContactMatcher.asSaid("Uma", "umma or Uuma, whoever"))
+        assertEquals("+91 98450 11111", ContactMatcher.asSaid("+91 98450 11111", "call 98450 11111"))
+    }
+
+    @Test
+    fun `the default number, else a mobile, else the first`() {
+        assertEquals("98450 99999", ContactMatcher.number(book.single { it.name == "Ravi Kumar" }))
+        assertEquals("98450 66666", ContactMatcher.number(book.single { it.name == "Anjali" }))
+        assertEquals("080 2222 3333", ContactMatcher.number(book.single { it.name == "Amma Home" }))
+    }
+
+    private val apps = listOf(
+        InstalledApp("YouTube", "com.google.android.youtube"),
+        InstalledApp("YouTube Music", "com.google.android.apps.youtube.music"),
+        InstalledApp("WhatsApp", "com.whatsapp"),
+        InstalledApp("WhatsApp Business", "com.whatsapp.w4b"),
+        InstalledApp("Maps", "com.google.android.apps.maps"),
+        InstalledApp("Spotify", "com.spotify.music"),
+        InstalledApp("Phone", "com.google.android.dialer"),
+        InstalledApp("Google Pay", "com.google.android.apps.nbu.paisa.user"),
+        InstalledApp("PhonePe", "com.phonepe.app"),
+    )
+
+    private fun open(app: String, query: String? = null) = AppMatcher.resolve(app, query, apps)
+
+    private fun target(app: String, query: String? = null) = (open(app, query) as AppMatcher.Result.Found).target
+
+    @Test
+    fun `apps are opened by their label`() {
+        assertEquals("YouTube", (target("youtube") as AppTarget.Launch).app.label)
+        assertEquals("WhatsApp", (target("WhatsApp") as AppTarget.Launch).app.label)
+        assertEquals("Google Pay", (target("google pay") as AppTarget.Launch).app.label)
+        assertEquals("PhonePe", (target("phonepe") as AppTarget.Launch).app.label)
+        assertEquals(AppTarget.Camera, target("camera"))
+        assertEquals(AppTarget.Settings, target("settings"))
+        assertEquals(AppMatcher.Result.None, open("Instagram"))
+    }
+
+    @Test
+    fun `searches go to the app that answers them`() {
+        assertEquals(AppTarget.Directions("Indiranagar"), target("maps", "Indiranagar"))
+        assertEquals(AppTarget.Directions("Indiranagar"), target("Google Maps", "Indiranagar"))
+        assertEquals(AppTarget.Directions("Indiranagar"), target("maps", "directions to Indiranagar"))
+        assertEquals(AppTarget.Directions("MG Road"), target("maps", "navigate to MG Road"))
+        assertEquals(AppTarget.Videos("lofi beats", apps[0]), target("youtube", "lofi beats"))
+        assertEquals(AppTarget.Play("Arijit Singh", null), target("music", "Arijit Singh"))
+        assertEquals(AppTarget.Play("Arijit Singh", apps[5]), target("spotify", "Arijit Singh"))
+        assertEquals(AppTarget.Play("Kesariya", apps[1]), target("youtube music", "Kesariya"))
+        assertEquals(AppTarget.WebSearch("weather in Kochi"), target("browser", "weather in Kochi"))
+        assertEquals(AppTarget.StoreSearch("Swiggy"), target("play store", "Swiggy"))
+    }
+
+    @Test
+    fun `an app that cannot be searched is still opened, and the model is told`() {
+        val found = open("WhatsApp", "Priya") as AppMatcher.Result.Found
+        assertEquals("WhatsApp", (found.target as AppTarget.Launch).app.label)
+        assertTrue(found.note!!.contains("can't search"))
+    }
+}

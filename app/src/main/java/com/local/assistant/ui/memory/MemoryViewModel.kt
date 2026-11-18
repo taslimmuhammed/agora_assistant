@@ -1,0 +1,316 @@
+package com.local.assistant.ui.memory
+
+import android.content.ContentResolver
+import android.net.Uri
+import android.util.Log
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.viewModelScope
+import androidx.lifecycle.viewmodel.initializer
+import androidx.lifecycle.viewmodel.viewModelFactory
+import com.local.assistant.AppContainer
+import com.local.assistant.data.prefs.SettingsStore
+import com.local.assistant.memory.MemoryControls
+import com.local.assistant.memory.core.CoreMemoryRenderer
+import com.local.assistant.memory.core.DuplicateSuggestion
+import com.local.assistant.memory.core.FactKeys
+import com.local.assistant.memory.core.FactLabels
+import com.local.assistant.memory.db.EventEntity
+import com.local.assistant.memory.db.FactCategory
+import com.local.assistant.memory.db.FactEntity
+import com.local.assistant.memory.db.FactOrigin
+import com.local.assistant.memory.db.NoteEntity
+import com.local.assistant.memory.db.TaskEntity
+import com.local.assistant.memory.db.TaskPlace
+import com.local.assistant.memory.tools.ReminderEdits
+import com.local.assistant.memory.prompt.MemoryBudget
+import com.local.assistant.memory.prompt.TokenEstimator
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.launchIn
+import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
+import java.util.Locale
+
+/** What the facts tab shows. */
+data class FactsView(
+    val core: List<FactEntity>,
+    /** What "Always in mind" costs in every prompt, against its cap. */
+    val coreTokens: Int,
+    val coreCap: Int,
+    val groups: List<Pair<FactCategory, List<FactEntity>>>,
+    val total: Int,
+) {
+    val isEmpty: Boolean get() = core.isEmpty() && groups.isEmpty()
+
+    companion object {
+        val EMPTY = FactsView(emptyList(), 0, MemoryBudget.EIGHT_K.coreCap, emptyList(), 0)
+
+        fun of(all: List<FactEntity>, query: String, renderer: CoreMemoryRenderer, coreCap: Int): FactsView {
+            val q = query.trim().lowercase(Locale.ROOT)
+            val shown = if (q.isEmpty()) all else all.filter { fact ->
+                listOf(fact.subject.replace('_', ' '), FactLabels.attribute(fact.attribute), fact.value)
+                    .any { q in it.lowercase(Locale.ROOT) }
+            }
+            val core = shown.filter { it.core }.sortedBy { it.id }
+            val coreTokens = renderer.render(all.filter { it.core && it.subject == FactKeys.USER }, Int.MAX_VALUE).tokens
+            val groups = shown.filter { !it.core }
+                .groupBy { it.category }
+                .toSortedMap(compareBy { SECTION_ORDER.indexOf(it) })
+                .map { (category, facts) -> category to facts.sortedWith(compareBy({ it.subject != FactKeys.USER }, { it.subject }, { it.attribute })) }
+            return FactsView(core, coreTokens, coreCap, groups, all.size)
+        }
+
+        /** "About you" first: the order the brief lists them in. */
+        private val SECTION_ORDER = listOf(
+            FactCategory.PROFILE, FactCategory.PREFERENCE, FactCategory.PEOPLE, FactCategory.PLACES,
+            FactCategory.WORK, FactCategory.HEALTH, FactCategory.ROUTINE, FactCategory.OTHER,
+        )
+    }
+}
+
+/**
+ * A short-lived message under the screen, with an undo when there is one. The undo comes last, so
+ * `Notice("Deleted “Buy milk”") { restore() }` is an undo: with [settle] last that lambda was it,
+ * and every undo ran by itself once its message went (5 Nov 2026).
+ */
+data class Notice(
+    val message: String,
+    /** Runs once the notice goes without its undo: what the undo needed kept can go now. */
+    val settle: (suspend () -> Unit)? = null,
+    val undo: (suspend () -> Unit)? = null,
+)
+
+class MemoryViewModel(
+    private val controls: MemoryControls,
+    private val settings: SettingsStore,
+    private val forgetAll: suspend () -> Unit,
+    estimator: TokenEstimator,
+    /** The Images tab's "+": the model names and describes the image, then it is saved. */
+    private val addImage: suspend (Uri) -> NoteEntity? = { null },
+    private val zone: () -> ZoneId = ZoneId::systemDefault,
+) : ViewModel() {
+
+    private val renderer = CoreMemoryRenderer(estimator)
+    private val coreCap = MemoryBudget.EIGHT_K.coreCap
+
+    private val _query = MutableStateFlow("")
+    val query: StateFlow<String> = _query.asStateFlow()
+
+    private val facts = controls.observeFacts().stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+    val factsView: StateFlow<FactsView> = combine(facts, _query) { all, q -> FactsView.of(all, q, renderer, coreCap) }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, FactsView.EMPTY)
+
+    val tasks: StateFlow<List<TaskEntity>> = controls.observeTasks().stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+    val events: StateFlow<List<EventEntity>> = controls.observeEvents().stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+    val savedImages: StateFlow<List<NoteEntity>> = controls.observeSavedImages().stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+    private val _duplicates = MutableStateFlow<List<DuplicateSuggestion>>(emptyList())
+    val duplicates: StateFlow<List<DuplicateSuggestion>> = _duplicates.asStateFlow()
+
+    val memoryPaused: StateFlow<Boolean> = settings.observeMemoryPaused()
+        .stateIn(viewModelScope, SharingStarted.Eagerly, settings.memoryPaused)
+
+    val retentionDays: StateFlow<Int> = settings.observeHistoryRetentionDays()
+        .stateIn(viewModelScope, SharingStarted.Eagerly, settings.historyRetentionDays)
+
+    /** An image from the "+" is with the model. */
+    private val _addingImage = MutableStateFlow(false)
+    val addingImage: StateFlow<Boolean> = _addingImage.asStateFlow()
+
+    private val _notices = MutableSharedFlow<Notice>(extraBufferCapacity = 4)
+    val notices: SharedFlow<Notice> = _notices.asSharedFlow()
+
+    init {
+        facts.onEach { refreshDuplicates() }.launchIn(viewModelScope)
+    }
+
+    fun search(text: String) {
+        _query.value = text
+    }
+
+    fun edit(fact: FactEntity, value: String) = launch { controls.edit(fact, value) }
+
+    fun togglePin(fact: FactEntity) = launch { controls.setCore(fact, !fact.core) }
+
+    fun delete(fact: FactEntity) = launch {
+        val deletion = controls.delete(fact)
+        val also = deletion.snippets.size
+        val message = "Forgot " + label(fact) + when (also) {
+            0 -> ""
+            1 -> " · also removed 1 related snippet"
+            else -> " · also removed $also related snippets"
+        }
+        _notices.emit(Notice(message, undo = { controls.undo(deletion) }))
+    }
+
+    suspend fun source(fact: FactEntity): String? {
+        val (message, chat) = controls.source(fact) ?: return null
+        val date = DATE.format(Instant.ofEpochMilli(message.createdAt).atZone(zone()))
+        return "“${message.text.trim()}”\n\n${chat?.title ?: "A deleted chat"} · $date"
+    }
+
+    fun merge(suggestion: DuplicateSuggestion, into: String) = launch {
+        val from = if (into == suggestion.first) suggestion.second else suggestion.first
+        controls.merge(from, into)
+        _notices.emit(Notice("“${from.replace('_', ' ')}” is now another name for “${into.replace('_', ' ')}”"))
+    }
+
+    fun dismiss(suggestion: DuplicateSuggestion) = launch {
+        controls.dismiss(suggestion)
+        refreshDuplicates()
+    }
+
+    fun completeTask(task: TaskEntity) = launch {
+        controls.completeTask(task)
+        _notices.emit(Notice("Done: “${task.title}”", undo = { controls.undoEdit(task) }))
+    }
+
+    /**
+     * Changes [task] as edited on screen. [onOutcome] hears whether it was saved, or why not, so
+     * the editor can stay open with the reason; a saved change can be undone.
+     */
+    fun editTask(task: TaskEntity, title: String, at: Long?, place: TaskPlace?, onOutcome: (ReminderEdits.Outcome) -> Unit) = launch {
+        val outcome = controls.editTask(task, title, at, place)
+        onOutcome(outcome)
+        if (outcome is ReminderEdits.Outcome.Saved) {
+            _notices.emit(Notice("Changed “${outcome.task.title}”", undo = { controls.undoEdit(task) }))
+        }
+    }
+
+    fun deleteTask(task: TaskEntity) = launch {
+        controls.deleteTask(task)
+        _notices.emit(Notice("Deleted “${task.title}”", undo = { controls.restoreTask(task) }))
+    }
+
+    fun deleteEvent(event: EventEntity) = launch {
+        controls.deleteEvent(event)
+        _notices.emit(Notice("Deleted “${event.title}”", undo = { controls.restoreEvent(event) }))
+    }
+
+    /** The note goes now; its image file once the undo has passed. */
+    fun deleteSavedImage(note: NoteEntity) = launch {
+        controls.deleteSavedImage(note)
+        _notices.emit(
+            Notice(
+                "Deleted “${note.title}”",
+                undo = { controls.restoreSavedImage(note) },
+                settle = { controls.discardSavedImageFile(note) },
+            ),
+        )
+    }
+
+    fun addSavedImage(uri: Uri) {
+        if (_addingImage.value) return
+        _addingImage.value = true
+        launch {
+            val message = try {
+                val note = addImage(uri)
+                if (note == null) {
+                    Notice("The model isn't available right now, so the image wasn't saved")
+                } else {
+                    Notice("Saved “${note.title}”", undo = { controls.deleteSavedImage(note) })
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "Could not add the image", e)
+                Notice("Couldn't read that image. Try again, or send it in a chat.")
+            } finally {
+                _addingImage.value = false
+            }
+            _notices.emit(message)
+        }
+    }
+
+    fun setPaused(paused: Boolean) {
+        settings.memoryPaused = paused
+    }
+
+    /** Shortening the period deletes what is now past it, straight away. */
+    fun setRetention(days: Int) = launch {
+        settings.historyRetentionDays = days
+        val deleted = controls.applyRetention(days)
+        if (deleted > 0) _notices.emit(Notice("Deleted $deleted older messages"))
+    }
+
+    fun forgetEverything() = launch {
+        forgetAll()
+        _notices.emit(Notice("Forgot everything. Your chats and notes are still there."))
+    }
+
+    fun export(uri: Uri, resolver: ContentResolver) = launch {
+        val json = controls.exportJson()
+        val ok = withContext(Dispatchers.IO) {
+            runCatching { resolver.openOutputStream(uri)?.use { it.write(json.toByteArray()) } != null }.getOrDefault(false)
+        }
+        _notices.emit(Notice(if (ok) "Exported" else "Could not write the file"))
+    }
+
+    fun undo(notice: Notice) = launch { notice.undo?.invoke() }
+
+    fun settle(notice: Notice) = launch { notice.settle?.invoke() }
+
+    private suspend fun refreshDuplicates() {
+        _duplicates.value = controls.duplicates()
+    }
+
+    private fun launch(block: suspend () -> Unit) {
+        viewModelScope.launch { block() }
+    }
+
+    companion object {
+        private const val TAG = "MemoryViewModel"
+        private val DATE = DateTimeFormatter.ofPattern("d MMM yyyy, h:mm a", Locale.ENGLISH)
+
+        /** "Dentist" for the user's own facts, "Mother · birthday" for someone else's. */
+        fun label(fact: FactEntity): String {
+            val attribute = FactLabels.attribute(fact.attribute).replaceFirstChar { it.titlecase(Locale.ROOT) }
+            return if (fact.subject == FactKeys.USER) {
+                attribute
+            } else {
+                fact.subject.replace('_', ' ').replaceFirstChar { it.titlecase(Locale.ROOT) } + " · " + attribute.lowercase(Locale.ROOT)
+            }
+        }
+
+        /** "From chat, 21 Sep" / "Learned from chat, 21 Sep" / "Edited by you, 22 Sep". */
+        fun provenance(fact: FactEntity, zone: ZoneId = ZoneId.systemDefault()): String {
+            val how = when (fact.origin) {
+                FactOrigin.CHAT -> "From chat"
+                FactOrigin.EXTRACTED -> "Learned from chat"
+                FactOrigin.USER_EDIT -> "Edited by you"
+            }
+            return "$how, " + SHORT_DATE.format(Instant.ofEpochMilli(fact.statedAt).atZone(zone))
+        }
+
+        private val SHORT_DATE = DateTimeFormatter.ofPattern("d MMM", Locale.ENGLISH)
+
+        fun factory(container: AppContainer): ViewModelProvider.Factory = viewModelFactory {
+            initializer {
+                MemoryViewModel(
+                    controls = container.memoryControls,
+                    settings = container.settings,
+                    forgetAll = container::forgetEverything,
+                    estimator = container.tokenEstimator,
+                    addImage = container::addSavedImage,
+                )
+            }
+        }
+    }
+}

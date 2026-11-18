@@ -1,0 +1,46 @@
+{
+  "elder": "lakshmi",
+  "members": [
+    {
+      "id": "lakshmi",
+      "name": "Lakshmi",
+      "relation": "herself",
+      "role": "elder",
+      "phone": "+91 90000 00001",
+      "aliases": ["amma", "mother", "mom"]
+    },
+    {
+      "id": "rahul",
+      "name": "Rahul",
+      "relation": "son",
+      "role": "caregiver",
+      "phone": "+91 90000 00002",
+      "aliases": ["my son", "son", "beta"]
+    },
+    {
+      "id": "priya",
+      "name": "Priya",
+      "relation": "daughter-in-law",
+      "role": "family",
+      "aliases": ["bahu", "daughter-in-law"]
+    },
+    {
+      "id": "ramesh-stores",
+      "name": "Ramesh Stores",
+      "relation": "the grocery shop",
+      "role": "provider",
+      "aliases": ["ramesh", "kirana", "grocery", "grocery shop", "shop", "store"]
+    },
+    {
+      "id": "dr-rao",
+      "name": "Dr. Rao's Clinic",
+      "relation": "her doctor",
+      "role": "provider",
+      "aliases": ["dr rao", "doctor", "clinic", "rao"]
+    }
+  ],
+  "doses": [
+    { "id": "bp-am", "name": "BP tablet", "detail": "Amlodipine 5 mg, after breakfast", "time": "09:00" },
+    { "id": "bp-pm", "name": "BP tablet", "detail": "Amlodipine 5 mg, after dinner", "time": "21:00" }
+  ]
+}
