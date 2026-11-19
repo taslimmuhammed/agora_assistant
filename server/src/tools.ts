@@ -1,6 +1,6 @@
 import type { Hub, Member } from './hub.ts'
 import type { Session, ToolDeclaration } from './sessions.ts'
-import { type Button, type Messenger, esc, familyRecipients } from './telegram.ts'
+import { type Option, type WhatsApp, chatOf } from './whatsapp.ts'
 import { dayKey, formatTime, resolveWhen } from './when.ts'
 
 /**
@@ -12,13 +12,13 @@ import { dayKey, formatTime, resolveWhen } from './when.ts'
  * the description, so the two sets read alike to the model.
  */
 export const SERVER_TOOLS: ToolDeclaration[] = [
-  declare('assign_task', "Asks a family member to do something for her (\"ask Rahul to take me to the doctor\"). They get it on Telegram and answer; she is told. Not for shops or services: use request_service.", {
+  declare('assign_task', "Asks a family member to do something for her (\"ask Rahul to take me to the doctor\"). They get it on WhatsApp and answer; she is told. Not for shops or services: use request_service.", {
     assignee: 'string', task: 'string', when: 'string',
   }, ['assignee', 'task'], "task: what to do, as an instruction to them (\"Take Amma to Dr. Rao's clinic\"). when: her own words for when (\"at 4:30\", \"kal subah\"), never a worked-out date."),
   declare('message_family', "Tells someone in her family something, or everyone (\"tell Priya I reached home\", \"let everyone know\"). urgent=true for anything about her safety or health: it also goes to her caregiver at once.", {
     to: 'string', text: 'string', urgent: 'boolean',
   }, ['to', 'text'], 'to: a name, a relation, or "everyone". text: the message, written for them to read.'),
-  declare('request_service', 'Sends an order or a booking to a shop, clinic or service she uses ("send my list to Ramesh Stores", "book Dr. Rao for tomorrow"). They confirm on Telegram; she is told.', {
+  declare('request_service', 'Sends an order or a booking to a shop, clinic or service she uses ("send my list to Ramesh Stores", "book Dr. Rao for tomorrow"). They confirm on WhatsApp; she is told.', {
     provider: 'string', what: 'string', when: 'string',
   }, ['provider', 'what'], 'what: the whole order or request, with every item. when: her own words for when.'),
   declare('log_checkin', 'Records what she says about her medicine, meals, mood or a walk, so her family can see it ("I took my tablet", "not yet", "I had lunch"). Use it every time she says whether she took a medicine.', {
@@ -37,7 +37,7 @@ export function isServerTool(name: string): boolean {
 
 export interface ToolDeps {
   hub: Hub
-  messenger: Messenger | null
+  whatsapp: WhatsApp | null
   session: Session
   now: Date
 }
@@ -68,7 +68,7 @@ export async function runServerTool(name: string, args: Record<string, unknown>,
   }
 }
 
-async function assignTask(args: Record<string, unknown>, { hub, messenger, now }: ToolDeps): Promise<ToolOutcome> {
+async function assignTask(args: Record<string, unknown>, { hub, whatsapp, now }: ToolDeps): Promise<ToolOutcome> {
   const title = text(args.task)
   if (!title) throw new ToolError('Say what they should do.')
   const who = hub.findMember(text(args.assignee), ['caregiver', 'family'])
@@ -85,18 +85,19 @@ async function assignTask(args: Record<string, unknown>, { hub, messenger, now }
   const followUpAt = Math.max(now.getTime() + 10 * 60_000, dueAt ? Math.min(hour, dueAt - 15 * 60_000) : hour)
   const task = hub.addTask({ title, assignee: who.id, whenText: when.label || text(args.when), dueAt, followUpAt }, now.getTime())
   const elder = hub.elder()
-  const html = `🙏 <b>${esc(elder.name)}</b> asked you, through Luna:\n\n<b>${esc(title)}</b>${when.label ? `\n🕓 ${esc(when.label)}` : ''}`
-  const sent = await deliver(hub, messenger, who, html, [[{ text: "👍 I'll do it", data: `task:${task.id}:yes` }, { text: "🙅 Can't", data: `task:${task.id}:no` }]])
-  hub.updateTask(task.id, { telegramChatId: sent.chatId, telegramMessageId: sent.messageId }, now.getTime())
+  const message = `🙏 *${elder.name}* asked you, through Luna:\n\n*${title}*${when.label ? `\n🕓 ${when.label}` : ''}`
+  const sent = await deliver(hub, whatsapp, who, message, [{ text: "👍 I'll do it", data: `task:${task.id}:yes` }, { text: "🙅 Can't", data: `task:${task.id}:no` }])
+    .catch(e => { hub.removeTask(task.id); throw e })
+  hub.updateTask(task.id, { chatId: sent.chatId, messageId: sent.messageId }, now.getTime())
   hub.addEvent('task', `You asked ${who.name}: ${title}${when.label ? `, ${when.label}` : ''}.`, { task: task.id }, now.getTime())
   return {
-    result: { ok: true, task: task.id, asked: who.name, when: when.label || undefined, next: `${who.name} answers on Telegram; she'll be told when they do.` },
+    result: { ok: true, task: task.id, asked: who.name, when: when.label || undefined, next: `${who.name} answers on WhatsApp; she'll be told when they do.` },
     card: { title: `Asked ${who.name}`, detail: `${title}${when.label ? ` · ${when.label}` : ''}` },
     action: `assign_task: asked ${who.name} to "${title}"${when.label ? ` (${when.label})` : ''}, task ${task.id}, waiting for an answer`,
   }
 }
 
-async function messageFamily(args: Record<string, unknown>, { hub, messenger, now }: ToolDeps): Promise<ToolOutcome> {
+async function messageFamily(args: Record<string, unknown>, { hub, whatsapp, now }: ToolDeps): Promise<ToolOutcome> {
   const body = text(args.text)
   if (!body) throw new ToolError('Say what the message is.')
   const urgent = truthy(args.urgent)
@@ -104,30 +105,28 @@ async function messageFamily(args: Record<string, unknown>, { hub, messenger, no
   const to = text(args.to)
   const everyone = !to || /\b(every|everyone|everybody|all|family|sab|sabko)\b/i.test(to)
   const event = hub.addEvent('message', `${urgent ? 'Urgent message' : 'Message'} to ${everyone ? 'the family' : to}: ${body}`, { urgent }, now.getTime())
-  const html = urgent
-    ? `🔴 <b>Urgent from ${esc(elder.name)}</b>, through Luna:\n\n${esc(body)}`
-    : `💬 <b>${esc(elder.name)}</b>, through Luna:\n\n${esc(body)}`
-  const buttons: Button[][] | undefined = urgent
-    ? [[{ text: `📞 Call ${elder.name}`, data: `call:${elder.id}` }, { text: "👍 I'm on it", data: `ack:${event.id}` }]]
-    : undefined
+  const message = urgent
+    ? `🔴 *Urgent from ${elder.name}*, through Luna:\n\n${body}${elder.phone ? `\n\n📞 Call her: ${elder.phone}` : ''}`
+    : `💬 *${elder.name}*, through Luna:\n\n${body}`
+  const options: Option[] = urgent ? [{ text: "👍 I'm on it", data: `ack:${event.id}` }] : []
 
   const told: string[] = []
   const group = hub.familyGroupChat()
   if (everyone && group !== null) {
-    await send(messenger, group, html, buttons)
+    await send(whatsapp, group, message, options)
     told.push('the family group')
   } else {
     const people = everyone ? familyRecipients(hub) : [hub.findMember(to, ['caregiver', 'family', 'provider'])].filter((m): m is Member => !!m)
-    if (!people.length) throw new ToolError(everyone ? 'No one in her family is connected to Luna on Telegram yet.' : `No one called "${to}". Her family: ${familyList(hub)}.`)
+    if (!people.length) throw new ToolError(everyone ? 'No one in her family has a WhatsApp number saved yet.' : `No one called "${to}". Her family: ${familyList(hub)}.`)
     for (const person of people) {
-      await deliver(hub, messenger, person, html, buttons)
+      await deliver(hub, whatsapp, person, message, options)
       told.push(person.name)
     }
   }
   if (urgent) {
     for (const carer of hub.caregivers()) {
-      if (told.includes(carer.name) || carer.telegramChatId === null || told.includes('the family group')) continue
-      await deliver(hub, messenger, carer, html, buttons)
+      if (told.includes(carer.name) || chatOf(carer) === null || told.includes('the family group')) continue
+      await deliver(hub, whatsapp, carer, message, options)
       told.push(carer.name)
     }
   }
@@ -139,7 +138,7 @@ async function messageFamily(args: Record<string, unknown>, { hub, messenger, no
   }
 }
 
-async function requestService(args: Record<string, unknown>, { hub, messenger, now }: ToolDeps): Promise<ToolOutcome> {
+async function requestService(args: Record<string, unknown>, { hub, whatsapp, now }: ToolDeps): Promise<ToolOutcome> {
   const what = text(args.what)
   if (!what) throw new ToolError('Say what to order or book.')
   const provider = hub.findMember(text(args.provider), ['provider'])
@@ -150,21 +149,22 @@ async function requestService(args: Record<string, unknown>, { hub, messenger, n
   const when = resolveWhen(text(args.when), now)
   const request = hub.addRequest({ provider: provider.id, what, whenText: when.label || text(args.when) }, now.getTime())
   const elder = hub.elder()
-  const html = `🛎️ <b>New request from ${esc(elder.name)}</b>, through Luna:\n\n${esc(what)}${when.label ? `\n🕓 ${esc(when.label)}` : ''}\n\n<i>Reply to this message to send her a note.</i>`
-  const sent = await deliver(hub, messenger, provider, html, [
-    [{ text: '✅ Confirm', data: `req:${request.id}:ok` }, { text: '⏱ Within the hour', data: `req:${request.id}:hour` }],
-    [{ text: '🕐 Another time', data: `req:${request.id}:later` }],
-  ])
-  hub.updateRequest(request.id, { telegramChatId: sent.chatId, telegramMessageId: sent.messageId }, now.getTime())
+  const message = `🛎️ *New request from ${elder.name}*, through Luna:\n\n${what}${when.label ? `\n🕓 ${when.label}` : ''}\n\n_Anything else you write here goes to her as a note._`
+  const sent = await deliver(hub, whatsapp, provider, message, [
+    { text: '✅ Confirm', data: `req:${request.id}:ok` },
+    { text: '⏱ Within the hour', data: `req:${request.id}:hour` },
+    { text: '🕐 Another time', data: `req:${request.id}:later` },
+  ]).catch(e => { hub.removeRequest(request.id); throw e })
+  hub.updateRequest(request.id, { chatId: sent.chatId, messageId: sent.messageId }, now.getTime())
   hub.addEvent('request', `You sent ${provider.name}: ${what}${when.label ? `, ${when.label}` : ''}.`, { request: request.id }, now.getTime())
   return {
-    result: { ok: true, request: request.id, sent_to: provider.name, when: when.label || undefined, next: `${provider.name} confirms on Telegram; she'll be told.` },
+    result: { ok: true, request: request.id, sent_to: provider.name, when: when.label || undefined, next: `${provider.name} confirms on WhatsApp; she'll be told.` },
     card: { title: `Sent to ${provider.name}`, detail: what },
     action: `request_service: sent ${provider.name} "${what}"${when.label ? ` (${when.label})` : ''}, request ${request.id}, waiting for confirmation`,
   }
 }
 
-async function logCheckin(args: Record<string, unknown>, { hub, messenger, session, now }: ToolDeps): Promise<ToolOutcome> {
+async function logCheckin(args: Record<string, unknown>, { hub, whatsapp, session, now }: ToolDeps): Promise<ToolOutcome> {
   const kind = checkinKind(text(args.kind))
   const ok = args.ok === undefined || args.ok === null || args.ok === '' ? true : truthy(args.ok)
   const detail = text(args.detail)
@@ -179,8 +179,8 @@ async function logCheckin(args: Record<string, unknown>, { hub, messenger, sessi
     hub.addEvent('checkin', ok ? `You took your ${doseName}.` : `You hadn't taken your ${doseName} yet.`, { dose: dose?.id, ok }, now.getTime())
     // Her caregiver was told she'd missed it: tell them it's sorted.
     if (ok && dose && hub.doseAlerted(dose.id, day)) {
-      for (const carer of hub.caregivers().filter(c => c.telegramChatId !== null)) {
-        await send(messenger, carer.telegramChatId!, `✅ ${esc(elder.name)} has taken the ${esc(doseName)} now.`)
+      for (const chat of hub.caregivers().map(chatOf).filter(c => c !== null)) {
+        await send(whatsapp, chat, `✅ ${elder.name} has taken the ${doseName} now.`)
       }
     }
   } else {
@@ -212,21 +212,29 @@ function familyStatus(args: Record<string, unknown>, { hub, now }: ToolDeps): To
 const TASK_STATES = { open: 'no answer yet', accepted: 'said yes', done: 'done', declined: "can't" }
 const REQUEST_STATES = { sent: 'not confirmed yet', confirmed: 'confirmed', within_hour: 'confirmed, within the hour', another_time: 'asked for another time' }
 
-/** Sends to [member] on Telegram, or to the family group naming them when they haven't linked. */
-async function deliver(hub: Hub, messenger: Messenger | null, member: Member, html: string, buttons?: Button[][]) {
-  if (member.telegramChatId !== null) {
-    return { chatId: member.telegramChatId, messageId: await send(messenger, member.telegramChatId, html, buttons) }
-  }
+/** Sends to [member] on WhatsApp, or to the family group naming them when there's no number for them. */
+async function deliver(hub: Hub, whatsapp: WhatsApp | null, member: Member, message: string, options?: Option[]) {
+  const chat = chatOf(member)
+  if (chat !== null) return { chatId: chat, messageId: await send(whatsapp, chat, message, options) }
   const group = hub.familyGroupChat()
   if (group !== null && member.role !== 'provider') {
-    return { chatId: group, messageId: await send(messenger, group, `<b>For ${esc(member.name)}</b>\n${html}`, buttons) }
+    return { chatId: group, messageId: await send(whatsapp, group, `*For ${member.name}*\n${message}`, options) }
   }
-  throw new ToolError(`${member.name} isn't connected to Luna on Telegram yet, so nothing was sent.`)
+  throw new ToolError(`There's no WhatsApp number for ${member.name}, so nothing was sent.`)
 }
 
-async function send(messenger: Messenger | null, chatId: number, html: string, buttons?: Button[][]): Promise<number> {
-  if (!messenger) throw new ToolError('Messages to the family are not set up on the server (no Telegram bot), so nothing was sent.')
-  return messenger.send(chatId, html, buttons)
+async function send(whatsapp: WhatsApp | null, chat: string, message: string, options?: Option[]): Promise<string> {
+  if (!whatsapp) throw new ToolError("WhatsApp isn't set up on the server, so nothing was sent.")
+  try {
+    return await whatsapp.send(chat, message, options)
+  } catch (e) {
+    throw new ToolError(`The WhatsApp message couldn't be sent (${(e as Error).message}), so nothing went.`)
+  }
+}
+
+/** Who a family-wide message goes to when there's no family group: her family with a number, not the shops. */
+export function familyRecipients(hub: Hub): Member[] {
+  return hub.members().filter(m => (m.role === 'caregiver' || m.role === 'family') && chatOf(m) !== null)
 }
 
 function familyList(hub: Hub): string {

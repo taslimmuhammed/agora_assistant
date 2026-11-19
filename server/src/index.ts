@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs'
 import { loadConfig } from './config.ts'
 
 const config = loadConfig()
@@ -11,12 +12,17 @@ const { Bridge } = await import('./bridge.ts')
 const { runFollowUps } = await import('./followups.ts')
 const { Hub } = await import('./hub.ts')
 const { openAiChat } = await import('./llm.ts')
+const { handleEvent } = await import('./replies.ts')
 const { Sessions } = await import('./sessions.ts')
-const { TelegramBot, handleUpdate } = await import('./telegram.ts')
+const { WhatsApp, connectWhatsApp } = await import('./whatsapp.ts')
 
+if (!existsSync(config.seedPath)) {
+  console.error(`No family at ${config.seedPath}. Copy seed/family.json there and fill in everyone's WhatsApp number, or set SEED_PATH.`)
+  process.exit(1)
+}
 const hub = Hub.fromFiles(config.dbPath, config.seedPath)
-const bot = config.telegram.botToken ? new TelegramBot(config.telegram.botToken) : null
 const clock = () => new Date()
+const whatsapp = config.whatsapp.enabled ? new WhatsApp(hub, clock) : null
 const { app, attachBridge, announce } = createApp({
   config,
   hub,
@@ -24,7 +30,7 @@ const { app, attachBridge, announce } = createApp({
   bridge: new Bridge(),
   agents: new AgoraAgents(config),
   chat: openAiChat(config),
-  messenger: bot,
+  whatsapp,
   clock,
 })
 
@@ -33,26 +39,21 @@ const server = app.listen(config.port, () => {
   const missing = [
     ['AGORA_APP_ID', config.agora.appId], ['AGORA_APP_CERTIFICATE', config.agora.appCertificate],
     ['AGORA_CUSTOMER_ID', config.agora.customerId], ['AGORA_CUSTOMER_SECRET', config.agora.customerSecret],
-    ['LLM_API_KEY', config.llm.apiKey], ['MURF_API_KEY', config.murf.apiKey], ['TELEGRAM_BOT_TOKEN', config.telegram.botToken],
+    ['LLM_API_KEY', config.llm.apiKey], ['MURF_API_KEY', config.murf.apiKey],
     ['APP_KEY', config.appKey], ['LLM_PROXY_SECRET', config.llmProxySecret],
   ].filter(([, value]) => !value).map(([name]) => name)
   if (missing.length) console.warn(`Not set: ${missing.join(', ')}`)
+  if (whatsapp) console.log(`WhatsApp sign-in page: http://localhost:${config.port}/whatsapp/qr${config.appKey ? '?key=<APP_KEY>' : ''}`)
 })
 attachBridge(server)
 
-if (bot) {
-  if (config.publicUrl) {
-    bot.setWebhook(`${config.publicUrl}/telegram/webhook`, config.telegram.webhookSecret)
-      .then(() => console.log('Telegram webhook set'))
-      .catch(e => console.warn(`Telegram webhook: ${(e as Error).message}`))
-  } else {
-    void bot.startPolling(update => handleUpdate(update, { hub, messenger: bot, announce, clock }))
-    console.log('Telegram: polling for updates')
-  }
+if (whatsapp) {
+  whatsapp.onEvent(event => handleEvent(event, { hub, whatsapp, announce, clock }))
+  connectWhatsApp(whatsapp, hub, config.whatsapp.authDir).catch(e => console.warn(`WhatsApp: ${(e as Error).message}`))
 }
 
 setInterval(() => {
-  runFollowUps(hub, bot, clock()).then(did => {
+  runFollowUps(hub, whatsapp, clock()).then(did => {
     if (did.length) console.log(`[follow-ups] ${did.join('; ')}`)
   }).catch(e => console.warn('[follow-ups]', (e as Error).message))
 }, 30_000)

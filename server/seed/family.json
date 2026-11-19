@@ -6,7 +6,7 @@
       "name": "Lakshmi",
       "relation": "herself",
       "role": "elder",
-      "phone": "+91 90000 00001",
+      "phone": "",
       "aliases": ["amma", "mother", "mom"]
     },
     {
@@ -14,7 +14,7 @@
       "name": "Rahul",
       "relation": "son",
       "role": "caregiver",
-      "phone": "+91 90000 00002",
+      "phone": "",
       "aliases": ["my son", "son", "beta"]
     },
     {
@@ -22,6 +22,7 @@
       "name": "Priya",
       "relation": "daughter-in-law",
       "role": "family",
+      "phone": "",
       "aliases": ["bahu", "daughter-in-law"]
     },
     {
@@ -29,6 +30,7 @@
       "name": "Ramesh Stores",
       "relation": "the grocery shop",
       "role": "provider",
+      "phone": "",
       "aliases": ["ramesh", "kirana", "grocery", "grocery shop", "shop", "store"]
     },
     {
@@ -36,6 +38,7 @@
       "name": "Dr. Rao's Clinic",
       "relation": "her doctor",
       "role": "provider",
+      "phone": "",
       "aliases": ["dr rao", "doctor", "clinic", "rao"]
     }
   ],

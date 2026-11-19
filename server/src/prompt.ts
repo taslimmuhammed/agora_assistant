@@ -28,7 +28,7 @@ export function buildSystemPrompt(hub: Hub, session: Session, now: Date): string
   }
 
   const people = hub.members().filter(m => m.role !== 'elder').map(m =>
-    `- ${m.name}: ${m.relation}${m.role === 'caregiver' ? ', her caregiver' : ''}${m.role === 'provider' ? ' (use request_service)' : ''}${m.telegramChatId === null && hub.familyGroupChat() === null ? ' (not on Telegram yet)' : ''}`)
+    `- ${m.name}: ${m.relation}${m.role === 'caregiver' ? ', her caregiver' : ''}${m.role === 'provider' ? ' (use request_service)' : ''}${!m.phone && hub.familyGroupChat() === null ? ' (no WhatsApp number saved)' : ''}`)
   sections.push(`Her family and helpers\n${people.join('\n')}`)
 
   const doses = hub.doseStates(now).map(d => `- ${clock(d.dose.time)} ${d.dose.name} (${d.dose.detail}): ${DOSE_WORDS[d.state]}`)

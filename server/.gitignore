@@ -1,3 +1,5 @@
 node_modules/
 .env
 data/
+# The family with real numbers, for the demo (SEED_PATH=seed/family.local.json).
+seed/*.local.json

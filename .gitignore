@@ -16,6 +16,9 @@ captures/
 *.mp4
 *.mov
 
+# Keys for the server (server/.env, or one here at the root).
+.env
+
 # The Play upload key and its passwords (see keystore.properties.example).
 keystore.properties
 *.jks

@@ -6,7 +6,7 @@ import type { Config } from './config.ts'
 import type { Hub } from './hub.ts'
 import { buildSystemPrompt } from './prompt.ts'
 import type { Session, Sessions, ToolDeclaration } from './sessions.ts'
-import type { Messenger } from './telegram.ts'
+import type { WhatsApp } from './whatsapp.ts'
 import { SERVER_TOOLS, isServerTool, runServerTool } from './tools.ts'
 
 /**
@@ -50,7 +50,7 @@ export interface LlmDeps {
   hub: Hub
   sessions: Sessions
   bridge: Bridge
-  messenger: Messenger | null
+  whatsapp: WhatsApp | null
   chat: ChatFn
   clock: () => Date
 }
@@ -158,7 +158,7 @@ export async function runTurn(deps: LlmDeps, session: Session, incoming: Array<R
 
 async function runTool(deps: LlmDeps, session: Session, name: string, args: Record<string, unknown>, deviceNames: Set<string>, turnId: string | undefined, userText: string): Promise<string> {
   if (isServerTool(name)) {
-    const outcome = await runServerTool(name, args, { hub: deps.hub, messenger: deps.messenger, session, now: deps.clock() })
+    const outcome = await runServerTool(name, args, { hub: deps.hub, whatsapp: deps.whatsapp, session, now: deps.clock() })
     if (outcome.action) session.actions.push(outcome.action)
     if (outcome.card) deps.bridge.push(session.id, { type: 'action', tool: name, ok: outcome.result.ok !== false, ...outcome.card })
     return JSON.stringify(outcome.result)

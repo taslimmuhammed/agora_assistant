@@ -11,15 +11,16 @@ reply with Murf Falcon. This server:
   phone's ToolExecutor sets reminders, edits lists, sets alarms, reads health data;
 - keeps the family hub (SQLite): who's who, medicines and check-ins, tasks asked of the family,
   requests to shops and clinics;
-- reaches the family and the shops through a Telegram bot, and tells her their answers during the
-  call (Agora `/speak`) or at her next one;
+- reaches the family and the shops on WhatsApp, at the numbers in the seed (Baileys, signed in
+  the way WhatsApp Web is), and tells her their answers during the call (Agora `/speak`) or at her
+  next one;
 - follows up: asks again when a task goes unanswered, tells her caregiver when a dose isn't
   confirmed 30 minutes after its time, and sends an 8 PM digest.
 
 ```
 phone ──RTC audio──▶ Agora ConvoAI ──/v1/chat/completions──▶ this server ──▶ Gemini Flash
   ▲  ◀──RTM transcripts──┘    ▲ Murf Falcon TTS               │  │
-  └──────── WebSocket /bridge (phone tools) ──────────────────┘  └──▶ Telegram (family, shops)
+  └──────── WebSocket /bridge (phone tools) ──────────────────┘  └──▶ WhatsApp (family, shops)
 ```
 
 ## Setting up (about an hour)
@@ -35,13 +36,26 @@ phone ──RTC audio──▶ Agora ConvoAI ──/v1/chat/completions──▶
    ```
 3. **Gemini.** An API key from [aistudio.google.com](https://aistudio.google.com), and the id of
    the current Flash model for `LLM_MODEL`.
-4. **Telegram.** Message [@BotFather](https://t.me/BotFather), send `/newbot`, and copy the token.
-   Then each person opens the bot and sends who they are: `/start rahul`, `/start priya`,
-   `/start ramesh-stores`, `/start dr-rao` (the ids in `seed/family.json`). For a family group,
-   add the bot to it and send `/family` there. `/status` anywhere shows the day so far.
-5. **Settings.** `cp .env.example .env` and fill it in. `APP_KEY` and `LLM_PROXY_SECRET` are
+4. **The family's numbers.** `cp seed/family.json seed/family.local.json` and fill in each
+   person's WhatsApp number with its country code (`"+91 98450 12345"`). The server uses the
+   local copy whenever it exists, and git leaves it out.
+5. **Settings.** `cp .env.example .env` and fill it in (here in `server/`, or at the repository
+   root: `npm start` reads both, this one winning). `GEMINI_API_KEY`, `GEMINI_MODEL_ID` and
+   `MURF_VOICE_ID` are read too, for `LLM_API_KEY`, `LLM_MODEL` and `MURF_VOICE`. `APP_KEY` and `LLM_PROXY_SECRET` are
    any long random strings; the phone needs `APP_KEY` too (`live.appKey` in the app's
    `local.properties`).
+6. **WhatsApp.** Luna sends from a WhatsApp number linked to the server, the way WhatsApp Web
+   is: Amma's in the story, a spare phone for the demo. Start the server, open
+   `http://localhost:8080/whatsapp/qr?key=<APP_KEY>` (the terminal shows the code too), and on that
+   phone go to WhatsApp → **Linked devices** → **Link a device** and scan it. The session stays in
+   `data/whatsapp-auth`, so it's once. At each start the log says whose number isn't on
+   WhatsApp. For a family group, add that number to the group and send `/family` in it from that
+   phone; `/status` in any chat with it shows the day so far.
+
+**About Baileys.** It isn't WhatsApp's own API: WhatsApp can restrict or ban a number it sees
+sending automated messages. Link a spare number rather than your own, send to people who already
+have a chat with it, and keep to the demo's handful of messages. Nobody in the seed may have the
+number Luna sends from: WhatsApp would file their messages under "Message yourself".
 
 ## Running it
 
@@ -59,17 +73,16 @@ and set `PUBLIC_URL` to its address before starting:
 cloudflared tunnel --url http://localhost:8080
 ```
 
-Without `PUBLIC_URL` the server still runs (Telegram polls for updates instead of using a
-webhook), but calls can't start.
+Without `PUBLIC_URL` the server still runs, WhatsApp included, but calls can't start.
 
 **Deploying.** On Railway or Render: root directory `server`, start command `npm start`, the same
 variables as `.env`, and a region near India (Singapore). Use an instance that doesn't sleep: a
-cold start would land in the middle of a call. Give `data/` a persistent disk if the Telegram
-links should survive a redeploy; otherwise everyone sends `/start` again.
+cold start would land in the middle of a call. Give `data/` a persistent disk, or WhatsApp asks
+for a new scan after each deploy. On the laptop none of this applies.
 
 ## Trying a turn without the phone
 
-With the keys set, this checks Gemini, the family tools and Telegram end to end, with no Agora
+With the keys set, this checks Gemini, the family tools and WhatsApp end to end, with no Agora
 call and no phone (phone tools then answer that the phone isn't connected):
 
 ```bash
@@ -80,7 +93,22 @@ curl -N "localhost:8080/v1/chat/completions?session=$SESSION" \
   -d '{"stream":true,"messages":[{"role":"user","content":"Ask Rahul to take me to Dr. Rao at 4:30"}]}'
 ```
 
-Rahul's Telegram gets the request with **I'll do it** and **Can't**.
+Rahul gets the request on WhatsApp, with **1** I'll do it and **2** Can't under it.
+
+## How the family answers
+
+WhatsApp shows no buttons to an account like this, so the choices under Luna's messages are
+numbered. Any of these answer them:
+
+- the number: `1`, or `1, I'll be there by 4` (the choice, and the rest is passed on to her);
+- a short word, English or Hindi: `yes`, `ok`, `haan`, `no`, `nahi`, `can't`, `done`, `she took it`,
+  `within the hour`, `kal`;
+- a 👍 (or 👎) on the message;
+- a reply quoting an older message, which answers that one rather than the latest.
+
+Anything longer is passed on to her as it is ("Rahul says: …") and settles nothing. So is a
+message a shop sends after confirming, which is kept with the order as its note. Only people in
+the seed are listened to; whatever anyone else writes to the number is left alone.
 
 ## For the demo
 
@@ -88,13 +116,14 @@ Each takes the `X-App-Key` header; the phone's debug buttons call them too.
 
 | Call | Does |
 |---|---|
-| `POST /demo/reset` | Clears tasks, requests, check-ins and events; keeps the Telegram links |
+| `POST /demo/reset` | Clears tasks, requests, check-ins and events; keeps the family group |
 | `POST /demo/missed-dose` | Flags the latest dose to her caregiver now, unless she took it (`{"dose_id":"bp-am"}` for a given one) |
 | `POST /demo/nudge` | Asks unanswered tasks' assignees again now; a second call tells the family |
 | `POST /demo/digest` | Sends the evening digest now |
 
 `GET /hub/state?key=…` is everything the hub holds, and `GET /hub/stream?key=…` each event as
-it happens, for a dashboard.
+it happens, for a dashboard. `GET /whatsapp` says whether WhatsApp is signed in, and
+`/whatsapp/qr?key=…` shows the code to scan when it isn't.
 
 ## The phone's side
 
@@ -138,7 +167,8 @@ On the bridge:
 | `src/prompt.ts` | The persona and each turn's system message; the greeting |
 | `src/tools.ts` | `assign_task`, `message_family`, `request_service`, `log_checkin`, `family_status` |
 | `src/bridge.ts` | Phone tools over the WebSocket, with a timeout |
-| `src/telegram.ts` | The bot: links, button taps, replies passed on to her |
+| `src/whatsapp.ts` | WhatsApp through Baileys: sign-in, sending with numbered choices, reading answers |
+| `src/replies.ts` | What an answer does: a task, an order or a dose settled, a note passed on to her |
 | `src/followups.ts` | Nudges, missed doses, the digest |
 | `src/announce.ts` | News for her: spoken during a call, or kept for the next |
 | `src/agora.ts` | Tokens, and the agent's join, leave and speak |
@@ -146,7 +176,7 @@ On the bridge:
 | `src/when.ts` | Her time words ("4:30", "kal subah") as times, in her zone |
 
 ```bash
-npm test           # node:test, with fakes for Agora, the model, the phone and Telegram
+npm test           # node:test, with fakes for Agora, the model, the phone and WhatsApp
 npm run typecheck
 ```
 

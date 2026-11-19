@@ -19,7 +19,6 @@ export interface Member {
   role: Role
   phone: string | null
   aliases: string[]
-  telegramChatId: number | null
 }
 
 export interface Dose {
@@ -42,8 +41,9 @@ export interface Task {
   status: TaskStatus
   nudgedAt: number | null
   escalated: boolean
-  telegramChatId: number | null
-  telegramMessageId: number | null
+  /** The WhatsApp chat it was sent to and Luna's message there, for replies to it. */
+  chatId: string | null
+  messageId: string | null
   createdAt: number
   updatedAt: number
 }
@@ -57,8 +57,8 @@ export interface ServiceRequest {
   whenText: string
   status: RequestStatus
   note: string | null
-  telegramChatId: number | null
-  telegramMessageId: number | null
+  chatId: string | null
+  messageId: string | null
   createdAt: number
   updatedAt: number
 }
@@ -71,7 +71,7 @@ export interface Checkin {
   doseId: string | null
   day: string
   at: number
-  /** "luna" when she told Luna, "caregiver" when someone tapped "She took it". */
+  /** "luna" when she told Luna, "caregiver" when someone answered "She's taken it". */
   source: string
 }
 
@@ -89,7 +89,7 @@ export type DoseState = 'taken' | 'not_yet' | 'due' | 'missed' | 'upcoming'
 
 export interface Seed {
   elder: string
-  members: Array<Omit<Member, 'telegramChatId' | 'phone' | 'aliases'> & { phone?: string; aliases?: string[] }>
+  members: Array<Omit<Member, 'phone' | 'aliases'> & { phone?: string; aliases?: string[] }>
   doses: Dose[]
 }
 
@@ -109,7 +109,7 @@ export class Hub {
     this.db.exec(SCHEMA)
     this.elderId = seed.elder
     this.doses = seed.doses
-    // The seed decides who's in the family; a Telegram link made with /start survives a reseed.
+    // The seed decides who's in the family, and their numbers are their WhatsApp chats.
     const upsert = this.db.prepare(
       `INSERT INTO members (id, name, relation, role, phone, aliases) VALUES (?, ?, ?, ?, ?, ?)
        ON CONFLICT(id) DO UPDATE SET name = excluded.name, relation = excluded.relation,
@@ -160,17 +160,8 @@ export class Hub {
     )
   }
 
-  linkTelegram(memberId: string, chatId: number) {
-    this.db.prepare('UPDATE members SET telegram_chat_id = NULL WHERE telegram_chat_id = ?').run(chatId)
-    this.db.prepare('UPDATE members SET telegram_chat_id = ? WHERE id = ?').run(chatId, memberId)
-  }
-
-  memberByChat(chatId: number): Member | null {
-    const row = this.db.prepare('SELECT * FROM members WHERE telegram_chat_id = ?').get(chatId)
-    return row ? toMember(row) : null
-  }
-
-  // Settings kept between restarts: the family group's chat, when each call ended, the digest.
+  // Settings kept between restarts: the family group's chat, when each call ended, the digest,
+  // and the choices under Luna's WhatsApp messages (whatsapp.ts).
 
   meta(key: string): string | null {
     const row = this.db.prepare('SELECT value FROM meta WHERE key = ?').get(key) as { value: string } | undefined
@@ -181,9 +172,13 @@ export class Hub {
     this.db.prepare('INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run(key, value)
   }
 
-  familyGroupChat(): number | null {
-    const id = this.meta('family_group_chat_id')
-    return id ? Number(id) : null
+  deleteMeta(key: string) {
+    this.db.prepare('DELETE FROM meta WHERE key = ?').run(key)
+  }
+
+  /** The WhatsApp group that gets family-wide news, once someone sends /family in it. */
+  familyGroupChat(): string | null {
+    return this.meta('family_group_chat')
   }
 
   // Tasks asked of family members
@@ -205,15 +200,19 @@ export class Hub {
     return this.db.prepare('SELECT * FROM tasks ORDER BY id').all().map(toTask)
   }
 
-  updateTask(id: number, patch: Partial<Pick<Task, 'status' | 'nudgedAt' | 'escalated' | 'telegramChatId' | 'telegramMessageId'>>, now: number) {
+  updateTask(id: number, patch: Partial<Pick<Task, 'status' | 'nudgedAt' | 'escalated' | 'chatId' | 'messageId'>>, now: number) {
     const columns: Record<string, string> = {
-      status: 'status', nudgedAt: 'nudged_at', escalated: 'escalated',
-      telegramChatId: 'telegram_chat_id', telegramMessageId: 'telegram_message_id',
+      status: 'status', nudgedAt: 'nudged_at', escalated: 'escalated', chatId: 'chat_id', messageId: 'message_id',
     }
     for (const [key, value] of Object.entries(patch)) {
       const v = typeof value === 'boolean' ? Number(value) : value
       this.db.prepare(`UPDATE tasks SET ${columns[key]} = ?, updated_at = ? WHERE id = ?`).run(v as number | string | null, now, id)
     }
+  }
+
+  /** For a task that never reached anyone. */
+  removeTask(id: number) {
+    this.db.prepare('DELETE FROM tasks WHERE id = ?').run(id)
   }
 
   // Requests to shops, clinics and services
@@ -234,20 +233,24 @@ export class Hub {
     return this.db.prepare('SELECT * FROM requests ORDER BY id').all().map(toRequest)
   }
 
-  updateRequest(id: number, patch: Partial<Pick<ServiceRequest, 'status' | 'note' | 'telegramChatId' | 'telegramMessageId'>>, now: number) {
+  updateRequest(id: number, patch: Partial<Pick<ServiceRequest, 'status' | 'note' | 'chatId' | 'messageId'>>, now: number) {
     const columns: Record<string, string> = {
-      status: 'status', note: 'note', telegramChatId: 'telegram_chat_id', telegramMessageId: 'telegram_message_id',
+      status: 'status', note: 'note', chatId: 'chat_id', messageId: 'message_id',
     }
     for (const [key, value] of Object.entries(patch)) {
       this.db.prepare(`UPDATE requests SET ${columns[key]} = ?, updated_at = ? WHERE id = ?`).run(value as number | string | null, now, id)
     }
   }
 
-  /** The task or request a Telegram message was about, for replies to it. */
-  aboutMessage(chatId: number, messageId: number): { task?: Task; request?: ServiceRequest } | null {
-    const task = this.db.prepare('SELECT * FROM tasks WHERE telegram_chat_id = ? AND telegram_message_id = ?').get(chatId, messageId)
+  removeRequest(id: number) {
+    this.db.prepare('DELETE FROM requests WHERE id = ?').run(id)
+  }
+
+  /** The task or request Luna's WhatsApp message [messageId] in [chatId] was about, for replies to it. */
+  aboutMessage(chatId: string, messageId: string): { task?: Task; request?: ServiceRequest } | null {
+    const task = this.db.prepare('SELECT * FROM tasks WHERE chat_id = ? AND message_id = ?').get(chatId, messageId)
     if (task) return { task: toTask(task) }
-    const request = this.db.prepare('SELECT * FROM requests WHERE telegram_chat_id = ? AND telegram_message_id = ?').get(chatId, messageId)
+    const request = this.db.prepare('SELECT * FROM requests WHERE chat_id = ? AND message_id = ?').get(chatId, messageId)
     return request ? { request: toRequest(request) } : null
   }
 
@@ -327,10 +330,10 @@ export class Hub {
       .filter(e => !kinds || kinds.includes(e.kind))
   }
 
-  /** Back to the seed, keeping Telegram links: between rehearsals. */
+  /** Back to the seed, keeping the family group: between rehearsals. */
   reset() {
     this.db.exec('DELETE FROM tasks; DELETE FROM requests; DELETE FROM checkins; DELETE FROM dose_alerts; DELETE FROM events;')
-    this.db.prepare("DELETE FROM meta WHERE key LIKE 'last_call_end:%' OR key = 'digest_day'").run()
+    this.db.prepare("DELETE FROM meta WHERE key LIKE 'last_call_end:%' OR key = 'digest_day' OR key LIKE 'wa:%'").run()
   }
 
   /** Everything the dashboard shows. */
@@ -338,7 +341,7 @@ export class Hub {
     return {
       now: now.toISOString(),
       elder: this.elder(),
-      members: this.members().map(m => ({ ...m, linked: m.telegramChatId !== null, telegramChatId: undefined })),
+      members: this.members(),
       familyGroupLinked: this.familyGroupChat() !== null,
       doses: this.doseStates(now).map(d => ({ ...d.dose, state: d.state })),
       tasks: this.tasks(),
@@ -352,20 +355,18 @@ export class Hub {
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS members (
   id TEXT PRIMARY KEY, name TEXT NOT NULL, relation TEXT NOT NULL, role TEXT NOT NULL,
-  phone TEXT, aliases TEXT NOT NULL DEFAULT '[]', telegram_chat_id INTEGER
+  phone TEXT, aliases TEXT NOT NULL DEFAULT '[]'
 );
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS tasks (
   id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, assignee TEXT NOT NULL,
   when_text TEXT NOT NULL DEFAULT '', due_at INTEGER, follow_up_at INTEGER, status TEXT NOT NULL,
-  nudged_at INTEGER, escalated INTEGER NOT NULL DEFAULT 0,
-  telegram_chat_id INTEGER, telegram_message_id INTEGER,
+  nudged_at INTEGER, escalated INTEGER NOT NULL DEFAULT 0, chat_id TEXT, message_id TEXT,
   created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS requests (
   id INTEGER PRIMARY KEY AUTOINCREMENT, provider TEXT NOT NULL, what TEXT NOT NULL,
-  when_text TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, note TEXT,
-  telegram_chat_id INTEGER, telegram_message_id INTEGER,
+  when_text TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, note TEXT, chat_id TEXT, message_id TEXT,
   created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS checkins (
@@ -388,7 +389,6 @@ function toMember(row: Row): Member {
     role: row.role as Role,
     phone: (row.phone as string | null) ?? null,
     aliases: JSON.parse(String(row.aliases ?? '[]')),
-    telegramChatId: row.telegram_chat_id == null ? null : Number(row.telegram_chat_id),
   }
 }
 
@@ -403,8 +403,8 @@ function toTask(row: Row): Task {
     status: row.status as TaskStatus,
     nudgedAt: row.nudged_at == null ? null : Number(row.nudged_at),
     escalated: Number(row.escalated) === 1,
-    telegramChatId: row.telegram_chat_id == null ? null : Number(row.telegram_chat_id),
-    telegramMessageId: row.telegram_message_id == null ? null : Number(row.telegram_message_id),
+    chatId: (row.chat_id as string | null) ?? null,
+    messageId: (row.message_id as string | null) ?? null,
     createdAt: Number(row.created_at),
     updatedAt: Number(row.updated_at),
   }
@@ -418,8 +418,8 @@ function toRequest(row: Row): ServiceRequest {
     whenText: String(row.when_text ?? ''),
     status: row.status as RequestStatus,
     note: (row.note as string | null) ?? null,
-    telegramChatId: row.telegram_chat_id == null ? null : Number(row.telegram_chat_id),
-    telegramMessageId: row.telegram_message_id == null ? null : Number(row.telegram_message_id),
+    chatId: (row.chat_id as string | null) ?? null,
+    messageId: (row.message_id as string | null) ?? null,
     createdAt: Number(row.created_at),
     updatedAt: Number(row.updated_at),
   }

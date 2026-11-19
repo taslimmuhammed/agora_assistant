@@ -5,7 +5,7 @@ import { WebSocket } from 'ws'
 import { createApp } from '../src/app.ts'
 import { Bridge } from '../src/bridge.ts'
 import { Sessions } from '../src/sessions.ts'
-import { FakeAgents, FakeMessenger, at, makeHub, scriptedChat, testConfig, text, toolCall } from './helpers.ts'
+import { FakeAgents, at, makeHub, scriptedChat, testConfig, text, toolCall } from './helpers.ts'
 
 // The whole call over HTTP, as the phone and Agora make it: token, bridge, start, one turn.
 
@@ -18,7 +18,7 @@ const { app, attachBridge } = createApp({
   bridge: new Bridge(),
   agents,
   chat,
-  messenger: new FakeMessenger(),
+  whatsapp: null,
   clock: () => at(9, 5),
 })
 const server = app.listen(0)
@@ -89,4 +89,13 @@ test('the family page lists the medicines for the check-in calls', async () => {
   assert.equal(family.elder.name, 'Lakshmi')
   assert.deepEqual(family.doses.map((d: { id: string }) => d.id), ['bp-am', 'bp-pm'])
   assert.ok(!family.members.some((m: { role: string }) => m.role === 'elder'))
+  assert.ok(family.members.every((m: { reachable: boolean }) => m.reachable), 'every one has a number')
+})
+
+test('the demo follow-ups say when WhatsApp is not signed in', async () => {
+  const res = await post('/demo/missed-dose', {})
+  assert.equal(res.status, 503)
+  assert.match((await res.json()).error, /whatsapp\/qr/)
+  const status = await (await fetch(`${base}/whatsapp`, { headers: { 'X-App-Key': 'app-key' } })).json()
+  assert.deepEqual(status, { enabled: false, signed_in: false, account: null, waiting_for_scan: false })
 })

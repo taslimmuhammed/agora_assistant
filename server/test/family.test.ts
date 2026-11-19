@@ -1,118 +1,108 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { announcer } from '../src/announce.ts'
-import { Bridge } from '../src/bridge.ts'
 import { runFollowUps } from '../src/followups.ts'
-import { Sessions } from '../src/sessions.ts'
-import { handleUpdate } from '../src/telegram.ts'
-import { runServerTool } from '../src/tools.ts'
-import { FakeAgents, FakeMessenger, FakePhone, at, makeHub } from './helpers.ts'
+import { RAHUL, at, family, incoming, liveCall } from './helpers.ts'
 
-function family(now = at(9, 5)) {
-  const hub = makeHub()
-  const sessions = new Sessions()
-  const bridge = new Bridge()
-  const agents = new FakeAgents()
-  const messenger = new FakeMessenger()
-  const clock = () => now
-  const announce = announcer({ hub, sessions, bridge, agents, clock })
-  const deps = { hub, messenger, announce, clock }
-  hub.linkTelegram('rahul', 555)
-  hub.linkTelegram('ramesh-stores', 777)
-  return { hub, sessions, bridge, agents, messenger, announce, deps, now }
-}
+// The family's side, over WhatsApp: what Luna sends them, and what their answers do.
 
-function liveCall(f: ReturnType<typeof family>) {
-  const session = f.sessions.create('lakshmi', 0, f.now.getTime())
-  session.agentId = 'agent-1'
-  const phone = new FakePhone()
-  f.bridge.attach(session.id, phone)
-  return { session, phone }
-}
-
-test('/start links a family member to their Telegram chat', async () => {
-  const f = family()
-  await handleUpdate({ message: { message_id: 1, chat: { id: 888, type: 'private' }, text: '/start priya' } }, f.deps)
-  assert.equal(f.hub.member('priya')?.telegramChatId, 888)
-  assert.match(f.messenger.sent[0].html, /Hi Priya/)
-})
-
-test("Rahul's \"I'll do it\" is said in her call at once and shown on her phone", async () => {
+test("Rahul's \"1\" is said in her call at once and shown on her phone", async () => {
   const f = family()
   const { session, phone } = liveCall(f)
-  const asked = await runServerTool('assign_task', { assignee: 'Rahul', task: "Take Amma to Dr. Rao's clinic", when: 'at 4:30' }, { hub: f.hub, messenger: f.messenger, session, now: f.now })
+  const asked = await f.tool('assign_task', { assignee: 'Rahul', task: "Take Amma to Dr. Rao's clinic", when: 'at 4:30' }, session)
   assert.equal(asked.result.ok, true)
-  const message = f.messenger.sent[0]
+  const message = f.socket.sent[0]
+  assert.equal(message.jid, RAHUL)
+  assert.match(message.text, /\*Take Amma to Dr\. Rao's clinic\*\n🕓 4:30 PM today/)
+  assert.match(message.text, /Reply with a number:\n\*1\* {2}👍 I'll do it\n\*2\* {2}🙅 Can't$/)
 
-  await handleUpdate({ callback_query: { id: 'q1', from: { id: 555 }, data: 'task:1:yes', message: { message_id: message.id, chat: { id: 555 }, text: 'asked' } } }, f.deps)
+  await f.whatsapp.receive(incoming(f.hub, 'rahul', '1'))
 
   assert.equal(f.hub.task(1)?.status, 'accepted')
   assert.deepEqual(f.agents.spoken, [{ agentId: 'agent-1', text: "Rahul said yes: take Amma to Dr. Rao's clinic, 4:30 PM today." }])
   assert.equal(phone.received.find(m => m.type === 'hub_update')?.kind, 'task_reply')
   assert.match(session.actions.at(-1)!, /Rahul said yes/)
-  assert.deepEqual(f.messenger.edits[0].buttons?.[0].map(b => b.data), ['task:1:done'])
-  assert.equal(f.messenger.answers[0].id, 'q1')
+  const thanks = f.socket.sent[1]
+  assert.equal(thanks.quoted, message.id)
+  assert.match(thanks.text, /\*1\* {2}✅ Done/)
+
+  await f.whatsapp.receive(incoming(f.hub, 'rahul', 'done'))
+  assert.equal(f.hub.task(1)?.status, 'done')
+  assert.equal(f.agents.spoken.at(-1)?.text, "Rahul has done it: take Amma to Dr. Rao's clinic.")
 })
 
 test("the shop's confirmation and note reach her; with no call they wait for the next one", async () => {
   const f = family()
-  const session = f.sessions.create('lakshmi', 0, f.now.getTime())
-  await runServerTool('request_service', { provider: 'the grocery shop', what: 'Milk, 2 kg atta' }, { hub: f.hub, messenger: f.messenger, session, now: f.now })
-  const order = f.messenger.sent[0]
-  assert.equal(order.chatId, 777)
+  await f.tool('request_service', { provider: 'the grocery shop', what: 'Milk, 2 kg atta' })
+  const order = f.socket.sent[0]
+  assert.equal(order.jid, '919000000004@s.whatsapp.net')
+  assert.match(order.text, /\*1\* {2}✅ Confirm\n\*2\* {2}⏱ Within the hour\n\*3\* {2}🕐 Another time/)
 
-  await handleUpdate({ callback_query: { id: 'q2', from: { id: 777 }, data: 'req:1:ok', message: { message_id: order.id, chat: { id: 777 }, text: 'order' } } }, f.deps)
-  await handleUpdate({ message: { message_id: 9, chat: { id: 777, type: 'private' }, from: { id: 777 }, text: 'Delivery by 11', reply_to_message: { message_id: order.id } } }, f.deps)
+  await f.whatsapp.receive(incoming(f.hub, 'ramesh-stores', 'ok'))
+  await f.whatsapp.receive(incoming(f.hub, 'ramesh-stores', 'Delivery by 11'))
 
   assert.equal(f.hub.request(1)?.status, 'confirmed')
   assert.equal(f.hub.request(1)?.note, 'Delivery by 11')
-  assert.equal(f.agents.spoken.length, 0, 'no bridge connected, so nothing is spoken')
+  assert.equal(f.agents.spoken.length, 0, 'no call, so nothing is spoken')
   const news = f.hub.eventsSince(0).map(e => e.text)
   assert.ok(news.includes('Ramesh Stores confirmed: Milk, 2 kg atta.'))
   assert.ok(news.includes('Ramesh Stores says: Delivery by 11'))
+  assert.match(f.socket.sent.at(-1)!.text, /Luna will tell Lakshmi/)
 })
 
 test('assign_task refuses a shop and an unknown name, saying who there is', async () => {
   const f = family()
-  const session = f.sessions.create('lakshmi', 0, f.now.getTime())
-  const shop = await runServerTool('assign_task', { assignee: 'Ramesh Stores', task: 'Bring milk' }, { hub: f.hub, messenger: f.messenger, session, now: f.now })
+  const shop = await f.tool('assign_task', { assignee: 'Ramesh Stores', task: 'Bring milk' })
   assert.match(String(shop.result.error), /request_service/)
-  const nobody = await runServerTool('assign_task', { assignee: 'Suresh', task: 'Bring milk' }, { hub: f.hub, messenger: f.messenger, session, now: f.now })
+  const nobody = await f.tool('assign_task', { assignee: 'Suresh', task: 'Bring milk' })
   assert.match(String(nobody.result.error), /Rahul \(son\)/)
-  assert.equal(f.messenger.sent.length, 0)
+  assert.equal(f.socket.sent.length, 0)
 })
 
-test("a dose not confirmed 30 minutes after its time is flagged to her caregiver, once", async () => {
+test('without WhatsApp signed in, the tool says nothing was sent', async () => {
   const f = family()
-  assert.deepEqual(await runFollowUps(f.hub, f.messenger, at(9, 20)), [])
-  const did = await runFollowUps(f.hub, f.messenger, at(9, 31))
+  f.whatsapp.detach()
+  const asked = await f.tool('assign_task', { assignee: 'Rahul', task: 'Bring milk' })
+  assert.equal(asked.result.ok, false)
+  assert.match(String(asked.result.error), /couldn't be sent/)
+})
+
+test('a dose not confirmed 30 minutes after its time is flagged to her caregiver, once, and he can answer for her', async () => {
+  const f = family()
+  assert.deepEqual(await runFollowUps(f.hub, f.whatsapp, at(9, 20)), [])
+  const did = await runFollowUps(f.hub, f.whatsapp, at(9, 31))
   assert.equal(did.length, 1)
-  assert.equal(f.messenger.sent[0].chatId, 555)
-  assert.match(f.messenger.sent[0].html, /hasn't confirmed the 9:00 AM BP tablet/)
-  assert.deepEqual(await runFollowUps(f.hub, f.messenger, at(9, 32)), [])
+  const alert = f.socket.sent[0]
+  assert.equal(alert.jid, RAHUL)
+  assert.match(alert.text, /hasn't confirmed the 9:00 AM BP tablet/)
+  assert.match(alert.text, /Call her: \+91 90000 00001/)
+  assert.deepEqual(await runFollowUps(f.hub, f.whatsapp, at(9, 32)), [])
+
+  await f.whatsapp.receive(incoming(f.hub, 'rahul', 'she took it'))
+  assert.equal(f.hub.doseStates(at(9, 33))[0].state, 'taken')
+  assert.ok(f.hub.eventsSince(0).some(e => e.text === 'Rahul confirmed you took your BP tablet.'))
 })
 
 test('a dose she said she took is never flagged; "not yet" can be flagged on demand', async () => {
   const f = family(at(9, 2))
   const session = f.sessions.create('lakshmi', 0, f.now.getTime())
   session.context = { purpose: 'checkin', dose_id: 'bp-am' }
-  await runServerTool('log_checkin', { kind: 'medicine', ok: false, detail: 'after breakfast' }, { hub: f.hub, messenger: f.messenger, session, now: f.now })
+  await f.tool('log_checkin', { kind: 'medicine', ok: false, detail: 'after breakfast' }, session)
   assert.equal(f.hub.doseStates(at(9, 2))[0].state, 'not_yet')
-  const forced = await runFollowUps(f.hub, f.messenger, at(9, 3), { forceDose: true })
+  const forced = await runFollowUps(f.hub, f.whatsapp, at(9, 3), { forceDose: true })
   assert.equal(forced.length, 1)
 
-  await runServerTool('log_checkin', { kind: 'tablet', ok: true }, { hub: f.hub, messenger: f.messenger, session, now: at(9, 40) })
-  assert.match(f.messenger.sent.at(-1)!.html, /has taken the BP tablet \(9:00 AM\) now/)
-  assert.deepEqual(await runFollowUps(f.hub, f.messenger, at(9, 45), { forceDose: 'bp-am' }), [])
+  await f.tool('log_checkin', { kind: 'tablet', ok: true }, session, at(9, 40))
+  assert.match(f.socket.sent.at(-1)!.text, /has taken the BP tablet \(9:00 AM\) now/)
+  assert.deepEqual(await runFollowUps(f.hub, f.whatsapp, at(9, 45), { forceDose: 'bp-am' }), [])
 })
 
-test('an unanswered task is asked again, then the family is told', async () => {
+test('an unanswered task is asked again under the first message, then the family is told', async () => {
   const f = family()
-  f.hub.linkTelegram('priya', 888)
-  const session = f.sessions.create('lakshmi', 0, f.now.getTime())
-  await runServerTool('assign_task', { assignee: 'Rahul', task: 'Pick up my medicines' }, { hub: f.hub, messenger: f.messenger, session, now: f.now })
-  assert.deepEqual(await runFollowUps(f.hub, f.messenger, at(9, 29)), [])
-  assert.match((await runFollowUps(f.hub, f.messenger, at(10, 6)))[0], /nudged Rahul/)
-  assert.match((await runFollowUps(f.hub, f.messenger, at(10, 22)))[0], /told the family/)
-  assert.equal(f.messenger.sent.at(-1)!.chatId, 888)
+  await f.tool('assign_task', { assignee: 'Rahul', task: 'Pick up my medicines' })
+  assert.deepEqual(await runFollowUps(f.hub, f.whatsapp, at(9, 29)), [])
+  assert.match((await runFollowUps(f.hub, f.whatsapp, at(10, 6)))[0], /nudged Rahul/)
+  const nudge = f.socket.sent.find(m => /waiting to hear from you/.test(m.text))!
+  assert.equal(nudge.quoted, f.socket.sent[0].id)
+  assert.match((await runFollowUps(f.hub, f.whatsapp, at(10, 22)))[0], /told the family/)
+  assert.equal(f.socket.sent.at(-1)!.jid, '919000000003@s.whatsapp.net', 'Priya')
 })

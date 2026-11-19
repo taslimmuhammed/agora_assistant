@@ -2,6 +2,7 @@ import type { IncomingMessage, Server } from 'node:http'
 import type { Duplex } from 'node:stream'
 import { fileURLToPath } from 'node:url'
 import express, { type NextFunction, type Request, type Response } from 'express'
+import QRCode from 'qrcode'
 import { WebSocketServer } from 'ws'
 import { type AgentApi, joinBody, rtcRtmToken } from './agora.ts'
 import { type Announce, announcer } from './announce.ts'
@@ -12,7 +13,7 @@ import type { Hub } from './hub.ts'
 import { type ChatFn, chatCompletions, sameSecret } from './llm.ts'
 import { buildSystemPrompt, greetingFor } from './prompt.ts'
 import type { LiveContext, Session, Sessions } from './sessions.ts'
-import { type Messenger, type TelegramUpdate, handleUpdate } from './telegram.ts'
+import { type WhatsApp, chatOf } from './whatsapp.ts'
 
 export interface AppDeps {
   config: Config
@@ -21,13 +22,13 @@ export interface AppDeps {
   bridge: Bridge
   agents: AgentApi
   chat: ChatFn
-  messenger: Messenger | null
+  whatsapp: WhatsApp | null
   clock: () => Date
 }
 
 /**
  * The HTTP side. The phone: /family, /session/{token,start,stop}, the /bridge WebSocket and
- * /demo/*. Agora: /v1/chat/completions. Telegram: /telegram/webhook. The dashboard: /hub/*.
+ * /demo/*. Agora: /v1/chat/completions. Signing in to WhatsApp: /whatsapp/qr. The dashboard: /hub/*.
  */
 export function createApp(deps: AppDeps) {
   const { config, hub, sessions, bridge, agents, clock } = deps
@@ -51,7 +52,7 @@ export function createApp(deps: AppDeps) {
     const elder = hub.elder()
     res.json({
       elder: { id: elder.id, name: elder.name, phone: elder.phone },
-      members: hub.members().filter(m => m.role !== 'elder').map(m => ({ id: m.id, name: m.name, relation: m.relation, role: m.role, linked: m.telegramChatId !== null })),
+      members: hub.members().filter(m => m.role !== 'elder').map(m => ({ id: m.id, name: m.name, relation: m.relation, role: m.role, reachable: chatOf(m) !== null })),
       doses: hub.doseStates(now).map(d => ({ ...d.dose, state: d.state })),
     })
   })
@@ -108,17 +109,19 @@ export function createApp(deps: AppDeps) {
 
   app.post('/v1/chat/completions', chatCompletions(deps))
 
-  app.post('/telegram/webhook', (req, res) => {
-    if (!sameSecret(String(req.headers['x-telegram-bot-api-secret-token'] ?? ''), config.telegram.webhookSecret)) {
-      res.sendStatus(401)
-      return
-    }
-    // Answered at once: Telegram retries anything slow, and the work may wait on Agora.
-    res.sendStatus(200)
-    if (deps.messenger) {
-      handleUpdate(req.body as TelegramUpdate, { hub, messenger: deps.messenger, announce, clock })
-        .catch(e => console.warn('[telegram] update failed:', (e as Error).message))
-    }
+  // WhatsApp: whether it's signed in, and the code to scan when it isn't.
+  app.get('/whatsapp', requireKey, (_req, res) => {
+    const wa = deps.whatsapp
+    res.json({ enabled: !!wa, signed_in: !!wa?.connected, account: wa?.account ?? null, waiting_for_scan: !!wa?.qr })
+  })
+  app.get('/whatsapp/qr', requireKey, async (_req, res) => {
+    const wa = deps.whatsapp
+    const page = (body: string) => `<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="5"><title>Luna · WhatsApp</title><body style="font:16px system-ui;display:grid;place-items:center;min-height:90vh;text-align:center">${body}</body>`
+    if (!wa) return void res.status(503).send(page('<p>WhatsApp is turned off on this server (WHATSAPP=off).</p>'))
+    if (wa.connected) return void res.send(page(`<p>✅ Signed in to WhatsApp as +${(wa.account ?? '').split('@')[0]}.</p>`))
+    if (!wa.qr) return void res.send(page('<p>Waiting for WhatsApp to send a code…</p>'))
+    const svg = await QRCode.toString(wa.qr, { type: 'svg', margin: 2, width: 320 })
+    res.send(page(`<div><p>On the phone Luna sends from: WhatsApp → <b>Linked devices</b> → <b>Link a device</b>, then scan.</p>${svg}</div>`))
   })
 
   // The dashboard: everything at once, then each event as it happens.
@@ -141,15 +144,20 @@ export function createApp(deps: AppDeps) {
     hub.reset()
     res.json({ ok: true })
   })
-  app.post('/demo/missed-dose', requireKey, async (req, res) => {
-    res.json({ ok: true, did: await runFollowUps(hub, deps.messenger, clock(), { forceDose: req.body?.dose_id || true }) })
-  })
-  app.post('/demo/nudge', requireKey, async (_req, res) => {
-    res.json({ ok: true, did: await runFollowUps(hub, deps.messenger, clock(), { forceNudge: true }) })
-  })
-  app.post('/demo/digest', requireKey, async (_req, res) => {
-    res.json({ ok: true, did: await runFollowUps(hub, deps.messenger, clock(), { forceDigest: true }) })
-  })
+  const followUp = (options: Parameters<typeof runFollowUps>[3]) => async (_req: Request, res: Response) => {
+    if (!deps.whatsapp?.connected) {
+      res.status(503).json({ error: "WhatsApp isn't signed in on the server: open /whatsapp/qr and scan the code." })
+      return
+    }
+    try {
+      res.json({ ok: true, did: await runFollowUps(hub, deps.whatsapp, clock(), options) })
+    } catch (e) {
+      res.status(502).json({ error: (e as Error).message })
+    }
+  }
+  app.post('/demo/missed-dose', requireKey, (req, res) => followUp({ forceDose: req.body?.dose_id || true })(req, res))
+  app.post('/demo/nudge', requireKey, followUp({ forceNudge: true }))
+  app.post('/demo/digest', requireKey, followUp({ forceDigest: true }))
 
   app.use(express.static(fileURLToPath(new URL('../public', import.meta.url))))
 
