@@ -9,15 +9,22 @@ import { type Announce, announcer } from './announce.ts'
 import type { Bridge } from './bridge.ts'
 import type { Config } from './config.ts'
 import { runFollowUps } from './followups.ts'
-import type { Hub } from './hub.ts'
+import type { Hub, Member } from './hub.ts'
 import { type ChatFn, chatCompletions, sameSecret } from './llm.ts'
+import { chatRoutes } from './chat.ts'
 import { buildSystemPrompt, greetingFor } from './prompt.ts'
+import { isServerTool, runServerTool } from './tools.ts'
+import { type Speak, type WriteBriefing, plainBriefing, updatesFor } from './briefing.ts'
 import type { LiveContext, Session, Sessions } from './sessions.ts'
 import { type WhatsApp, chatOf } from './whatsapp.ts'
 
 export interface AppDeps {
   config: Config
   hub: Hub
+  /** Writes what Luna says when she opens the app (briefing.ts); without it the answers as they are. */
+  briefing?: WriteBriefing
+  /** Murf's voice for it; without it the phone speaks it. */
+  speak?: Speak
   sessions: Sessions
   bridge: Bridge
   agents: AgentApi
@@ -27,11 +34,11 @@ export interface AppDeps {
 }
 
 /**
- * The HTTP side. The phone: /family, /session/{token,start,stop}, the /bridge WebSocket and
- * /demo/*. Agora: /v1/chat/completions. Signing in to WhatsApp: /whatsapp/qr. The dashboard: /hub/*.
+ * The HTTP side. The phone: /family (and its members, answers and tool), /session/{token,start,stop}, the /bridge WebSocket and
+ * /demo/* (rehearsals). Agora: /v1/chat/completions. Signing in to WhatsApp: /whatsapp/qr. The dashboard: /hub/*.
  */
 export function createApp(deps: AppDeps) {
-  const { config, hub, sessions, bridge, agents, clock } = deps
+  const { config, hub, sessions, bridge, agents, clock, whatsapp } = deps
   const announce: Announce = announcer(deps)
   const app = express()
   app.use(express.json({ limit: '2mb' }))
@@ -52,10 +59,112 @@ export function createApp(deps: AppDeps) {
     const elder = hub.elder()
     res.json({
       elder: { id: elder.id, name: elder.name, phone: elder.phone },
-      members: hub.members().filter(m => m.role !== 'elder').map(m => ({ id: m.id, name: m.name, relation: m.relation, role: m.role, reachable: chatOf(m) !== null })),
+      members: hub.members().filter(m => m.role !== 'elder').map(personJson),
       doses: hub.doseStates(now).map(d => ({ ...d.dose, state: d.state })),
     })
   })
+
+  // The app sets someone's WhatsApp number, picked from her contacts, or adds someone new. Kept
+  // across restarts, and over the seed's. With introduce, Luna says hello to them on WhatsApp.
+  app.put('/family/members/:id/phone', requireKey, async (req, res) => {
+    const member = hub.member(String(req.params.id))
+    if (!member || member.role === 'elder') return void res.status(404).json({ error: `No one called ${req.params.id} in the family` })
+    const phone = String(req.body?.phone ?? '').trim()
+    if (phone && !chatOf({ phone })) return void res.status(400).json({ error: 'That number looks too short' })
+    const changed = chatOf({ phone }) !== chatOf(member)
+    const saved = hub.setPhone(member.id, phone)!
+    res.json(await withWhatsApp(saved, changed && req.body?.introduce === true))
+  })
+
+  app.post('/family/members', requireKey, async (req, res) => {
+    const name = String(req.body?.name ?? '').trim().slice(0, 60)
+    const relation = String(req.body?.relation ?? '').trim().slice(0, 60)
+    const role = String(req.body?.role ?? 'family')
+    const phone = String(req.body?.phone ?? '').trim()
+    if (!name) return void res.status(400).json({ error: 'Say who it is' })
+    if (!['family', 'caregiver', 'provider'].includes(role)) return void res.status(400).json({ error: 'role is family, caregiver or provider' })
+    if (!chatOf({ phone })) return void res.status(400).json({ error: 'That number looks too short' })
+    const same = hub.members().find(m => chatOf(m) === chatOf({ phone }))
+    if (same) return void res.status(409).json({ error: `${same.name} already has that number` })
+    const added = hub.addMember({ name, relation: relation || (role === 'provider' ? 'shop' : 'family'), role: role as 'family', phone })
+    res.status(201).json(await withWhatsApp(added, req.body?.introduce === true))
+  })
+
+  // The family's answers for her that came outside a call, for the phone to tell her: those after
+  // [after], or on a first visit the last few of the past 12 hours, as her next call would. [waiting]: someone may answer
+  // soon, so the phone looks again in a minute rather than a quarter of an hour.
+  const since = (after: number) => Number.isInteger(after) && after >= 0
+    ? hub.answersAfter(after)
+    : hub.answersAfter(0).filter(e => e.at > clock().getTime() - 12 * 60 * 60_000).slice(-3)
+  app.get('/family/answers', requireKey, (req, res) => {
+    const answers = since(Number(req.query.after ?? -1))
+    res.json({
+      answers: answers.map(e => ({ id: e.id, kind: e.kind, text: e.text, at: e.at, told: e.told === true })),
+      last: hub.lastEventId(),
+      waiting: hub.awaitingAnswers(clock().getTime()),
+    })
+  })
+
+  // What Luna says as she opens the app: the updates after [after] (up to [up_to]) she didn't hear
+  // in a call, in one short message, with Murf's audio of it unless [audio] is false. [greet]
+  // false: she's in the app already, so no "Good morning".
+  app.post('/family/briefing', requireKey, async (req, res) => {
+    const upTo = Number(req.body?.up_to ?? Number.MAX_SAFE_INTEGER)
+    const events = since(Number(req.body?.after ?? -1)).filter(e => e.id <= upTo && !e.told)
+    if (!events.length) return void res.json({ text: null, up_to: null, audio: null })
+    const input = { elder: hub.elder().name, now: clock(), updates: updatesFor(hub, events), greet: req.body?.greet !== false }
+    const text = await (deps.briefing?.(input) ?? Promise.resolve(plainBriefing(input))).catch(e => {
+      console.warn(`[briefing] written plainly: ${(e as Error).message}`)
+      return plainBriefing(input)
+    })
+    const audio = req.body?.audio === false ? null : ((await deps.speak?.(text)) ?? null)
+    res.json({ text, up_to: events.at(-1)!.id, audio })
+  })
+
+  // [text] in Murf's voice, as the briefing's audio: for the phone to show the words first.
+  app.post('/family/speech', requireKey, async (req, res) => {
+    const text = String(req.body?.text ?? '').trim().slice(0, 1_000)
+    if (!text) return void res.status(400).json({ error: 'Say what to say' })
+    res.json({ audio: (await deps.speak?.(text)) ?? null })
+  })
+
+  // The chat on the phone, outside a call, sends to the family the way a call does: one of Luna's
+  // family tools, as if she'd asked for it in a call ({ name: 'message_family', args: { to, text } }).
+  // Also for rehearsals. A name not in the family is a 400, and the phone opens WhatsApp instead.
+  app.post('/family/tool', requireKey, async (req, res) => {
+    const name = String(req.body?.name ?? '')
+    if (!isServerTool(name)) return void res.status(400).json({ error: `No family tool called "${name}"` })
+    if (!whatsapp?.connected) return void res.status(503).json({ error: "WhatsApp isn't signed in on the server: open /whatsapp/qr and scan the code." })
+    const now = clock()
+    const session = sessions.create(`chat:${hub.elderId}`, 0, now.getTime())
+    try {
+      const outcome = await runServerTool(name, (req.body?.args ?? {}) as Record<string, unknown>, { hub, whatsapp, session, now })
+      res.status(outcome.result.ok === false ? 400 : 200).json({ ...outcome.result, card: outcome.card })
+    } finally {
+      sessions.end(session.id)
+    }
+  })
+
+  app.delete('/family/members/:id', requireKey, (req, res) => {
+    const member = hub.member(String(req.params.id))
+    if (!member) return void res.status(404).json({ error: `No one called ${req.params.id} in the family` })
+    if (!hub.removeMember(member.id)) return void res.status(400).json({ error: `${member.name} is in the seed; clear the number instead` })
+    res.json({ ok: true })
+  })
+
+  /** [member] for the app, with whether WhatsApp knows the number, after Luna's hello if asked. */
+  async function withWhatsApp(member: Member, introduce: boolean) {
+    const onWhatsApp = member.phone && whatsapp ? await whatsapp.hasWhatsApp(member.phone) : null
+    let introduced = false
+    const chat = chatOf(member)
+    if (introduce && chat && whatsapp?.connected && onWhatsApp !== false) {
+      introduced = await whatsapp.send(chat, introduction(hub, member)).then(() => true, e => {
+        console.warn(`[whatsapp] hello to ${member.name} not sent: ${(e as Error).message}`)
+        return false
+      })
+    }
+    return { ...personJson(member), on_whatsapp: onWhatsApp, introduced }
+  }
 
   // A call starts in two steps, because the phone must be listening on RTM before the agent joins.
   app.post('/session/token', requireKey, (req, res) => {
@@ -108,6 +217,8 @@ export function createApp(deps: AppDeps) {
   })
 
   app.post('/v1/chat/completions', chatCompletions(deps))
+  // The app's typed chat: the same brain, written (chat.ts).
+  chatRoutes(app, deps, requireKey)
 
   // WhatsApp: whether it's signed in, and the code to scan when it isn't.
   app.get('/whatsapp', requireKey, (_req, res) => {
@@ -199,4 +310,18 @@ export function createApp(deps: AppDeps) {
 function socketBase(config: Config, req: Request): string {
   if (config.publicUrl) return config.publicUrl.replace(/^http/, 'ws')
   return `ws://${req.headers.host}`
+}
+
+/** Someone in her family, as the app shows them. */
+function personJson(m: Member) {
+  return { id: m.id, name: m.name, relation: m.relation, role: m.role, phone: m.phone ?? '', reachable: chatOf(m) !== null, added: m.added }
+}
+
+/** Luna's hello to someone whose number was just added, so her first message isn't from a stranger. */
+export function introduction(hub: Hub, member: Member): string {
+  const elder = hub.elder().name
+  const how = 'Answer any way you like: the number shown, a few words in any language, a voice note, a photo or an emoji.'
+  return member.role === 'provider'
+    ? `👋 Hello ${member.name}! I'm *Luna*, ${elder}'s voice assistant. ${elder}'s orders and bookings for you will come here. ${how}`
+    : `👋 Hi ${member.name}! I'm *Luna*, ${elder}'s voice assistant. ${elder} added you here${member.relation && member.relation !== 'family' ? ` as her ${member.relation}` : ''}. When she asks me to tell you something or needs your help, it comes to this chat, and I'll tell her what you say. ${how}`
 }

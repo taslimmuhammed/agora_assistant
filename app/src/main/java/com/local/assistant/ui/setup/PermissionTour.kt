@@ -177,7 +177,7 @@ internal fun PermissionTour(container: AppContainer, onDone: () -> Unit, preview
         checked++
         if (library.access() == PhotoLibrary.Access.NONE) return@rememberLauncherForActivityResult
         settings.findPeople = findPeople
-        // The photo model now, beside the chat model: photos are searchable sooner.
+        // The photo model now: photos are searchable as soon as it's in.
         val models = container.galleryModelManager
         if (models.installed.value == null && models.transfer.value == null) models.download()
         container.indexPhotosIfReady()
@@ -225,8 +225,6 @@ internal fun PermissionTour(container: AppContainer, onDone: () -> Unit, preview
         val sms = context.checkSelfPermission(Manifest.permission.READ_SMS) == PackageManager.PERMISSION_GRANTED
         settings.keepMessages = keepMessages && (MessageListener.allowed(context) || (assistant && sms))
         settings.accessAsked = true
-        // Tools for files and messages come and go with these.
-        container.conversations.prefixMayHaveChanged()
         onDone()
     }
 
@@ -478,7 +476,7 @@ private fun AskExtra(
             SmallAction("Allow all the time", onMore, Modifier.padding(top = 10.dp))
         }
         Ask.FILES -> if (!given) Hint("Android opens a page: turn on Allow access to manage all files, then come back.")
-        Ask.ASSISTANT -> if (!given) Hint("Android doesn't let apps pick this themselves. On the page that opens, choose Digital assistant app, then Local Assistant.")
+        Ask.ASSISTANT -> if (!given) Hint("Android doesn't let apps pick this themselves. On the page that opens, choose Digital assistant app, then Luna.")
         Ask.BATTERY -> if (!given) Hint("In App info, tap Battery, then choose Unrestricted. On some phones it's Allow background activity.")
         Ask.MESSAGES -> {
             if (!given) {
@@ -496,7 +494,7 @@ private fun AskExtra(
                         when {
                             !morePending && assistant -> "Your SMS inbox is searched too."
                             assistant -> "Your SMS from before can be searched too."
-                            else -> "To search your SMS from before too, make Local Assistant your digital assistant (the page before)."
+                            else -> "To search your SMS from before too, make Luna your digital assistant (the page before)."
                         },
                         style = MaterialTheme.typography.bodySmall,
                         color = AppColors.TextSecondary,
@@ -568,7 +566,7 @@ private fun AllSet(given: Map<Ask, Boolean>, onAllow: (Ask) -> Unit) {
         )
         Spacer(Modifier.height(10.dp))
         Text(
-            "Next: the model download (${com.local.assistant.model.formatBytes(com.local.assistant.model.ModelCatalog.SIZE_BYTES)}, best on Wi-Fi), then your photos are indexed. You'll see each step.",
+            "Next: the chat. Luna answers from her server, so there's nothing to download first. Photo and memory search can be set up later in Settings.",
             style = MaterialTheme.typography.bodySmall,
             color = AppColors.TextSecondary,
         )
@@ -683,7 +681,7 @@ private enum class Ask(
     ASSISTANT(
         "Digital assistant", Icons.Outlined.PowerSettingsNew, Glass.Ink[1],
         "Open it from anywhere",
-        "Make Local Assistant your phone's digital assistant to open it by holding the power button over any app. It can then look at the screen you're on when you ask, and your SMS can be searched too.",
+        "Make Luna your phone's digital assistant to open it by holding the power button over any app. It can then look at the screen you're on when you ask, and your SMS can be searched too.",
         listOf(
             Icons.Outlined.PowerSettingsNew to "Hold the power button over any app",
             Icons.Outlined.ScreenshotMonitor to "“Summarise this”, about your screen",
@@ -711,7 +709,7 @@ private enum class Ask(
     BATTERY(
         "Battery", Icons.Outlined.BatteryChargingFull, Glass.Ink[3],
         "Keep it ready in the background",
-        "Phones close apps they think are idle. Letting Local Assistant run in the background keeps reminders on time, lets photo indexing finish, and makes answers start sooner.",
+        "Phones close apps they think are idle. Letting Luna run in the background keeps reminders on time, lets photo indexing finish, and makes answers start sooner.",
         listOf(
             Icons.Outlined.Schedule to "Reminders that ring on time",
             Icons.Outlined.PhotoLibrary to "Indexing that finishes",

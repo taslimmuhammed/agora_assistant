@@ -11,6 +11,8 @@ import java.util.Locale
  * Nothing here calls or sends on its own. `call` opens the dialer with the number and
  * `send_message` opens the messaging app with the text written; the user presses the button. A
  * 4B model does misroute now and then, and a call placed to the wrong person cannot be undone.
+ * The one exception is the family hub ([family]): with live voice on, a message to someone in it
+ * goes from Luna's WhatsApp at once, as it does in a call, so their answer comes back to her.
  *
  * People are found memory first — a number saved for "amma", or the name the user's dentist goes
  * by — then in the phone's contacts, which are asked for the first time they are needed.
@@ -21,6 +23,7 @@ class DeviceTools(
     private val people: PeopleMemory,
     private val alarms: SystemAlarms,
     private val now: () -> ZonedDateTime,
+    private val family: FamilyMessenger? = null,
 ) {
 
     internal suspend fun call(args: Args): ActionResult {
@@ -45,6 +48,16 @@ class DeviceTools(
             else -> throw ToolError("app must be sms, whatsapp or email.")
         }
         val image = if (args.bool("screenshot") == true) screenshot(screen) else null
+        val asked = args.text("app")?.lowercase(Locale.ROOT)?.replace(Regex("[^a-z]"), "")
+        if (app != MessageApp.EMAIL && asked != "sms" && image == null && text != null) {
+            family?.send(to, text)?.let { sentTo ->
+                return ActionResult(
+                    ok("sent" to "on WhatsApp to $sentTo from Luna's number, already; their answer will be told to the user when it comes"),
+                    MemoryChip(MemoryChip.Kind.MESSAGE, "WhatsApp", "$sentTo: ${text.take(CHIP_TEXT)}", note = "Sent by Luna · you'll hear the answer"),
+                    ready = "Sent to $sentTo on WhatsApp. I'll tell you when they answer.",
+                )
+            }
+        }
         val person = find(to, if (app == MessageApp.EMAIL) Need.EMAIL else Need.PHONE)
         val appName = APP_NAMES.getValue(app)
         val handoff = phone.compose(app, person.address, text, image)

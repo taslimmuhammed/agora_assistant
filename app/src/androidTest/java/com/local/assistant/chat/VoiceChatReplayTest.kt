@@ -10,7 +10,6 @@ import com.local.assistant.data.db.Role
 import com.local.assistant.llm.VoiceClips
 import com.local.assistant.memory.tools.ChatToolLog
 import com.local.assistant.memory.tools.GarbledText
-import com.local.assistant.memory.tools.ToolSteps
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
@@ -21,7 +20,8 @@ import org.junit.runner.RunWith
 import java.io.File
 
 /**
- * The chat that went to token soup on 14 Nov 2026, replayed through the app's own [ChatSender] in
+ * The chat that went to token soup on 14 Nov 2026 on the old on-phone model, replayed through
+ * the app's own [ChatSender], which now asks Luna's server, in
  * a hidden chat (deleted after): two typed turns, then voice and typed questions. Each reply is
  * judged by [GarbledText]; only the made-up questions' replies are written out, so nothing from
  * the phone's photos or messages reaches the report. Each line also says how long the reply's
@@ -31,9 +31,9 @@ import java.io.File
  * Clips under the app's external files, `voice-input/known/<id>.wav` (16 kHz mono): `messages`
  * ("Do you have any latest messages?") and `capital` ("What is the capital of Australia?").
  *
- *     adb shell am instrument -w -e eval voicereplay [-e speak true] [-e away true] [-e soup 4] \
+ *     adb shell am instrument -w -e eval voicereplay [-e speak true] [-e away true] \
  *         -e class com.local.assistant.chat.VoiceChatReplayTest \
- *         com.taslim.localassistant.dev.test/androidx.test.runner.AndroidJUnitRunner
+ *         com.taslim.luna.dev.test/androidx.test.runner.AndroidJUnitRunner
  */
 @RunWith(AndroidJUnit4::class)
 class VoiceChatReplayTest {
@@ -61,8 +61,6 @@ class VoiceChatReplayTest {
         var firstShown: Long? = null
         var firstStood: Long? = null
         var wordsWhenStood = 0
-        var restarted = false
-        var soupSayable = false
     }
 
     @Test
@@ -77,9 +75,6 @@ class VoiceChatReplayTest {
         // "-e away true": after the second turn the photo model closes, as memory search lets it
         // go when the app leaves the screen, and the next question opens it again.
         val away = args.getString("away") == "true"
-        // "-e soup N": turn N's first reply comes out as made-up soup instead of the model's: it
-        // should be taken back unspoken, the model loaded again, and the turn answered.
-        val soupAt = args.getString("soup")?.toIntOrNull()
         var chatId: Long? = null
         try {
             for ((index, turn) in turns.withIndex()) {
@@ -87,7 +82,6 @@ class VoiceChatReplayTest {
                     container.photoModel.unload()
                     report("photo model closed")
                 }
-                if (index + 1 == soupAt) container.llmService.soupNextReply = SOUP
                 if (speak && turn.clip != null) {
                     container.speaker.prepare()
                     // The user speaking: the voice loads meanwhile.
@@ -106,8 +100,6 @@ class VoiceChatReplayTest {
                     container.chatSender.live.collect { live ->
                         live ?: return@collect
                         val now = SystemClock.elapsedRealtime() - started
-                        if (live.step == ToolSteps.RESTARTING) watched.restarted = true
-                        if (SOUP_MARK in live.sayable) watched.soupSayable = true
                         if (live.text.isNotBlank() && watched.firstShown == null) watched.firstShown = now
                         if (live.sayable.isNotBlank() && watched.firstStood == null) {
                             watched.firstStood = now
@@ -122,13 +114,12 @@ class VoiceChatReplayTest {
                 val tools = messages.filter { it.role == Role.TOOL }.mapNotNull { ChatToolLog.parse(it.text)?.tool }
                 val stored = messages.lastOrNull { it.role == Role.ASSISTANT }?.text.orEmpty()
                 val fine = GarbledText.verdict(reply, final = true) == GarbledText.Verdict.FINE &&
-                    GarbledText.verdict(stored, final = true) == GarbledText.Verdict.FINE && SOUP_MARK !in stored
+                    GarbledText.verdict(stored, final = true) == GarbledText.Verdict.FINE
                 val held = watched.firstStood?.let { stood -> watched.firstShown?.let { stood - it } }
                 report(
                     "${if (fine) "ok     " else "GARBAGE"} ${if (turn.clip != null) "voice" else "typed"} \"${turn.text}\" in " +
                         "${SystemClock.elapsedRealtime() - started} ms, tools $tools, ${reply.length} chars, " +
                         "held ${held ?: "-"} ms (${watched.wordsWhenStood} words)" +
-                        (if (index + 1 == soupAt) ", soup: restarted ${watched.restarted}, soup sayable ${watched.soupSayable}, soup stored ${SOUP_MARK in stored}" else "") +
                         if (turn.madeUp || !fine) ": ${reply.take(if (turn.madeUp) 160 else 60).replace('\n', ' ')}" else "",
                 )
                 if (speak && turn.clip != null) {
@@ -137,12 +128,8 @@ class VoiceChatReplayTest {
                 }
             }
         } finally {
-            container.llmService.soupNextReply = null
             if (speak) container.speaker.stop()
-            chatId?.let {
-                container.chatRepository.deleteChat(it)
-                container.conversations.forget(it)
-            }
+            chatId?.let { container.chatRepository.deleteChat(it) }
         }
     }
 
@@ -177,9 +164,5 @@ class VoiceChatReplayTest {
 
     private companion object {
         const val TAG = "VoiceChatReplay"
-
-        /** Made up in the style of what the phone gave on 14 Nov 2026. */
-        const val SOUP_MARK = "840tsetUauthorx205619i"
-        const val SOUP = "\"$SOUP_MARK aponitimiCrap.M WMWWCOMXIai /isdevincr 링Tı Microsoft Sound***passou setzuL6yCblue and so on for a while"
     }
 }

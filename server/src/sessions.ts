@@ -17,8 +17,8 @@ export interface LiveContext {
   locale?: string
   time_zone?: string
   now?: string
-  /** "user" when she called, "checkin" when Luna rang her for a dose. */
-  purpose?: 'user' | 'checkin'
+  /** "user" when she called, "checkin" when Luna rang her for a dose, "chat" for a typed message (chat.ts). */
+  purpose?: 'user' | 'checkin' | 'chat'
   dose_id?: string
   /** On the lock screen: the phone sends only the tools allowed there, and no memory. */
   locked?: boolean
@@ -91,5 +91,10 @@ export class Sessions {
   end(id: string) {
     const session = this.byId.get(id)
     if (session) session.ended = true
+  }
+
+  /** Forgets a session that is over and needs nothing kept: a chat message's. */
+  drop(id: string) {
+    this.byId.delete(id)
   }
 }

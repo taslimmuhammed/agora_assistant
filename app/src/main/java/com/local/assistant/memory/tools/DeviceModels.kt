@@ -3,7 +3,7 @@ package com.local.assistant.memory.tools
 /** What a device or web tool gives back: the model's JSON, the chip, and a picture for the model to look at, if any. */
 /**
  * [image]: a picture for the model to look at with [result]. [reply]: what to tell the user,
- * written by the tool, which ends the turn (a photo question answered by `PhotoReader`).
+ * written by the tool, which ends the turn.
  */
 /** [ready]: for a call or message, what is now open for the user to send, in a sentence for them. */
 data class ActionResult(
@@ -130,4 +130,13 @@ object NoPhone : PhoneActions {
     override fun volume(change: VolumeChange): Int? = null
     override fun doNotDisturb(on: Boolean) = Handoff.NO_APP
     override fun openPanel(panel: SettingsPanel) = Handoff.NO_APP
+}
+
+/**
+ * Luna's own WhatsApp on her server, for the people in the family hub. [send] gives who it went to
+ * ("Filu"), or null when [to] isn't in the hub or the server can't send now: the phone's own
+ * WhatsApp is opened instead.
+ */
+fun interface FamilyMessenger {
+    suspend fun send(to: String, text: String): String?
 }

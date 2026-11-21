@@ -43,7 +43,21 @@ class LiveApi(
         val doses: List<Dose> = emptyList(),
     )
 
-    data class Member(val id: String = "", val name: String = "", val relation: String? = null, val role: String? = null)
+    data class Member(
+        val id: String = "",
+        val name: String = "",
+        val relation: String? = null,
+        val role: String? = null,
+        /** Their WhatsApp number, as saved on the server; blank when Luna can't message them. */
+        val phone: String? = null,
+        val reachable: Boolean = false,
+        /** Added from this app, not the server's seed: they can be removed here. */
+        val added: Boolean = false,
+        /** After a save: whether WhatsApp knows the number; null when the server couldn't check. */
+        @SerializedName("on_whatsapp") val onWhatsApp: Boolean? = null,
+        /** After a save: Luna said hello to them on WhatsApp. */
+        val introduced: Boolean = false,
+    )
 
     /** A medicine and when it is due, "09:00" in the elder's local time. */
     data class Dose(val id: String = "", val name: String = "", val detail: String? = null, val time: String = "")
@@ -61,7 +75,44 @@ class LiveApi(
 
     data class Started(@SerializedName("agent_id") val agentId: String? = null, val status: String? = null)
 
+    /** Something the family answered on WhatsApp, written to be said to her. [told]: she heard it in a call. */
+    data class Answer(val id: Long = 0, val kind: String = "", val text: String = "", val at: Long = 0, val told: Boolean = false)
+
+    /** The answers after a point, the newest event's id to carry on from, and whether one may come soon. */
+    data class Answers(val answers: List<Answer> = emptyList(), val last: Long = 0, val waiting: Boolean = false)
+
+    /** What Luna says as she opens the app, about the updates up to [upTo]; null [text] when there were none. */
+    data class Briefing(val text: String? = null, @SerializedName("up_to") val upTo: Long? = null)
+
+    /** Murf's MP3 of something, base64; null when Murf couldn't. */
+    data class Audio(val mime: String = "", val data: String = "")
+    private data class Speech(val audio: Audio? = null)
+
+    /** Sent through Luna's own WhatsApp: [sentTo] names who got it ("Filu", "the family group"). */
+    data class Sent(val ok: Boolean = false, @SerializedName("sent_to") val sentTo: String? = null)
+
     suspend fun family(): Family = parse(call("GET", "/family"), Family::class.java)
+
+    /**
+     * Saves [memberId]'s WhatsApp number on the server (picked from the contacts); blank clears it.
+     * With [introduce], Luna says hello to a new number on WhatsApp.
+     */
+    suspend fun setPhone(memberId: String, phone: String, introduce: Boolean = false): Member =
+        parse(call("PUT", "/family/members/${encode(memberId)}/phone", gson.toJson(mapOf("phone" to phone, "introduce" to introduce))), Member::class.java)
+
+    /** Adds someone picked from the contacts; [role] is family, caregiver or provider (a shop or service). */
+    suspend fun addMember(name: String, relation: String, role: String, phone: String, introduce: Boolean): Member =
+        parse(
+            call("POST", "/family/members", gson.toJson(mapOf("name" to name, "relation" to relation, "role" to role, "phone" to phone, "introduce" to introduce))),
+            Member::class.java,
+        )
+
+    /** Removes someone added here; the server's seed people stay. */
+    suspend fun removeMember(memberId: String) {
+        call("DELETE", "/family/members/${encode(memberId)}")
+    }
+
+    private fun encode(id: String) = java.net.URLEncoder.encode(id, "UTF-8").replace("+", "%20")
 
     suspend fun token(userId: String): Session =
         parse(call("POST", "/session/token", gson.toJson(mapOf("user_id" to userId))), Session::class.java).also {
@@ -76,6 +127,37 @@ class LiveApi(
         call("POST", "/session/stop", gson.toJson(mapOf("session_id" to sessionId)))
     }
 
+    /** The family's answers after event [after], or on a first visit (null) the last few of the past 12 hours. */
+    suspend fun answers(after: Long?): Answers =
+        parse(call("GET", "/family/answers" + (after?.let { "?after=$it" } ?: "")), Answers::class.java)
+
+    /** The updates after [after] up to [upTo] that she didn't hear in a call, as one short message from Luna; [greet] as she comes back. */
+    suspend fun briefing(after: Long?, upTo: Long, greet: Boolean): Briefing =
+        parse(
+            call("POST", "/family/briefing", gson.toJson(mapOf("after" to (after ?: -1L), "up_to" to upTo, "greet" to greet, "audio" to false)), client = quick),
+            Briefing::class.java,
+        )
+
+    /** [text] in Murf's voice, the one her calls use, as MP3 bytes; null when Murf couldn't. */
+    suspend fun speech(text: String): ByteArray? =
+        parse(call("POST", "/family/speech", gson.toJson(mapOf("text" to text)), client = speaking), Speech::class.java)
+            .audio?.data?.takeIf { it.isNotEmpty() }?.let { android.util.Base64.decode(it, android.util.Base64.DEFAULT) }
+
+    private val speaking: OkHttpClient by lazy { http.newBuilder().callTimeout(15, TimeUnit.SECONDS).build() }
+
+    /**
+     * [text] to [to] from Luna's WhatsApp, as a call sends it, so their answer comes back to her.
+     * Throws when [to] isn't in the family hub, or the server can't send: the chat then opens
+     * WhatsApp on the phone instead. Quick to give up, since the chat is waiting on it.
+     */
+    suspend fun messageFamily(to: String, text: String): Sent =
+        parse(
+            call("POST", "/family/tool", gson.toJson(mapOf("name" to "message_family", "args" to mapOf("to" to to, "text" to text))), client = quick),
+            Sent::class.java,
+        ).also { if (!it.ok) throw LiveError("Luna's server didn't send it.") }
+
+    private val quick: OkHttpClient by lazy { http.newBuilder().callTimeout(8, TimeUnit.SECONDS).build() }
+
     /** The demo's shortcuts: `missed-dose` acts as if the 9:00 dose went unconfirmed, `reset` clears the hub. */
     suspend fun demo(action: String) {
         call("POST", "/demo/$action", "{}")
@@ -85,7 +167,7 @@ class LiveApi(
     fun openBridge(url: String, listener: WebSocketListener): WebSocket =
         http.newWebSocket(Request.Builder().url(url).header(KEY_HEADER, appKey()).build(), listener)
 
-    private suspend fun call(method: String, path: String, body: String? = null): String = withContext(Dispatchers.IO) {
+    private suspend fun call(method: String, path: String, body: String? = null, client: OkHttpClient = http): String = withContext(Dispatchers.IO) {
         val base = serverUrl().trim().trimEnd('/').takeIf { it.isNotEmpty() } ?: throw LiveError("Live voice has no server set.")
         val request = Request.Builder()
             .url(base + path)
@@ -93,7 +175,7 @@ class LiveApi(
             .method(method, body?.toRequestBody(JSON))
             .build()
         val (code, text) = try {
-            http.newCall(request).execute().use { it.code to it.body?.string().orEmpty() }
+            client.newCall(request).execute().use { it.code to it.body?.string().orEmpty() }
         } catch (e: IOException) {
             throw LiveError("Couldn't reach Luna's server. The phone may be offline.")
         } catch (e: IllegalArgumentException) {

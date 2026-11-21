@@ -115,7 +115,6 @@ import com.local.assistant.data.db.AttachmentKind
 import com.local.assistant.data.db.MessageEntity
 import com.local.assistant.data.db.Role
 import com.local.assistant.data.repo.ChatRepository
-import com.local.assistant.llm.LlmService
 import com.local.assistant.media.RecordingState
 import com.local.assistant.ui.theme.AppColors
 import com.local.assistant.ui.theme.liquidGlass
@@ -173,25 +172,21 @@ fun ChatScreen(
     val activeChatId by viewModel.activeChatId.collectAsStateWithLifecycle()
     val messages by viewModel.messages.collectAsStateWithLifecycle()
     val streamingText by viewModel.streamingText.collectAsStateWithLifecycle()
-    val streamingStep by viewModel.streamingStep.collectAsStateWithLifecycle()
     val pendingQuestion by viewModel.pendingQuestion.collectAsStateWithLifecycle()
     val isGenerating by viewModel.isGenerating.collectAsStateWithLifecycle()
-    val engineState by viewModel.engineState.collectAsStateWithLifecycle()
     val error by viewModel.error.collectAsStateWithLifecycle()
-    val contextUsage by viewModel.contextUsage.collectAsStateWithLifecycle()
     val supportsImages by viewModel.supportsImages.collectAsStateWithLifecycle()
     val supportsAudio by viewModel.supportsAudio.collectAsStateWithLifecycle()
     val pendingAttachment by viewModel.pendingAttachment.collectAsStateWithLifecycle()
     val recording by viewModel.recordingState.collectAsStateWithLifecycle()
     val speaking by viewModel.speaking.collectAsStateWithLifecycle()
     val readingAloud by viewModel.readingAloud.collectAsStateWithLifecycle()
-    val droppedFromContext by viewModel.droppedFromContext.collectAsStateWithLifecycle()
     val chips by viewModel.chips.collectAsStateWithLifecycle()
     val askForNotifications by viewModel.askForNotifications.collectAsStateWithLifecycle()
     val offerExactAlarms by viewModel.offerExactAlarms.collectAsStateWithLifecycle()
     val busyElsewhere by viewModel.busyElsewhere.collectAsStateWithLifecycle()
     val lifecycle = LocalLifecycleOwner.current.lifecycle
-    // Back in view (from the panel, Settings, another app): what it shows is made ready again.
+    // Back in view (from the panel, Settings, another app): whether Luna's server can be reached.
     LaunchedEffect(lifecycle) {
         lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) { viewModel.onScreenShown() }
     }
@@ -421,17 +416,9 @@ fun ChatScreen(
                     .padding(padding)
                     .imePadding(),
             ) {
-                // On a blank chat the starter panel says it in its hint line instead, so the tiles stay put.
-                val blankChat = messages.isEmpty() && streamingText == null
-                // A message waiting on the model says so in its own line ("Loading the model ·
-                // about 6 s left"); the pill above it said "Getting ready…" too.
-                val waitSaysIt = streamingText != null && (engineState is LlmService.State.Loading || engineState == LlmService.State.Idle)
-                if ((!blankChat && !waitSaysIt) || engineState is LlmService.State.Failed || engineState == LlmService.State.NoModel) {
-                    EngineBanner(engineState, onRetry = viewModel::retryLoad)
-                }
-                val tidying by viewModel.tidying.collectAsStateWithLifecycle()
                 val memoryPaused by viewModel.memoryPaused.collectAsStateWithLifecycle()
-                if (tidying) QuietBanner("Tidying up…")
+                val serverReady by viewModel.serverReady.collectAsStateWithLifecycle()
+                if (!serverReady) QuietBanner(viewModel.serverNotice())
                 if (memoryPaused) QuietBanner("Memory is paused: nothing new is remembered")
                 if (busyElsewhere) QuietBanner("Finishing an answer from the assistant…")
                 setupNote()
@@ -447,13 +434,9 @@ fun ChatScreen(
                     )
                 }
 
-                // While the model loads, a message can still be sent: it waits for the engine.
-                // Not while the overlay's reply is running, though: one turn at a time.
-                val canSend = !busyElsewhere && (
-                    engineState is LlmService.State.Ready ||
-                        engineState is LlmService.State.Loading ||
-                        engineState is LlmService.State.Idle
-                    )
+                // Not while the overlay's reply is running: one turn at a time. Offline, alarms,
+                // timers, sums and the phone's switches still work, so sending is never shut.
+                val canSend = !busyElsewhere
 
                 Box(Modifier.weight(1f).fillMaxWidth()) {
                     if (messages.isEmpty() && streamingText == null) {
@@ -465,10 +448,7 @@ fun ChatScreen(
                             health = canReadHealth,
                             enabled = canSend && !isGenerating,
                             onPick = sendWithTick,
-                            status = when (engineState) {
-                                is LlmService.State.Loading, LlmService.State.Idle -> "Getting ready…"
-                                else -> null
-                            },
+                            status = null,
                             modifier = Modifier.fillMaxSize(),
                         )
                     } else {
@@ -477,9 +457,6 @@ fun ChatScreen(
                             modifier = Modifier.fillMaxSize().fadingEdges(top = 20.dp, bottom = 12.dp),
                             contentPadding = PaddingValues(vertical = 12.dp),
                         ) {
-                            if (droppedFromContext > 0) {
-                                item(key = TRIMMED_NOTICE_KEY) { TrimmedNotice(droppedFromContext) }
-                            }
                             // While a reply streams, the chips its tool calls made belong under it,
                             // not under the question.
                             val asking = messages.lastOrNull()?.takeIf { streamingText != null && it.role == Role.USER }
@@ -515,14 +492,10 @@ fun ChatScreen(
                             streamingText?.let { partial ->
                                 item(key = STREAMING_ITEM_KEY) {
                                     if (partial.isEmpty()) {
-                                        // A message sent while the model is still starting waits
-                                        // for it: say so, so the wait doesn't look like a hang. Then
-                                        // what is being done: "Checking your memories…", a tool.
-                                        ThinkingIndicator(label = streamingStep, loading = engineState as? LlmService.State.Loading)
+                                        // Luna's server is thinking, or a phone tool is running.
+                                        ThinkingIndicator()
                                     } else {
                                         AssistantMessage(partial, streaming = true)
-                                        // A tool partway through the reply.
-                                        streamingStep?.let { ThinkingIndicator(label = it) }
                                     }
                                     asking?.let {
                                         MemoryChips(
@@ -545,8 +518,6 @@ fun ChatScreen(
                     }
                 }
 
-                ContextMeter(contextUsage)
-
                 if (speaking && recording == null) SpeakingBar(onStop = viewModel::stopSpeaking)
 
                 Composer(
@@ -557,7 +528,7 @@ fun ChatScreen(
                     pendingAttachment = pendingAttachment,
                     recording = recording,
                     onSend = sendWithTick,
-                    onTyping = viewModel::onTyping,
+                    onTyping = {},
                     onStop = viewModel::stop,
                     onPickImage = {
                         imagePicker.launch(
@@ -630,7 +601,7 @@ private fun ChatTopBar(
 private fun PhoneKillsNotice(kills: Int, onOpen: () -> Unit, onDismiss: () -> Unit) {
     GlassCard(Modifier.padding(horizontal = 16.dp, vertical = 4.dp), padding = 14.dp) {
         Text(
-            "Your phone closed Local Assistant $kills times since yesterday, so answers often wait about 15 seconds while the model loads again. " +
+            "Your phone closed Luna $kills times since yesterday, so answers often wait about 15 seconds while the model loads again. " +
                 "Letting it run in the background (App info, then Battery) may stop this.",
             style = MaterialTheme.typography.bodyMedium,
             color = AppColors.TextPrimary,
@@ -647,55 +618,8 @@ private fun QuietBanner(text: String) {
     GlassNotice(text)
 }
 
-@Composable
-private fun EngineBanner(state: LlmService.State, onRetry: () -> Unit) {
-    val failed = state is LlmService.State.Failed
-    val message = when (state) {
-        is LlmService.State.Loading, LlmService.State.Idle -> "Getting ready…"
-        is LlmService.State.Failed -> "${state.message} Tap to try again."
-        LlmService.State.NoModel -> "No model installed."
-        else -> null
-    } ?: return
 
-    GlassNotice(message, color = if (failed) AppColors.Danger else AppColors.TextSecondary, onClick = if (failed) onRetry else null)
-}
 
-/**
- * Shows how much of the context window this chat has used. Quiet until the window is nearly
- * gone, at which point it says what to do about it.
- */
-@Composable
-private fun ContextMeter(usage: LlmService.ContextUsage?) {
-    if (usage == null) return
-    Text(
-        text = if (usage.isNearlyFull) {
-            "Context almost full (${usage.used} / ${usage.max} tokens) — start a new chat"
-        } else {
-            "${usage.used} / ${usage.max} tokens"
-        },
-        style = MaterialTheme.typography.bodyMedium,
-        color = if (usage.isNearlyFull) AppColors.Danger else AppColors.TextSecondary,
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 16.dp, vertical = 4.dp),
-    )
-}
-
-/**
- * Dropping old turns is silent by design, which is the one thing wrong with it — so say so
- * rather than letting the model appear to forget for no reason.
- */
-@Composable
-private fun TrimmedNotice(droppedCount: Int) {
-    Text(
-        text = "$droppedCount earlier message${if (droppedCount == 1) "" else "s"} " +
-            "no longer fit the context window",
-        style = MaterialTheme.typography.bodyMedium,
-        color = AppColors.TextSecondary,
-        textAlign = TextAlign.Center,
-        modifier = Modifier.fillMaxWidth().padding(horizontal = 32.dp, vertical = 10.dp),
-    )
-}
 
 
 /** What the round button at the end of the composer does right now. */

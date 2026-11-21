@@ -19,15 +19,22 @@ import java.io.File
 import java.util.Locale
 
 /**
- * The assistant's voice: the natural voice ([NaturalVoice]) when it is downloaded and chosen,
- * otherwise the phone's own text-to-speech engine with one of its on-device voices (see
- * [VoiceChoice]). Both run without a network. The phone's voice also says whatever the natural
- * one can't, so a voice that fails to load still answers.
+ * The assistant's voice: Murf's ([MurfVoice]), the voice of Luna's calls, while it's chosen and
+ * Luna's server can be reached; otherwise the natural voice ([NaturalVoice]) when it is downloaded
+ * and chosen, or the phone's own text-to-speech engine with one of its on-device voices (see
+ * [VoiceChoice]). Those two run without a network. The phone's voice also says whatever the others
+ * can't, so a voice that fails still answers.
  *
  * The phone's engine is bound the first time something is said, not at app start, and text said
  * before it is ready waits for it. Everything here runs on the main thread.
  */
-class Speaker(context: Context, private val settings: SettingsStore, installed: (VoicePack) -> File? = { null }) {
+class Speaker(
+    context: Context,
+    private val settings: SettingsStore,
+    installed: (VoicePack) -> File? = { null },
+    /** Murf, through Luna's server; null where there's none (tests). */
+    murf: ((fallback: (String) -> Unit, onSpeakingChanged: () -> Unit) -> MurfVoice)? = null,
+) {
 
     private val appContext = context.applicationContext
     private val main = Handler(Looper.getMainLooper())
@@ -58,6 +65,8 @@ class Speaker(context: Context, private val settings: SettingsStore, installed: 
         onSpeakingChanged = ::updateSpeaking,
     )
 
+    private val murf: MurfVoice? = murf?.invoke(::speakOffline, ::updateSpeaking)
+
     /** Something is being said, or waiting to be. */
     val speaking: StateFlow<Boolean> = _speaking.asStateFlow()
 
@@ -86,8 +95,18 @@ class Speaker(context: Context, private val settings: SettingsStore, installed: 
     /** Says [text] after anything still being said. */
     fun speak(text: String) {
         if (text.isBlank()) return
+        val murf = murf
+        if (murf != null && (murf.isSpeaking || murf.usable())) murf.speak(text) else speakOffline(text)
+    }
+
+    /** Says [text] with the voices on the phone, never Murf: for what Murf just failed to say. */
+    fun speakOffline(text: String) {
+        if (text.isBlank()) return
         if (useNatural()) natural.speak(text) else speakWithPhone(text)
     }
+
+    /** Murf speaks now ([MurfVoice.usable]). */
+    fun murfInUse(): Boolean = murf?.usable() == true
 
     /** About to speak (the overlay opened): loads the natural voice now rather than on the first sentence. */
     fun prepare() {
@@ -110,6 +129,7 @@ class Speaker(context: Context, private val settings: SettingsStore, installed: 
 
     /** Stops at once, and drops anything waiting. */
     fun stop() {
+        murf?.stop()
         natural.stop()
         queued.clear()
         pending.clear()
@@ -208,7 +228,7 @@ class Speaker(context: Context, private val settings: SettingsStore, installed: 
     }
 
     private fun updateSpeaking() {
-        _speaking.value = queued.isNotEmpty() || pending.isNotEmpty() || natural.isSpeaking
+        _speaking.value = queued.isNotEmpty() || pending.isNotEmpty() || natural.isSpeaking || murf?.isSpeaking == true
     }
 
     private companion object {

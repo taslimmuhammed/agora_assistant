@@ -52,7 +52,6 @@ class ReminderReceiver : BroadcastReceiver() {
             // brings it back; a repeating one waits for Done, which moves it to its next time.
             if (task.repeatRule == null) {
                 container.memoryRepository.updateTask(TaskOps.complete(task, ZonedDateTime.now()))
-                container.conversations.prefixMayHaveChanged()
             }
         }
     }
@@ -115,8 +114,6 @@ class ReminderActionReceiver : BroadcastReceiver() {
             } else {
                 container.reminderScheduler.cancel(taskId)
             }
-            // The agenda in the conversation's prefix is now out of date.
-            container.conversations.prefixMayHaveChanged()
         }
     }
 
@@ -247,8 +244,6 @@ class PlaceReminderReceiver : BroadcastReceiver() {
                 ReminderNotifications.showPlace(context, over, task.place.spots.getOrNull(spot))
                 rang = true
             }
-            // The agenda in the conversation's prefix is now out of date.
-            if (rang) container.conversations.prefixMayHaveChanged()
         }
     }
 
@@ -259,7 +254,6 @@ class PlaceReminderReceiver : BroadcastReceiver() {
         val reopened = PlaceAlerts.nextTime(task, System.currentTimeMillis()) ?: return
         container.memoryRepository.updateTask(reopened)
         container.reminderScheduler.schedulePlace(taskId, reopened.place!!)
-        container.conversations.prefixMayHaveChanged()
         Log.i(TAG, "Reminder $taskId open again, for the next time near ${LogText.of(reopened.place.name)}")
     }
 

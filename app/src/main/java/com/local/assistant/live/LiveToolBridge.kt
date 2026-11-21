@@ -115,16 +115,9 @@ class LiveToolBridge(
             "type" to TOOL_RESULT,
             "call_id" to callId,
             "result" to result,
-            "chip" to chip?.let { linkedMapOf("title" to it.label, "detail" to detailOf(it)) },
+            "chip" to chip?.let { linkedMapOf("title" to it.label, "detail" to chipDetail(it, zone())) },
         ),
     )
-
-    /** The chip's words as the call screen shows them, its time written out: the server keeps them for its prompt. */
-    private fun detailOf(chip: MemoryChip): String = listOfNotNull(
-        chip.detail.takeIf { it.isNotBlank() },
-        chip.at?.let { at -> (if (chip.allDay) DAY else DAY_TIME).format(Instant.ofEpochMilli(at).atZone(zone())) },
-        chip.place?.let { "near $it" },
-    ).joinToString(" · ")
 
     /**
      * Keeps the socket's messages going through [handle], each in its own coroutine on [scope]:
@@ -163,5 +156,12 @@ class LiveToolBridge(
         private val mapType = object : TypeToken<Map<String, Any?>>() {}.type
         private val DAY = DateTimeFormatter.ofPattern("EEE d MMM", Locale.ENGLISH)
         private val DAY_TIME = DateTimeFormatter.ofPattern("EEE d MMM, h:mm a", Locale.ENGLISH)
+
+        /** The chip's words as the call screen shows them, its time written out: the server keeps them for its prompt. */
+        fun chipDetail(chip: MemoryChip, zone: ZoneId): String = listOfNotNull(
+            chip.detail.takeIf { it.isNotBlank() },
+            chip.at?.let { at -> (if (chip.allDay) DAY else DAY_TIME).format(Instant.ofEpochMilli(at).atZone(zone)) },
+            chip.place?.let { "near $it" },
+        ).joinToString(" · ")
     }
 }

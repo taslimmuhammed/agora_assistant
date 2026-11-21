@@ -8,8 +8,8 @@ package com.local.assistant.memory.tools
  * until it was restarted. The instructions at the start of the model's memory still read: one
  * reply came round to "no info has been provided in the prompt other than instructions". What
  * came after about token 4,100 did not. The photo model closed on the GPU beside an open
- * conversation did it ([com.local.assistant.gallery.GalleryEmbedder.leaveGpu]); this stays to
- * catch any other cause as it streams.
+ * conversation on the phone's old chat model did it; this stays to catch any other cause as it
+ * streams.
  *
  * Judged by the first ten words of the reply (twenty if two of those are odd), from words no one
  * writes: a capital inside a long word, letters run into digits, two scripts in one word, symbols

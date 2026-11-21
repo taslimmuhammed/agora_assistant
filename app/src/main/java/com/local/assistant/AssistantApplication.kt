@@ -14,8 +14,6 @@ import com.local.assistant.gallery.GalleryIndex
 import com.local.assistant.gallery.GalleryModel
 import com.local.assistant.gallery.PhotoLibrary
 import com.local.assistant.gallery.PhotoThumbnails
-import com.local.assistant.gallery.PhotoReader
-import com.local.assistant.gallery.PhotoRecall
 import com.local.assistant.gallery.PhotoTools
 import com.local.assistant.gallery.faces.FaceFinder
 import com.local.assistant.gallery.faces.FaceIndex
@@ -23,10 +21,6 @@ import com.local.assistant.gallery.places.PlaceList
 import com.local.assistant.data.db.AppDatabase
 import com.local.assistant.data.prefs.SettingsStore
 import com.local.assistant.data.repo.ChatRepository
-import com.local.assistant.llm.LiteRtLmBackend
-import com.local.assistant.llm.LlmBackend
-import com.local.assistant.llm.LlmService
-import com.local.assistant.llm.ToolCallRepair
 import com.local.assistant.assist.AssistantRole
 import com.local.assistant.assist.KeepReadyService
 import com.local.assistant.chat.ChatSender
@@ -42,7 +36,6 @@ import com.local.assistant.device.AndroidContacts
 import com.local.assistant.device.AndroidPhone
 import com.local.assistant.device.PermissionBroker
 import com.local.assistant.memory.MemoryControls
-import com.local.assistant.memory.notes.ImageDescriber
 import com.local.assistant.memory.notes.SavedImages
 import com.local.assistant.memory.notes.UserNotes
 import com.local.assistant.memory.db.ArchiveRepository
@@ -63,27 +56,24 @@ import com.local.assistant.memory.retrieval.SqliteVec
 import com.local.assistant.memory.retrieval.SqliteVecIndex
 import com.local.assistant.memory.retrieval.VectorIndex
 import com.local.assistant.memory.tools.ArchiveSearch
-import com.local.assistant.memory.prompt.ConversationManager
-import com.local.assistant.memory.prompt.MeasuredTokenEstimator
-import com.local.assistant.memory.prompt.MemoryBudget
 import com.local.assistant.memory.prompt.NoteTitle
+import com.local.assistant.memory.prompt.HeuristicTokenEstimator
+import com.local.assistant.memory.prompt.MemoryContext
+import com.local.assistant.memory.tools.ToolCatalog
+import com.local.assistant.live.ServerChat
+import com.local.assistant.ui.chat.ServerState
+import com.local.assistant.voice.MurfVoice
 import com.local.assistant.memory.prompt.TurnRunner
 import com.local.assistant.memory.tools.ChatToolLog
 import com.local.assistant.memory.tools.DeviceTools
-import com.local.assistant.memory.tools.ToolCatalog
 import com.local.assistant.memory.tools.ToolExecutor
-import com.local.assistant.memory.tools.ToolLoop
 import com.local.assistant.memory.tools.WebTools
-import com.local.assistant.memory.extract.ExtractionRouter
-import com.local.assistant.memory.extract.Extractor
 import com.local.assistant.memory.summary.SessionSummaries
-import com.local.assistant.memory.summary.Summarizer
 import com.local.assistant.memory.work.AppForeground
 import com.local.assistant.memory.work.BackgroundJobs
 import com.local.assistant.memory.work.Consolidation
 import com.local.assistant.memory.work.EmbeddingQueue
 import com.local.assistant.memory.work.ModelScheduler
-import com.local.assistant.model.ModelCatalog
 import com.local.assistant.model.ModelManager
 import com.local.assistant.model.formatBytes
 import kotlinx.coroutines.flow.map
@@ -98,14 +88,10 @@ import com.local.assistant.location.SavedPlaces
 import com.local.assistant.device.PhoneLocation
 import com.local.assistant.ui.setup.MemorySearchControls
 import com.local.assistant.web.TavilySearch
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.flow.first
-import com.local.assistant.memory.work.PrecisionUpgrade
 import com.local.assistant.privacy.LogText
 import java.io.File
 import java.time.ZonedDateTime
@@ -125,50 +111,37 @@ class AppContainer(context: Context) {
     val settings = SettingsStore(context)
 
     init {
-        // Where each turn's time went, and the model work around it (files/turn-timings.csv).
+        // Where each turn's time went (files/turn-timings.csv).
         com.local.assistant.memory.prompt.TurnTimings.directory = context.filesDir
     }
 
     private val appContext: Context = context.applicationContext
 
-    /**
-     * The model stays loaded with the app away only while the system runs the app as the phone's
-     * assistant: that is the only way the power button reaches it, and the system's hold on
-     * [com.local.assistant.assist.AssistantInteractionService] keeps the app up. It costs no work,
-     * and saves the ~10 s load whenever the user is back before the phone closes the app.
-     * Otherwise a model left loaded would only make the app the first one Android kills.
-     *
-     * Nothing is loaded or prepared in the background for it, though: that was ~16 s of GPU work
-     * after each screen-off, and OxygenOS closed 4 of the 5 processes that did it before they
-     * answered anything (13 Nov 2026). A conversation is made ready when the user shows they're
-     * about to ask: the app opened on a blank chat, typing, the panel opening.
-     */
-    val keepsModel: Boolean get() = AssistantRole.serviceActive(appContext)
+    /** The system runs the app as the phone's assistant, which keeps it up for the power button. */
+    val isAssistant: Boolean get() = AssistantRole.serviceActive(appContext)
 
-    /** Coming to the foreground warms the engines, so they are usually ready by the first send. */
+    /** Coming to the foreground picks up what waited: family answers, photos, SMS, downloads. */
     val appForeground: AppForeground = AppForeground(
         onForeground = {
             com.local.assistant.memory.prompt.TurnTimings.event("app_back")
             backgroundJobs.onForeground()
+            familyAnswers.onForeground()
             speaker.setAway(false)
-            if (settings.modelPath != null) llmService.warmUp()
-            // A new chat on screen: its conversation made ready again if it went meanwhile.
-            conversations.cameIntoSight()
             embeddingQueue.kick()
             // Started while visible, as Android requires, if the wake word or a place reminder needs it.
             KeepReadyService.update(appContext)
             resumeDownloads()
             // Fences dropped while location was off, or waiting for location all the time.
             appScope.launch { runCatching { PlaceReminderReceiver.watchAll(this@AppContainer) }.onFailure { Log.w("AppContainer", "Watching place reminders failed", it) } }
-            // Photos taken meanwhile, or the first index carrying on, once the warm-up is done.
+            // Photos taken meanwhile, or the first index carrying on, after a moment.
             indexPhotosIfReady(afterMs = FOREGROUND_INDEX_DELAY_MS)
             // SMS that came meanwhile, and the inbox from before once SMS access is allowed.
             smsSync.syncSoon(delayMs = FOREGROUND_INDEX_DELAY_MS)
         },
         onBackground = {
-            // In the model's events: a bad reply on 14 Nov 2026 came after the app had been away.
             com.local.assistant.memory.prompt.TurnTimings.event("app_away")
             backgroundJobs.onBackground()
+            familyAnswers.onBackground()
             sensitiveLock.lock()
             // Out of sight, the photos wait for the charger at night, unless a big first index
             // is carrying on with its notice up.
@@ -190,8 +163,8 @@ class AppContainer(context: Context) {
 
     private val database = AppDatabase.build(context, withVectors = sqliteVecVersion != null)
 
-    /** Learns this model's real Latin rate from the runtime's counts; shared by every estimate. */
-    val tokenEstimator = MeasuredTokenEstimator(settings.tokenRates) { settings.modelPath }
+    /** How long a text is, for what of the memory a call or chat message is given. */
+    val tokenEstimator = HeuristicTokenEstimator
 
     val memoryRepository = MemoryRepository(database)
 
@@ -206,8 +179,6 @@ class AppContainer(context: Context) {
     /** Downloads started and not yet here, picked up again after the app was killed. */
     private val wantedDownloads = com.local.assistant.model.WantedDownloads(context)
 
-    val modelManager = ModelManager(context, ModelCatalog.FILE, settings::modelPath, appScope, wanted = wantedDownloads)
-
     /** Photo search's model, EmbeddingGemma 2; its text side is memory search's too. */
     val galleryModelManager = ModelManager(context, GalleryModel.FILE, settings::galleryModelPath, appScope, wanted = wantedDownloads)
 
@@ -215,7 +186,7 @@ class AppContainer(context: Context) {
     val photoModel: GalleryEmbedder = GalleryEmbedder(
         modelFile = { galleryModelManager.installed.value?.file },
         cacheDir = context.cacheDir,
-        gpuAllowed = { !llmService.holdsGpu },
+        gpuAllowed = { true },
     )
 
     /** An embedding model the user imported from storage, used by memory search instead of the photo model. */
@@ -278,12 +249,6 @@ class AppContainer(context: Context) {
         logScores = (context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0,
     )
 
-    val llmService: LlmService = LlmService(context, settings, appScope, beforeLoad = { photoModel.leaveGpu() })
-
-    val llmBackend: LlmBackend = LiteRtLmBackend(llmService, settings)
-
-    private val summarizer = Summarizer(llmBackend, tokenEstimator)
-
     val modelScheduler = ModelScheduler()
 
     val photoLibrary = PhotoLibrary(context)
@@ -336,9 +301,7 @@ class AppContainer(context: Context) {
     /**
      * Indexes the photos, and with Find people their faces, without waiting for the Photos
      * screen: as soon as the photo model is here and photos may be read, while the app is in
-     * front. [afterMs] lets the chat model's warm-up go first on coming to the front. Phones of
-     * 8 GB or less do it only while the chat model isn't loaded (first setup, while it downloads);
-     * otherwise on the charger at night and while Photos is open, as before.
+     * front. [afterMs] lets coming to the front settle first.
      */
     fun indexPhotosIfReady(afterMs: Long = 0) {
         if (!photoSearchReady()) return
@@ -346,10 +309,7 @@ class AppContainer(context: Context) {
             autoIndex?.cancel()
             autoIndex = appScope.launch {
                 kotlinx.coroutines.delay(afterMs)
-                // A load under way finishes first (a minute at most), so the first reply isn't slowed.
-                kotlinx.coroutines.withTimeoutOrNull(60_000L) { llmService.state.first { it !is LlmService.State.Loading } }
                 if (!appForeground.isForeground) return@launch
-                if (isSmallDevice && llmService.state.value is LlmService.State.Ready) return@launch
                 galleryIndex.start()
                 // A big backlog (a new install, Find people just turned on) carries on after the
                 // app is closed, with a notice; started now, while the app is in front, as
@@ -370,7 +330,7 @@ class AppContainer(context: Context) {
         appScope.launch { galleryIndex.refreshDocuments() }
     }
 
-    /** find_photos is declared to the model only once its model is here and the photos may be read. */
+    /** find_photos is offered only once its model is here and the photos may be read. */
     fun photoSearchReady(): Boolean =
         galleryModelManager.installed.value != null && photoLibrary.access() != PhotoLibrary.Access.NONE
 
@@ -383,13 +343,13 @@ class AppContainer(context: Context) {
     /** "Report this reply": to the developer's Google Form (see ReplyReporter). */
     val replyReporter = com.local.assistant.chat.ReplyReporter()
 
-    /** "0.3.0 (5), gemma-4-E4B-it.litertlm": what a report says it came from. */
+    /** "0.3.0 (5), Luna's server": what a report says it came from. */
     val appVersion: String = runCatching {
         val info = context.packageManager.getPackageInfo(context.packageName, 0)
-        "${info.versionName} (${androidx.core.content.pm.PackageInfoCompat.getLongVersionCode(info)}), ${com.local.assistant.model.ModelCatalog.FILE_NAME}"
-    }.getOrDefault(com.local.assistant.model.ModelCatalog.FILE_NAME)
+        "${info.versionName} (${androidx.core.content.pm.PackageInfoCompat.getLongVersionCode(info)}), Luna's server"
+    }.getOrDefault("Luna's server")
 
-    /** Tavily, with the user's own key; off (and undeclared to the model) until there is one. */
+    /** Tavily, with the user's own key; off (and not offered) until there is one. */
     val webSearch = TavilySearch(key = { secrets.get(SecretStore.TAVILY_KEY) })
 
     /** Health Connect, read only: steps, heart rate, sleep and workouts the phone's health apps keep. */
@@ -407,25 +367,12 @@ class AppContainer(context: Context) {
         stepGoal = { settings.stepGoal },
     )
 
-    val conversations = ConversationManager(
-        backend = llmBackend,
+    /** What a call or chat message is told of the user: profile, summary, agenda, notes (live/LiveContext). */
+    val memoryContext = MemoryContext(
         chats = chatRepository,
         memory = memoryRepository,
-        settings = settings,
-        scheduler = modelScheduler,
-        scope = appScope,
         estimator = tokenEstimator,
-        tools = { ToolCatalog.declarations(web = webSearch.enabled, photos = photoSearchReady(), health = healthTools.available(), files = fileSearchReady(), inbox = inboxReady()) },
-        webSearch = { webSearch.enabled },
-        photoSearch = ::photoSearchReady,
-        healthData = healthTools::available,
-        fileSearch = ::fileSearchReady,
-        inbox = ::inboxReady,
-        retriever = retriever,
-        photos = PhotoRecall(galleryIndex, photoLibrary, ready = ::photoSearchReady, cacheDir = context.cacheDir),
-        summarizer = summarizer,
         noteIndex = { userNotes.all().map { NoteTitle(it.id, it.title, it.kind == NoteKind.LIST) } },
-        inSight = { appForeground.isForeground },
     )
 
     val embeddingQueue: EmbeddingQueue = EmbeddingQueue(
@@ -438,13 +385,9 @@ class AppContainer(context: Context) {
         userNotes = database.userNoteDao(),
     )
 
-    /**
-     * A note changed on the Notes screen: its new parts need vectors, and a new name or a new note
-     * changes the prefix, rebuilt once the chat is idle.
-     */
+    /** A note changed on the Notes screen: its new parts need vectors. */
     fun notesChanged() {
         embeddingQueue.kick()
-        conversations.prefixMayHaveChanged()
     }
 
     /** Geofences for place reminders: Play Services' where there are, else Android's own. */
@@ -480,79 +423,11 @@ class AppContainer(context: Context) {
         people = memoryRepository,
         alarms = clockAlarms,
         now = ZonedDateTime::now,
+        family = { to, text -> sendThroughLuna(to, text) },
     )
-
-    private val imageDescriber = ImageDescriber(llmBackend, modelScheduler, conversations)
-
-    /** Puts right, once, what the model wrote before its text decoder ran in fp32. */
-    internal val precisionUpgrade = PrecisionUpgrade(
-        database = database,
-        archive = archive,
-        images = savedImages,
-        // At idle, like the other background model work: the user's messages come first.
-        reread = { path -> modelScheduler.runBackground(ModelScheduler.Priority.COMPACTION) { imageDescriber.read(path) } },
-        onChanged = {
-            conversations.prefixMayHaveChanged()
-            embeddingQueue.kick()
-        },
-    )
-
-    init {
-        appScope.launch {
-            llmService.state.first { it is LlmService.State.Ready }
-            if (llmService.exactDigits) {
-                try {
-                    precisionUpgrade.run()
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    // Nothing is marked done, so the next start tries again.
-                    Log.w("AppContainer", "Putting right the fp16 era failed", e)
-                }
-            }
-        }
-    }
-
-    /** The latest [rereadSavedImage], for evals to wait on. */
-    @Volatile
-    internal var imageReread: Job? = null
-
-    /**
-     * For a model whose text decoder is still fp16 ([com.local.assistant.llm.ModelPrecision]
-     * couldn't set it): a "remember this" in a chat saves what the model wrote in its tool call,
-     * past token 2,048, where fp16 positions garble digits — a PIN 4417 was saved as "44417",
-     * 1800-209-4455 as "18000-2094555". So once the turn is over, the image is read again in a
-     * conversation of its own, short enough to copy every digit (as the Images tab's "+" does),
-     * and that replaces the details. It waits behind the turn and goes ahead of the next message,
-     * which then finds the live conversation closed and rebuilds it.
-     */
-    private fun rereadSavedImage(noteId: Long, said: String) {
-        // With the text decoder in fp32 the model's own details are exact: nothing to redo.
-        if (llmService.exactDigits) return
-        imageReread = appScope.launch {
-            try {
-                // The model's slot first: it frees once the turn is over, and by then the note —
-                // saved inside the tool's transaction, still open as this is called — is written.
-                val description = modelScheduler.runUser {
-                    database.noteDao().byId(noteId)?.imagePath?.let { imageDescriber.read(it, said) }
-                } ?: return@launch
-                if (savedImages.rewriteDetails(noteId, description.details) != null) embeddingQueue.kick()
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                Log.w("AppContainer", "Could not read saved image $noteId again", e)
-            }
-        }
-    }
-
-    /** A photo question answered from the found photo in a short conversation of its own. */
-    private val photoReader = PhotoReader(llmBackend, conversations)
 
     /** Files on the phone by name: read_file, declared once All files access is given. */
     val fileFinder = com.local.assistant.files.FileFinder(context)
-
-    /** A document's question or summary, answered in short conversations of its own. */
-    val documentReader = com.local.assistant.files.DocumentReader(llmBackend, conversations)
 
     fun fileSearchReady(): Boolean = com.local.assistant.files.FileAccess.granted(appContext)
 
@@ -560,7 +435,6 @@ class AppContainer(context: Context) {
         find = { asked, type, period -> fileFinder.find(asked, type, period) },
         folders = { asked -> fileFinder.folders(asked) },
         read = { found -> kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { com.local.assistant.files.DocumentFiles.read(context, found) } },
-        reader = documentReader,
         now = ZonedDateTime::now,
         ready = ::fileSearchReady,
         attached = { chatId ->
@@ -620,7 +494,6 @@ class AppContainer(context: Context) {
         },
         memoryPaused = { settings.memoryPaused },
         images = savedImages,
-        onImageSaved = ::rereadSavedImage,
         device = deviceTools,
         web = WebTools(webSearch),
         photos = PhotoTools(
@@ -636,7 +509,6 @@ class AppContainer(context: Context) {
                 }
             },
             mayRead = { context.getSystemService(android.app.KeyguardManager::class.java)?.isKeyguardLocked != true },
-            reader = { path, question -> if ((llmService.capabilities.value?.visionTokensPerImage ?: 0) > 0) photoReader.answer(path, question) else null },
             documents = { field -> fileTools.idNumber(field) },
         ),
         health = healthTools,
@@ -645,21 +517,6 @@ class AppContainer(context: Context) {
         files = fileTools,
         inbox = com.local.assistant.inbox.InboxTools(inbox, now = ZonedDateTime::now, ready = ::inboxReady),
     )
-
-    private val toolLoop = ToolLoop(
-        executor = toolExecutor,
-        maxRounds = MemoryBudget.SIXTEEN_K.maxToolRounds,
-        isOverflow = llmBackend::isContextOverflow,
-        isUnreadable = llmBackend::isUnreadableToolCall,
-        repair = ToolCallRepair(ToolCatalog.declarations(web = true, photos = true, health = true, files = true, inbox = true))::repair,
-        onNumberFixed = { wrote, source -> Log.i("ReplyGrounding", "Reply wrote ${LogText.of(wrote)}; the source has ${LogText.of(source)}") },
-        groundNumbers = { !llmService.exactDigits },
-        seesImages = { (llmService.capabilities.value?.visionTokensPerImage ?: 0) > 0 },
-        onUnbackedClaim = { said -> Log.i("ActionClaims", "Held back, no tool ran: ${LogText.of(said.take(200))}") },
-        photosAvailable = ::photoSearchReady,
-    )
-
-    val turnRunner = TurnRunner(conversations, modelScheduler, toolLoop, onExchangeStored = ::exchangeStored)
 
     /** An exchange is stored, reply and all, typed or said in a live call: archived for recall. */
     private suspend fun exchangeStored(userMessageId: Long) {
@@ -677,32 +534,30 @@ class AppContainer(context: Context) {
         appKey = { secrets.get(SecretStore.LIVE_APP_KEY) ?: BuildConfig.LIVE_APP_KEY },
     )
 
-    /** The phone's tools as a call is given them: those set up now, as a chat's are. */
+    /** The phone's tools as a call or chat message is given them: those set up now. */
     private fun liveDeclarations() =
         ToolCatalog.declarations(web = webSearch.enabled, photos = photoSearchReady(), health = healthTools.available(), files = fileSearchReady(), inbox = inboxReady())
 
     private fun liveRules() =
         ToolCatalog.rules(web = webSearch.enabled, photos = photoSearchReady(), health = healthTools.available(), files = fileSearchReady(), inbox = inboxReady())
 
+    /** What the phone shares with Luna's server for one call or chat message. */
+    private val liveContexts = com.local.assistant.live.LiveContextBuilder(
+        memory = memoryContext::liveContext,
+        declarations = ::liveDeclarations,
+        rules = ::liveRules,
+        notes = userNotes::all,
+        health = healthTools::briefing,
+        userName = { memoryControls.profile()["name"]?.trim()?.takeIf { it.isNotEmpty() } },
+        murfVoice = { settings.murfVoice },
+    )
+
     /** Live calls with Luna, and the one in progress. */
     val liveCalls = com.local.assistant.live.LiveCalls(
         context = appContext,
         api = liveApi,
-        contexts = com.local.assistant.live.LiveContextBuilder(
-            memory = conversations::liveContext,
-            declarations = ::liveDeclarations,
-            rules = ::liveRules,
-            notes = userNotes::all,
-            health = healthTools::briefing,
-            userName = { memoryControls.profile()["name"]?.trim()?.takeIf { it.isNotEmpty() } },
-            murfVoice = { settings.murfVoice },
-        ),
-        execute = { call, toolContext ->
-            toolExecutor.execute(call, toolContext).also { outcome ->
-                // A reminder or event set in a call is in the agenda the next chat starts with.
-                if (outcome.changedPrefix) conversations.prefixMayHaveChanged()
-            }
-        },
+        contexts = liveContexts,
+        execute = toolExecutor::execute,
         chats = chatRepository,
         onExchangeStored = ::exchangeStored,
         appScope = appScope,
@@ -710,22 +565,59 @@ class AppContainer(context: Context) {
         userId = { settings.liveUserId },
     )
 
+    /** The chat's replies, from Luna's server: the brain of her calls, with the phone's tools. */
+    val serverChat = ServerChat(
+        serverUrl = { settings.liveServerUrl ?: BuildConfig.LIVE_SERVER_URL },
+        appKey = { secrets.get(SecretStore.LIVE_APP_KEY) ?: BuildConfig.LIVE_APP_KEY },
+        contexts = liveContexts,
+        execute = toolExecutor::execute,
+        history = chatRepository::messagesFor,
+        userId = { settings.liveUserId },
+    )
+
+    /** One typed or spoken message: the phone's own commands here, the rest by [serverChat]. */
+    val turnRunner = TurnRunner(
+        tools = toolExecutor,
+        server = serverChat,
+        serverAvailable = liveCalls::available,
+        serverConfigured = liveCalls::visible,
+        onExchangeStored = ::exchangeStored,
+    )
+
     /** Luna's check-in calls at the doses' times, while live voice is on. */
     val checkIns = com.local.assistant.live.CheckIns(appContext, settings, liveApi, enabled = liveCalls::visible)
 
+    /** What the family answers on WhatsApp, told to her outside a call too. */
+    val familyAnswers = com.local.assistant.live.FamilyAnswers(
+        context = appContext,
+        settings = settings,
+        api = liveApi,
+        chats = chatRepository,
+        speak = { speaker.speakOffline(it) },
+        enabled = liveCalls::visible,
+        inCall = { liveCalls.current.value?.isOver == false },
+        inSight = { appForeground.isForeground },
+        scope = appScope,
+    )
+
+    /**
+     * A chat's message to someone in the family hub, sent from Luna's WhatsApp as a call sends it,
+     * so the answer comes back; null (WhatsApp opens on the phone instead) when they aren't in it,
+     * or live voice is off or offline.
+     */
+    private suspend fun sendThroughLuna(to: String, text: String): String? {
+        if (!liveCalls.available()) return null
+        return try {
+            liveApi.messageFamily(to, text).sentTo?.also { familyAnswers.expect() }
+        } catch (e: com.local.assistant.live.LiveError) {
+            Log.i("AppContainer", "Not sent from Luna's WhatsApp, so WhatsApp opens instead: ${e.message}")
+            null
+        }
+    }
+
     val attachmentStore = AttachmentStore(context)
 
-    val sessionSummaries = SessionSummaries(database.sessionDao(), summarizer, llmBackend, conversations, modelScheduler)
-
-    private val extractor = Extractor(
-        maintenance = database.maintenanceDao(),
-        state = database.appStateDao(),
-        backend = llmBackend,
-        router = ExtractionRouter(memoryRepository, reminderScheduler),
-        conversations = conversations,
-        scheduler = modelScheduler,
-        estimator = tokenEstimator,
-    )
+    val sessionSummaries = SessionSummaries(database.sessionDao())
 
     /** What the memory screen can see and change. */
     val memoryControls = MemoryControls(
@@ -734,7 +626,7 @@ class AppContainer(context: Context) {
         archive = archive,
         chats = chatRepository,
         reminders = reminderScheduler,
-        onChanged = { conversations.prefixMayHaveChanged() },
+        onChanged = {},
         images = savedImages,
         townAt = { placeList.get().nearest(it.lat, it.lon)?.town },
     )
@@ -742,7 +634,6 @@ class AppContainer(context: Context) {
     val consolidation = Consolidation(
         embeddings = embeddingQueue,
         sessions = sessionSummaries,
-        extractor = extractor,
         memory = memoryRepository,
         database = database,
         retentionDays = { settings.historyRetentionDays },
@@ -752,10 +643,7 @@ class AppContainer(context: Context) {
             }
         },
         releaseModel = {
-            if (!appForeground.isForeground && !keepsModel) {
-                llmService.unload()
-                embedder.unload()
-            }
+            if (!appForeground.isForeground) embedder.unload()
         },
         pruneSavedImages = savedImages::prune,
         finishPastReminders = { memoryControls.finishPastReminders() },
@@ -766,39 +654,27 @@ class AppContainer(context: Context) {
     )
 
     /**
-     * The Images tab's "+": the picked image goes through the model like "remember this" in a
-     * chat, and is kept with the title and details it wrote. Null when the model is unavailable.
+     * The Images tab's "+": Luna's server looks at the picked image, as "remember this" in a chat
+     * does, and it is kept with the title and details written. Null when the server can't.
      */
     suspend fun addSavedImage(uri: Uri): NoteEntity? {
         val picked = attachmentStore.importImage(uri)
         try {
-            val description = imageDescriber.describe(picked.absolutePath) ?: return null
-            return savedImages.saveUpload(description.title, description.details, picked.absolutePath)
+            val described = try {
+                serverChat.describe(picked.absolutePath)
+            } catch (e: com.local.assistant.live.LiveError) {
+                Log.w("AppContainer", "The image wasn't described: ${e.message}")
+                return null
+            }
+            return savedImages.saveUpload(described.title, described.details, picked.absolutePath)
                 .also { embeddingQueue.kick() }
         } finally {
             attachmentStore.delete(picked.absolutePath)
         }
     }
 
-    /**
-     * The chat model was just installed (the first download, or an import): load it and read the
-     * first chat's prompt now, while the setup screen says so, instead of on the first message,
-     * which would otherwise wait ~15 s (a 9 s load, then 6 s reading the prompt; AssistLatencyEvalTest).
-     * Later launches load in the background, as before. Gives up after [FIRST_CHAT_READY_MS]
-     * rather than keep the user on the setup screen; the chat then carries on loading.
-     */
-    suspend fun prepareFirstChat() {
-        // The wake word listens from the first model on: the service only starts in the
-        // foreground, which the app was in, with no model yet, when this launch began.
-        KeepReadyService.update(appContext)
-        withTimeoutOrNull(FIRST_CHAT_READY_MS) {
-            // Loads the engine, or tries again if an earlier attempt failed; false if it can't.
-            if (llmBackend.ensureReady()) conversations.prepareFresh().join()
-        }
-    }
-
-    /** "Forget everything", including the nightly pass's place in the history. */
-    suspend fun forgetEverything() = memoryControls.forgetEverything(skipExtractionTo = extractor::skipToEnd)
+    /** "Forget everything". */
+    suspend fun forgetEverything() = memoryControls.forgetEverything()
 
     val audioRecorder = AudioRecorder(appScope)
 
@@ -806,69 +682,51 @@ class AppContainer(context: Context) {
     val transcriber = com.local.assistant.voice.Transcriber(context, appScope)
 
     /** Sends messages and streams replies for the chat and the assistant overlay alike. */
-    val chatSender = ChatSender(chatRepository, llmService, turnRunner, appScope)
+    val chatSender = ChatSender(chatRepository, turnRunner, appScope)
 
-    /** The natural voices' downloads (Settings › Voice). Once one arrives, the assistant speaks with it. */
+    /** The natural voices' downloads (Settings › Voice), for speaking offline. Once one arrives, it's the offline voice. */
     val voicePacks: List<VoicePackInstaller> = VoicePack.ALL.map { pack ->
         VoicePackInstaller(context, pack, appScope, onInstalled = { settings.naturalVoice = NaturalVoices.firstOf(pack).id }, wanted = wantedDownloads)
     }
 
     fun voicePack(pack: VoicePack): VoicePackInstaller = voicePacks.first { it.pack == pack }
 
-    /** The assistant's voice: the chosen natural voice when it's here, else the phone's text-to-speech. */
-    val speaker = Speaker(context, settings, installed = { pack -> voicePack(pack).installed.value })
+    /**
+     * The assistant's voice: Murf's, through Luna's server, while it can be reached; offline the
+     * chosen natural voice when it's here, else the phone's text-to-speech.
+     */
+    val speaker = Speaker(
+        context,
+        settings,
+        installed = { pack -> voicePack(pack).installed.value },
+        murf = { fallback, onSpeakingChanged ->
+            MurfVoice(
+                speech = liveApi::speech,
+                chosen = { settings.murfReplies && liveCalls.available() },
+                cacheDir = context.cacheDir,
+                scope = appScope,
+                fallback = fallback,
+                onSpeakingChanged = onSpeakingChanged,
+            )
+        },
+    )
 
     val audioFocus = AudioFocus(context)
 
     /** The chat screen's own hold on other audio, so it and the overlay never release each other's. */
     val chatAudioFocus = AudioFocus(context)
 
-    /** "While you were away": notifications kept for the brief, sorted by the chat model. */
+    /** "While you were away": notifications kept for the brief. */
     val awayBrief = com.local.assistant.away.AwayBrief(
         context = context,
         settings = settings,
         dao = com.local.assistant.away.AwayDatabase.build(context).dao(),
         replies = com.local.assistant.away.ReplyActions(),
-        scheduler = modelScheduler,
-        model = conversations,
-        backend = llmBackend,
-        modelLoaded = { llmService.state.value is LlmService.State.Ready },
         scope = appScope,
     )
 
-    /**
-     * Memory search comes with the first chat model: once one is installed (downloaded or
-     * imported) where there was none, the photo model, whose text side memory search uses,
-     * downloads right after it, so nobody has to go back for it. Not when it is already here or
-     * on its way, not when the user has loaded their own embedder, and not for a chat model that
-     * was installed before.
-     */
-    private fun fetchPhotoModelAfterFirstModel() {
-        appScope.launch {
-            var hadModel = modelManager.installed.value != null
-            modelManager.installed.collect { model ->
-                val arrived = model != null && !hadModel
-                hadModel = model != null
-                val none = galleryModelManager.installed.value == null && galleryModelManager.transfer.value == null &&
-                    embedderManager.installed.value == null
-                if (arrived && none) {
-                    Log.i("AppContainer", "Chat model installed; fetching ${GalleryModel.DISPLAY_NAME}")
-                    galleryModelManager.download()
-                }
-                if (arrived) fetchVoiceAfterPhotoModel()
-            }
-        }
-    }
-
     private var resuming: kotlinx.coroutines.Job? = null
 
-    /**
-     * Picks up the downloads that were started and not finished: the phone killed the app (it
-     * does, swiped from the recent apps), the connection dropped, or the last step (the photo
-     * model's check, the voice's unpack, minutes without traffic) was frozen. One at a time, in
-     * the order the first setup fetches them. As the app comes to the front, and as Android runs
-     * the download job again (see BackgroundDownloads). True when there's one to pick up.
-     */
     /**
      * Pause: in setup, on the download's notification, or Stop in Task Manager. Every download
      * stops where it is, still wanted, with what has arrived kept, and nothing is picked up by
@@ -878,7 +736,7 @@ class AppContainer(context: Context) {
     fun pauseDownloads() {
         wantedDownloads.pause(true)
         resuming?.cancel()
-        listOf(modelManager, galleryModelManager, embedderManager).forEach { it.pause() }
+        listOf(galleryModelManager, embedderManager).forEach { it.pause() }
         voicePacks.forEach { it.pause() }
         Log.i("AppContainer", "Downloads paused")
     }
@@ -888,12 +746,18 @@ class AppContainer(context: Context) {
 
     /** A download started and not finished, which [resumeDownloads] would pick up. */
     fun downloadsPending(): Boolean =
-        listOf(modelManager, galleryModelManager).any { it.shouldResume() } || voicePacks.any { it.shouldResume() }
+        galleryModelManager.shouldResume() || voicePacks.any { it.shouldResume() }
 
+    /**
+     * Picks up the downloads that were started and not finished: the phone killed the app (it
+     * does, swiped from the recent apps), the connection dropped, or the last step (the photo
+     * model's check, the voice's unpack, minutes without traffic) was frozen. One at a time. As
+     * the app comes to the front, and as Android runs the download job again (see
+     * BackgroundDownloads). True when there's one to pick up.
+     */
     fun resumeDownloads(): Boolean {
         val voices = voicePacks.filter { it.shouldResume() || it.isBusy }
-        // The photo model first: a tenth the size, and photos can be indexed while the chat model downloads.
-        val models = listOf(galleryModelManager, modelManager).filter { it.shouldResume() || it.isBusy }
+        val models = listOf(galleryModelManager).filter { it.shouldResume() || it.isBusy }
         if (voices.isEmpty() && models.isEmpty()) return false
         if (resuming?.isActive == true) return true
         resuming = appScope.launch {
@@ -907,24 +771,6 @@ class AppContainer(context: Context) {
             }
         }
         return true
-    }
-
-    /**
-     * Kokoro, the natural voice, comes with the first chat model too (the user, 10 Nov 2026),
-     * once the photo model is done, so the two don't split the connection. It becomes the voice
-     * answers are read in (see [voicePacks]); the phone's own voices stay in Settings › Voice.
-     */
-    private fun fetchVoiceAfterPhotoModel() {
-        val kokoro = voicePack(VoicePack.KOKORO)
-        if (kokoro.installed.value != null || kokoro.isBusy) return
-        // Wanted from now, so a killed app still fetches it, after the photo model.
-        kokoro.want()
-        appScope.launch {
-            galleryModelManager.awaitIdle()
-            resuming?.join()
-            Log.i("AppContainer", "Fetching the ${VoicePack.KOKORO.title} voice")
-            resumeDownloads()
-        }
     }
 
     /**
@@ -973,11 +819,10 @@ class AppContainer(context: Context) {
             )
         }
         val models = kotlinx.coroutines.flow.combine(
-            modelManager.transfer,
             galleryModelManager.transfer,
             embedderManager.transfer,
-        ) { chat, photo, imported ->
-            of(ModelCatalog.DISPLAY_NAME, chat) ?: of("the photo model", photo) ?: of("the memory search model", imported)
+        ) { photo, imported ->
+            of("the photo model", photo) ?: of("the memory search model", imported)
         }
         val voices = kotlinx.coroutines.flow.combine(voicePacks.map { installer -> installer.progress.map { installer.pack to it } }) { all ->
             all.firstNotNullOfOrNull { (pack, progress) ->
@@ -1010,9 +855,9 @@ class AppContainer(context: Context) {
         appScope.launch(kotlinx.coroutines.Dispatchers.IO) {
             val kills = com.local.assistant.assist.ProcessExits.systemKillsSince(appContext, System.currentTimeMillis() - 24 * 60 * 60_000L)
             com.local.assistant.memory.prompt.TurnTimings.event("process_start", detail = "$kills system kills in 24 h")
-            if (kills >= com.local.assistant.assist.ProcessExits.WORTH_A_NOTICE && !settings.toldAboutPhoneKills && keepsModel) phoneKills.value = kills
+            if (kills >= com.local.assistant.assist.ProcessExits.WORTH_A_NOTICE && !settings.toldAboutPhoneKills && isAssistant) phoneKills.value = kills
         }
-        fetchPhotoModelAfterFirstModel()
+        appScope.launch(kotlinx.coroutines.Dispatchers.IO) { deleteRetiredChatModel() }
         com.local.assistant.model.BackgroundDownloads.watch(appContext, appScope, downloads(), resume = ::resumeDownloads, pending = ::downloadsPending, pause = ::pauseDownloads)
         appScope.launch {
             dropOldEmbedder()
@@ -1040,17 +885,34 @@ class AppContainer(context: Context) {
         }
     }
 
-    private companion object {
-        /** The longest side of a found photo the model reads a question from. */
-        const val PHOTO_READ_PIXELS = 1024
+    /**
+     * Gemma 4 E4B, the on-phone chat model of earlier builds, and LiteRT-LM's caches of it: 3.66 GB
+     * or more, unused since replies come from Luna's server. Only ever inside the app's own files.
+     */
+    private fun deleteRetiredChatModel() {
+        val path = settings.takeRetiredChatModel() ?: return
+        val file = File(path)
+        if (!file.canonicalPath.startsWith(appContext.filesDir.canonicalPath + File.separator)) return
+        val freed = file.length()
+        if (file.delete()) Log.i("AppContainer", "Deleted the retired chat model, ${formatBytes(freed)}")
+        appContext.cacheDir.listFiles { cached -> cached.name.startsWith(file.name) }?.forEach { it.delete() }
+    }
 
-        /** The longest the setup screen waits for the first chat to be ready. */
-        const val FIRST_CHAT_READY_MS = 90_000L
+    /** Whether the chat's replies can come from Luna's server now. */
+    fun serverState(): ServerState = when {
+        liveCalls.available() -> ServerState.READY
+        liveCalls.visible() -> ServerState.OFFLINE
+        else -> ServerState.NONE
+    }
+
+    private companion object {
+        /** The longest side of a found photo kept for reading. */
+        const val PHOTO_READ_PIXELS = 1024
 
         /** At or below this, the photo model's memory goes back as soon as the Photos screen closes. */
         const val SMALL_DEVICE_BYTES = 8L * 1024 * 1024 * 1024
 
-        /** After coming to the front, how long photo indexing waits: the chat model warms up first. */
+        /** After coming to the front, how long photo indexing waits for the app to settle. */
         const val FOREGROUND_INDEX_DELAY_MS = 10_000L
 
         /** EmbeddingGemma 300M's key, from before the photo model did memory search too. */
@@ -1109,27 +971,17 @@ class AssistantApplication : Application() {
     }
 
     /**
-     * The engine holds gigabytes. While the app is in use it stays loaded; once the app is in
-     * the background and the system asks for memory back, it goes — the next visit to the
-     * foreground loads it again, and anything sent meanwhile waits for it. Unless the app is the
-     * phone's assistant ([AppContainer.keepsModel]): then it stays, since reloading costs ~9 s
-     * and re-reading the prompt ~6 s more before the power button's first answer.
+     * Out of sight with the system asking for memory back: the thumbnails, the voices and memory
+     * search's model go, and come back when next wanted.
      */
     override fun onTrimMemory(level: Int) {
         super.onTrimMemory(level)
         com.local.assistant.memory.prompt.TurnTimings.event("trim_memory", detail = "level $level")
         val background = level >= ComponentCallbacks2.TRIM_MEMORY_BACKGROUND
-        // Thumbnails are quick to read again; the model is not.
         if (background) container.photoThumbnails.clear()
-        // As the assistant, the model stays (and the system's hold on the assistant service
-        // keeps the app out of the cached list this is mostly about).
-        val keep = container.keepsModel
-        if (background && !keep && !container.appForeground.isForeground && !container.llmService.isGenerating) {
+        if (background && !container.appForeground.isForeground && !container.chatSender.isBusy) {
             container.speaker.release()
-            container.appScope.launch {
-                container.llmService.unload()
-                container.embedder.unload()
-            }
+            container.appScope.launch { container.embedder.unload() }
         }
     }
 }

@@ -27,8 +27,8 @@ phone ──RTC audio──▶ Agora ConvoAI ──/v1/chat/completions──▶
 
 1. **Agora.** At [console.agora.io](https://console.agora.io), create a project with an **App
    Certificate** (secured mode) and turn on **Conversational AI** for it. Copy the App ID and
-   App Certificate. Under **RESTful API**, add a key and download the Customer ID and Customer
-   Secret: the secret is shown only once.
+   App Certificate; that's all the server needs; it signs its calls to Agora with a token made
+   from them. (A Customer ID and Secret from Developer Toolkit → RESTful API also work, if set.)
 2. **Murf.** Get an API key at [murf.ai/api](https://murf.ai/api). Pick a voice that speaks both
    en-IN and hi-IN (Anusha, Priya, Aarav…) and check its exact id:
    ```bash
@@ -54,8 +54,13 @@ phone ──RTC audio──▶ Agora ConvoAI ──/v1/chat/completions──▶
 
 **About Baileys.** It isn't WhatsApp's own API: WhatsApp can restrict or ban a number it sees
 sending automated messages. Link a spare number rather than your own, send to people who already
-have a chat with it, and keep to the demo's handful of messages. Nobody in the seed may have the
-number Luna sends from: WhatsApp would file their messages under "Message yourself".
+have a chat with it, and keep to the demo's handful of messages.
+
+**Testing with one number.** Give Rahul (or anyone in the seed) the number you link. Luna's
+messages to him then arrive in **Message yourself** on that phone, and what you type or react
+there is his answer: `1`, `haan`, 👍. Nothing else you write from that phone counts. There's no
+notification for messages to yourself, and while this is set, notes to yourself in that chat
+reach her as his; for the demo itself, give him a phone of his own.
 
 ## Running it
 
@@ -106,9 +111,57 @@ numbered. Any of these answer them:
 - a 👍 (or 👎) on the message;
 - a reply quoting an older message, which answers that one rather than the latest.
 
-Anything longer is passed on to her as it is ("Rahul says: …") and settles nothing. So is a
-message a shop sends after confirming, which is kept with the order as its note. Only people in
-the seed are listened to; whatever anyone else writes to the number is left alone.
+With `LLM_API_KEY` set, Gemini reads everything else: a sentence in English, Hindi or Hinglish,
+a voice note, a photo, a sticker, or any other reaction (🥰, 🙏). It picks the choice the reply
+means, if any ("Sorry Amma, Pune mein hoon Sunday tak" is "Can't"), and says the rest for her in
+plain English. The choice and the words reach her as one update: "Rahul can't do it: bring milk.
+Rahul says: I'm in Pune till Sunday. Shall I ask someone else?" A location ("I'm at Apollo
+Pharmacy, MG Road"), a shared contact or a document is described in words too.
+
+Luna puts a ✅ on each note she'll pass on, and writes "✅ Luna will tell Lakshmi" only the first
+time in six hours, so a chatty family isn't answered with a wall of the same line. A reaction on
+one of her own messages is told to her in words ("Rahul sent love for your message: …").
+
+**When Gemini is busy.** The big Flash models often answer 503 or hang. Calls and replies try
+`LLM_MODEL` first; if it's busy, or silent for 8 seconds, `LLM_FALLBACK_MODEL` (default
+`gemini-3.5-flash-lite`) answers for the next two minutes. With no key, or both busy, a text is
+passed on as it is and settles nothing, and a voice note is "Rahul sent you a voice note." A
+message a shop sends after confirming is kept with the order as its note.
+
+## Family numbers from the phone
+
+In the app, Settings → Live voice → Family on WhatsApp lists the family. Tap **Pick** to choose
+someone's number in the phone's contacts (no contacts permission: the picker hands over only the
+one chosen), or **Add from contacts** for someone new: a neighbour, the chemist. Numbers are kept
+on the server, over the seed's. Each save says whether the number is on WhatsApp, and with "Luna
+says hello" on, Luna introduces herself to a new number so her first message isn't from a stranger.
+
+| Call | Does |
+|---|---|
+| `PUT /family/members/:id/phone` | `{"phone": "+91 …", "introduce": true}`; blank clears it |
+| `POST /family/members` | `{"name", "relation", "role": "family" \| "caregiver" \| "provider", "phone", "introduce"}` |
+| `DELETE /family/members/:id` | Removes someone added from the app; the seed's people stay |
+
+## Answers outside a call
+
+In a call, an answer is said as it comes. Outside one, the phone tells her. While Luna is closed,
+each answer is a notification: the background asks `GET /family/answers` every minute while
+someone may answer soon, otherwise every quarter of an hour. When she opens Luna (and every few
+seconds while it's open), what came since she last looked is one short message from Luna in the
+chat on screen, written by Gemini with times said from now ("Filu will bring your tablets this
+evening at 6"), and spoken in Murf's voice, the one her calls use; offline, by Kokoro or the
+phone's own voice. Her next call still opens with the latest answer.
+
+The phone's chat sends to the family through Luna too: "message Filu: can you call me tonight?"
+goes from Luna's WhatsApp at once, as in a call, when Filu is in the family. Anyone else, or an
+SMS asked for, opens WhatsApp or SMS on the phone ready to send, as before.
+
+| Call | Does |
+|---|---|
+| `GET /family/answers?after=<id>` | `{answers: [{id, kind, text, at, told}], last, waiting}`. With no `after`, the last few of the past 12 hours; `told`: she heard it in a call |
+| `POST /family/briefing` | `{after, up_to?, greet?, audio?}`: `{text, up_to, audio}`, what Luna says as she opens the app, in one message (Gemini), with Murf's MP3 of it (base64) unless `audio` is false |
+| `POST /family/speech` | `{text}`: `{audio}`, Murf's MP3 of it, in her calls' voice; null when Murf can't |
+| `POST /family/tool` | `{"name": "message_family", "args": {"to": "Filu", "text": "…"}}`: one of Luna's family tools without a call; a name not in the family is a 400 |
 
 ## For the demo
 

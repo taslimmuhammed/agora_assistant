@@ -1,33 +1,41 @@
-# Local Assistant: technical notes
+# Luna: technical notes
 
-How the app is put together and why: the runtime, the memory system, the tools, the power-button
-assistant, and the measurements on a real phone behind each choice. To install and use the app,
-see the [README](../README.md).
+How the app is put together and why: where replies come from, the memory system, the tools, the
+power-button assistant, live voice, and the measurements on a real phone behind each choice. To
+install and use the app, see the [README](../README.md).
+
+> **No chat model on the phone.** Until November 2026 the app ran Google's Gemma 4 E4B on the
+> device with LiteRT-LM. It no longer does: every reply, typed, spoken or in a call, is written by
+> Luna's server (`server/`, Gemini) and spoken with Murf ([Replies](#replies-lunas-server)).
+> Where a section below still mentions "the model" reading a prompt, a routing eval or a
+> measurement on the phone, it describes that time; the tools, memory, photos and files it
+> describes are the same ones the server now calls.
 
 ## What it does
 
-- Streams replies token-by-token from a local `.litertlm` model
+- Replies stream from Luna's server, the brain her Agora calls use ([Replies](#replies-lunas-server))
 - Multiple chats — create, switch, resume, delete; everything persists across restarts
-- Gets the model either by **downloading** it (resumable) or **importing** one already on the device
-- Falls back GPU + MTP → GPU → CPU if a backend fails to start
-- Stop button that interrupts generation and keeps the partial reply
+- Replies in Murf's voice when asked by voice, with the phone's own voice offline
+- Stop button that interrupts a reply and keeps what came
 - Opens from the power button as the phone's assistant, listens, and answers out loud (see
   [Power-button assistant](#power-button-assistant))
-- Optionally, a live voice call with Luna through Agora and a server, with the on-device model as
-  the offline fallback (see [Live voice (Agora)](#live-voice-agora))
+- A live voice call with Luna through Agora and the same server (see
+  [Live voice (Agora)](#live-voice-agora))
+- Offline, or with no server, the phone still does its own commands: alarms, timers, sums, the
+  flashlight, ringer, Do Not Disturb and volume (`InstantCommands`, `NumberGrounding`)
 
 ## Requirements
 
 | | |
 |---|---|
 | Android | 8.0 (API 26) or newer, `arm64-v8a` |
-| Free storage | ~4.2 GB, plus ~0.35 GB for the search model and ~0.4 GB for photo search |
-| RAM | 8 GB+ recommended (GPU backend peaks around 0.7–1 GB, CPU around 3.3 GB) |
+| Free storage | the app, plus ~0.4 GB for photo and memory search (optional) |
+| Luna's server | `server/`, reachable from the phone; its address and key in Settings or `local.properties` |
 | JDK (to build) | 17 |
 | NDK and CMake (to build) | NDK 28.2.13676358, CMake 3.22.1 (SDK Manager), for sqlite-vec |
 
-The LiteRT-LM AAR only ships `arm64-v8a` and `x86_64` native libraries, so `abiFilters` is set to
-match. There is no 32-bit build.
+The LiteRT-LM AAR, kept for EmbeddingGemma 2's embedding engine, only ships `arm64-v8a` and
+`x86_64` native libraries, so `abiFilters` is set to match. There is no 32-bit build.
 
 ## Build
 
@@ -35,109 +43,85 @@ match. There is no 32-bit build.
 ./gradlew :app:assembleDebug
 ```
 
-`local.properties` needs `sdk.dir` pointing at your Android SDK (already generated locally).
+`local.properties` needs `sdk.dir` pointing at your Android SDK (already generated locally), and
+`live.serverUrl` and `live.appKey` for a build that knows Luna's server.
 
-## Getting the model
+## Models on the phone
 
-On first launch the app shows the model screen. Two ways in:
+One, optional: **EmbeddingGemma 2** (text and vision, 388 MB), photo search and memory search in
+one file. It downloads by itself once photos are allowed, from litert-community on Hugging Face:
+nothing to host, no account. Settings → Photo and memory search shows it, and loads an embedder
+from storage instead if wanted. Settings → About shows the licences.
 
-**Download** — pulls `gemma-4-E4B-it.litertlm` (3.66 GB) from the LiteRT community repo on
-Hugging Face. The file is public, so no token is needed. Downloads resume from wherever they
-stopped, which matters at this size.
-
-> **Use the unsuffixed file.** The same repo also has `-gpu.litertlm` and `-web.litertlm`. Despite
-> the name, `-gpu` is the **WebGPU** build — it is the same size as `-web` (2.97 GB) and matches the
-> "Web" row of the model card. On Android it loads without error and then emits raw vocab tokens
-> (`<unused30>`, `[multimodal]`, `<mask>`) instead of text. The backend is chosen at runtime in
-> `EngineConfig`, not by the filename; one file serves both CPU and GPU.
-
-**Load from device storage** — pick a `.litertlm` file you already have. LiteRT-LM needs a real
-filesystem path, and a `content://` URI from the picker is not one, so the file is **copied** into
-the app's private storage. Budget room for both copies while the copy runs.
-
-Sideloading is usually faster than downloading on the phone:
-
-```bash
-adb push gemma-4-E4B-it.litertlm /sdcard/Download/
-```
-
-Then pick it from the file picker.
-
-**The memory-search model is the photo model.** EmbeddingGemma 2 (388 MB) downloads by itself
-right after the first chat model, from litert-community on Hugging Face: nothing to host, no
-account. Settings → About shows the models' licences in the app.
+An earlier build's Gemma 4 E4B file (3.66 GB) and LiteRT-LM's caches of it are deleted on the
+first start after updating (`AppContainer.deleteRetiredChatModel`, from the path
+`SettingsStore.takeRetiredChatModel` reads once and forgets).
 
 ## Architecture
 
 ```
 AssistantApplication
 └── AppContainer                  manual DI; one instance per process
-    ├── SettingsStore             model path, backend prefs, system prompt
+    ├── SettingsStore             server, voice and memory settings
     ├── AppDatabase (Room)        chats, messages and memory, one file (assistant.db)
     │   ├── ChatRepository        every message written with its session and token estimate
     │   ├── MemoryRepository      facts, tombstones, agenda
     │   └── ArchiveRepository     every exchange as a chunk: keyword index, vectors, backlog
-    ├── ModelManager (×3)         download / import the chat model, the photo model, an imported embedder
-    ├── LlmService                owns the LiteRT-LM Engine
-    ├── LiteRtLmBackend           LlmBackend: conversations, streaming, one-shot completions
+    ├── ModelManager (×2)         download / import the photo model, an imported embedder
     ├── MemoryEmbedder            memory search's model: the photo model's text side (GalleryEmbedder,
     │                             LiteRT-LM EmbeddingEngine, text on the CPU), or an imported one (LiteRtEmbedder)
-    ├── ModelScheduler            one model job at a time; the user always first
+    ├── ModelScheduler            one embedding job at a time; the user always first
     ├── EmbeddingQueue            embeds the archive's backlog while the user is idle
-    ├── Retriever                 per-turn recall: facts, then keyword + vector search, fused
-    ├── ConversationManager       the live conversation, when to rebuild it, rolling compaction
-    ├── TurnRunner                one user turn: prepare, send, stream, archive
-    ├── SessionSummaries          ends sessions and summarises them (session-end job)
-    ├── Consolidation             the nightly job: backlog, summaries, extraction, aliases, upkeep
+    ├── Retriever                 recall for the tools: facts, then keyword + vector search, fused
+    ├── MemoryContext             what the server is told of the user: profile, summary, agenda, notes
+    ├── LiveContextBuilder        that, with pinned lists, health and the phone's tool declarations
+    ├── ServerChat                one chat reply from Luna's server, its phone tools run here
+    ├── TurnRunner                one user message: the phone's own commands, else ServerChat
+    ├── Speaker + MurfVoice       replies aloud: Murf through the server, the phone's voice offline
+    ├── LiveCalls                 Agora calls with the same server
+    ├── Consolidation             the nightly job: embedding backlog, retention, upkeep
     └── MemoryControls            what the "What I know about you" screen can see and change
 ```
 
-### LlmService and the backend
+### Replies: Luna's server
 
-The piece worth understanding before extending anything.
+The chat, voice messages and the power-button panel all go through `ChatSender` →
+`TurnRunner`, and a call goes through Agora; every reply comes from the same server code
+(`server/src/llm.ts`, `runTurn`), with the family hub's tools on the server and the phone's
+tools run on the phone.
 
-- **One `Engine` per process.** Loading costs seconds and gigabytes, so it is shared across all
-  chats. It is kept alive while the app is in use, and released under memory pressure once the
-  app is in the background (`onTrimMemory`); coming back loads it again.
-- **Everything above the engine talks to `LlmBackend`**, not LiteRT-LM, so another runtime can be
-  added later. `LiteRtLmBackend` is the only implementation.
-- **One live `Conversation`, for the chat in use.** It holds the KV cache, so continuing the chat
-  only prefills the new turn. `ConversationManager` rebuilds it — system prefix plus the last few
-  turns through `ConversationConfig.initialMessages` — only at natural boundaries: switching
-  chats, after a restart, when a turn was interrupted, or when something outside the chat changed
-  what the prefix would say.
-- **Interrupted turns invalidate the cache.** If generation is stopped or fails, the native cache
-  no longer matches what was persisted, so it is dropped and rebuilt from the database next turn.
+- **On the phone first.** A sum is answered by `NumberGrounding`, and the plainest commands (an
+  alarm at a time, a timer, the flashlight, the ringer, Do Not Disturb, the volume) are carried
+  out at once by `InstantCommands` through `ToolExecutor`, online or not.
+- **Everything else** is one request: `ServerChat.reply` posts `POST /chat/turn` with the user's
+  id, the context a call gets (`LiveContext`, `purpose = "chat"`) and the chat's last 24
+  messages, and reads the answer as server-sent events: `session`, `text` as Gemini writes,
+  `tool_call` for a phone tool, `action` for what the server did itself, and `done`.
+- **The phone's tools** run on the main thread through the same `ToolExecutor` a call uses, with
+  its checks, deduplication, chip and Undo; each result goes back with
+  `POST /chat/tool_result {session_id, call_id, result, chip}`. The server's chat bridge waits 45 s
+  for one (a call's waits 8 s): a tool may wait on a permission dialog or a contact picked.
+- **Photos.** A photo sent with a message goes with the last user message as an image part. The
+  screen the panel was opened over goes only when the message is about it
+  (`QueryText.asksAboutScreen`), and never on the lock screen. A photo kept from the Images tab is
+  titled and read by `POST /chat/describe`.
+- **Voice messages** are written down on the phone (`Transcriber`) and sent as words, marked as
+  heard, so a sum's digits aren't taken from the recogniser's spelling.
+- **Spoken replies** go sentence by sentence to `MurfVoice`, which fetches each from
+  `POST /family/speech` (Murf Falcon, the calls' voice) while the one before plays. If Murf can't
+  answer, that sentence and the rest go to the phone's own voice and Murf rests for two minutes.
+  Settings → Voice → **Speak in Murf's voice** turns it off.
+- **Without the server**, or offline, the reply says what's needed and what the phone can still
+  do (`TurnRunner.NEEDS_SERVER`, `NEEDS_INTERNET`); the chat shows a quiet banner.
+- **Stopping** a reply closes the stream, which aborts the model on the server.
 
-Prompt templating, BOS tokens and turn markers are handled inside LiteRT-LM — the app passes plain
-strings and roles, never raw template text.
+### What the server is told
 
-### Prompt layout
-
-The system instruction is byte-stable for a conversation's life: instructions, the "always keep
-in mind" block rendered from core facts, a summary carried over from earlier, and an agenda
-snapshot dated to the day. Anything that changes per turn — the current time, facts recalled for
-this message — goes in front of the user's words in the user turn, as `[Now: …]` and
-`[Memory: …]` lines. Only the user's own words are stored.
-
-The instructions open with who the model is: "You are Luna, a helpful assistant running entirely
-on the user's device." Luna is the wake word's name (`WakeWord.NAME`). The user asked on
-2026-10-30: "since the model is now named as luna, it should be aware of it … also tell it to
-behave as an assistant if it's not present". The persona is a setting (`systemPrompt`) with that
-sentence as its default. If a persona never says "assistant", `Instructions.identity` puts "You
-are a helpful assistant running entirely on the user's device." before it, and if it never says
-"Luna", "Your name is Luna." after. In `RoutingEvalTest` on the phone at temperature 1.0, the
-change cost 2 tokens (instructions 901 → 903) and left routing where it was: 88 of 94 right
-before and after, with 78/79 tool requests either way. "I live in Bengaluru" now calls
-`save_fact`, and "what's my dentist's name?" now goes to `find_photos` (it has gone both ways
-before). "What's your name?" and "hey Luna, who are you?" get "I am Luna, a helpful assistant
-running entirely on your device."
-
-Every token limit lives in `memory/prompt/MemoryBudget.kt`, with a 16K profile and an 8K one,
-chosen from the window the engine runs with (8K unless changed in Settings). The prompt is planned to stay well under the window
-(12,000 of 16,384 at most) and shed in a fixed order when it would not: recalled snippets, then
-recalled facts, then the summary, then the oldest turns, then core facts by priority — never the
-user's response preferences.
+`MemoryContext` builds the memory part with `PromptAssembler.buildPrefix`: the "always keep in
+mind" block rendered from core facts, a summary carried over from earlier, an agenda snapshot
+dated to the day, and the names of the user's notes. Every token limit lives in
+`memory/prompt/MemoryBudget.kt`. The server writes its own instructions around it
+(`server/src/prompt.ts`, the chat's wording for `purpose = "chat"`).
 
 ### Recall and the archive
 
@@ -274,39 +258,13 @@ and to leave them unmentioned if they aren't about it (`PromptAssembler.renderPh
   itself takes 75–160 ms (0.6 s when the photo model loads); each photo sent adds roughly 3 s of
   reading for the model.
 
-### Summaries, compaction and the nightly job
+### The nightly job
 
-Background model work never shares the model with a chat: it asks `ConversationManager` to
-close the live conversation first (`withModelFree`), runs one short call at temperature 0.2 with
-thinking off, and the next turn rebuilds. Every such job goes through the `ModelScheduler` below
-the user's own turns and stops the moment they start typing.
-
-- **Rolling compaction.** After a reply, once the chat has been quiet for 30 seconds, a
-  conversation past `compactionTrigger` (4,000 tokens on the 8K profile) — or one rebuilt without
-  turns that no summary covers, like a long chat reopened after a restart — has its older turns
-  folded into the chat's "Earlier in this chat" summary (≤ 300 tokens), keeping the newest turns
-  that land the rebuilt prompt near `compactionTarget`. If a send would overflow before that
-  happened, it compacts first and the chat shows "Tidying up…".
-- **Session summaries.** Ten minutes after the app goes to the background, a WorkManager job
-  ends the sessions that went quiet and summarises them (topics, decisions, open loops, in the
-  user's language) if the engine is still loaded; otherwise they wait for the nightly job. The
-  newest summary opens later conversations as "Last time you talked". Summaries are context only:
-  nothing reads facts out of them.
-- **The nightly job** runs on the charger with the phone idle, eight minutes at a time with a
-  continuation for the rest, every step resuming where it stopped: embed the backlog, fill pending
-  summaries, extract, merge names, SQLite and FTS upkeep, and delete history past the retention
-  setting. It skips warm nights.
-- **Extraction** reads user messages after a watermark, a batch at a time, and asks for a
-  constrained JSON array of facts, tasks and events. Messages whose turn already made a tool call,
-  trivial ones, voice notes and paused ones are skipped. The examples in the prompt include what
-  must yield nothing (questions, hypotheticals, other people's opinions, moods, sarcasm), and every
-  item is checked in code (`ExtractionRouter`): it must point at a message in its batch; facts go
-  through the usual upsert rules with the message's own time, so tombstones and the user's edits
-  win; only reply preferences may be core; tasks and events need a time still ahead and are not
-  added twice.
-- **Names.** "amma", "mummy" and "mom" are filed under `mother` when written; the nightly job
-  merges any keys that normalise together, and anything that only looks alike ("priya" and
-  "priya_sharma") becomes a question on the memory screen rather than a merge.
+Summaries, rolling compaction and fact extraction were jobs for the on-phone model and went with
+it. On the charger with the phone idle, `Consolidation` deletes kept messages past their
+retention period, embeds the archive's backlog for memory search, and indexes new photos, to a
+deadline, keeping its place for the next run. Facts are saved when the server's model calls
+`save_fact` during a chat or a call.
 
 ### Your profile
 
@@ -467,14 +425,14 @@ messaging app opens ready, and the user presses the button.
 
 ### Tools and reminders
 
-The model can call up to sixteen tools — `add_task`, `update_task`, `add_event`, `save_fact`,
-`get_upcoming`, `search_memory`, `forget`, `set_alarm`, `remember_image`, and the everyday ones
-and web search below — declared in `memory/tools/ToolCatalog.kt` with short
-routing-style descriptions. Tool calling is manual (`automaticToolCalling = false`): the runtime
-reports a call, and `ToolLoop` hands it to `ToolExecutor`, which validates the arguments, ignores
-a repeat of the same call within two minutes, applies it and its TOOL-row record in one
-transaction, and answers the model with compact JSON (`{"ok":true,"id":42,"due":"Tue 22 Sep 11:00"}`
-or `{"ok":false,"error":"…"}` so it asks the user). At most three tool rounds per message.
+Luna's server can call the phone's tools — `add_task`, `update_task`, `add_event`, `save_fact`,
+`get_upcoming`, `search_memory`, `forget`, `set_alarm`, and the everyday ones and web search
+below — declared in `memory/tools/ToolCatalog.kt` with short routing-style descriptions and
+sent with each chat message and call (`LiveContext`). The server's model asks for a call over the
+chat's event stream or the call's WebSocket, and the phone hands it to `ToolExecutor`, which
+validates the arguments, ignores a repeat of the same call within two minutes, applies it and its
+TOOL-row record in one transaction, and answers with compact JSON
+(`{"ok":true,"id":42,"due":"Tue 22 Sep 11:00"}` or `{"ok":false,"error":"…"}` so it asks the user).
 
 The model never does date arithmetic. It copies the user's own words ("tomorrow at 11",
 "kal subah 11 baje") and `WhenResolver` turns them into a time, deterministically, in the
@@ -592,151 +550,6 @@ messages (`RoutingEvalTest -e tools basic`, 15 Nov), gave 99 and 101 of 105 (tem
 0.7) with the old text against 94 and 97 with the short one. All nine cases that differed went from
 right to wrong, four of them photo requests ("what's my dentist's name?" went to find_photos,
 "find photos of Amma at the beach" lost its query). The old text is back.
-
-### Saying it did what it didn't
-
-On 10 Oct 2026, by voice, the user asked for an email to Hitesh; "yes send it" got "I've sent the
-email to Hitesh" with no tool call at all, and later "I do not have access to email tools". On
-27 Oct the power-button panel did the same: "I've drafted the email for you. Would you like me to
-send it now?", then "Sent.", and no call, a minute after the same request typed in the app had
-opened the mail app. The panel has the same tools (its conversations are built the same way,
-pre-read ones included); what differs is that it is spoken to. Given the clip instead of the
-words, the model calls the tool less and says it did it more: the same email chat replayed
-typed calls `send_message`, spoken it got "The email has been sent." And after every
-`send_message` or `phone_call` in the user's chats the reply said "I've sent the message" or "I
-have called", though the app had only opened WhatsApp or the dialer. Four things keep replies to
-what happened:
-
-**Photos it says it found.** On follow-ups in a photo chat, the model answered with the last
-search's count instead of searching: "I found 3 photos of your B.Tech certificate.", then "I found
-5 photos of you watching the sunset.", with no `find_photos` call (1 Nov 2026), so no photos
-appeared under either reply. `ActionClaims.foundPhotos` ("I found … photos", "Here are your …
-photos") now counts as a claim when no photo went with the message, and is checked like the
-others: held back, the model asked again, and it searches. With a recalled photo sent along, the
-same words are true and pass.
-
-- **The opening is checked before it is shown** (`ToolLoop`, `ActionClaims`). Until a tool has
-  run in a turn, a reply's first sentence (or more, while that is under 30 characters, at most
-  200) is held back. If it says something was done (sent, called, booked, paid, an alarm or
-  reminder set, the flashlight turned on, a bare "Sent.") it is never shown: the model gets a
-  bracketed app note (`ToolLoop.UNBACKED_CLAIM`: nothing was done; call the tool now, or say
-  plainly you can't) and its answer is shown instead. If that answer says so too, the app shows
-  `ToolLoop.NOT_DONE` ("Sorry, I didn't actually do that: nothing was sent, set or saved.").
-  "I've drafted the email" counts only if no draft follows (no colon, no quotes, under 200
-  characters): such a reply is held until its text shows up. The live conversation then holds a
-  reply nobody saw, so it is rebuilt from the stored chat on the next turn. `ActionClaims` is English
-  and errs towards missing a claim: verbs that also describe writing or code ("I've updated the
-  code", "I've ordered the list by date") count only next to what a tool acts on. Over the 188
-  replies in the user's chats it found 19 claims, all real (17 after a tool, 2 with none), and
-  no false ones. Holding the opening delays the first words of a reply with no tool call by the
-  time it takes to write its first sentence.
-- **Token soup is taken back too** (`ToolLoop`, `GarbledText`). On 14 Nov 2026 one app process
-  replied with nothing but soup ("840tsetUauthorx205619i aponitimiCrap.M …") for 12 minutes, in
-  every chat, typed or spoken, until it was restarted. The instructions at the start of the
-  model's memory still read; what came after about token 4,100 did not.
-
-  **The cause** was the photo model's vision encoder on the GPU, where this branch had put it for
-  indexing speed. When it was closed and loaded again while a chat conversation was open, as the
-  app does when it leaves the screen and comes back, that conversation broke. In the app, a chat
-  opened before the app left the screen went bad once past ~4,096 tokens, 2 times in 2: soup, or
-  the model's reasoning written out ("[Thinking Process: 1. **Analyze the Request:** …
-  <channel|>The Eiffel Tower …"), thinking being off. Chats opened after it came back were fine.
-  `AudioPositionProbeTest -e photo reload` crashed the chat model in OpenCL (`clEnqueueMapBuffer`)
-  at the same point twice. With the photo model's vision on the CPU (`-e vision cpu`), 6 of 6
-  replies from 3,901 to 4,375 tokens were right. Loading the two models at once broke nothing,
-  6 of 6 (`-e photo concurrent`). Nor did closing them with no conversation open.
-
-  So the photo model's vision is now on the GPU only while the chat model isn't loaded, and it
-  leaves the GPU before the chat model loads (`GalleryEmbedder.leaveGpu`, `LlmService.holdsGpu`).
-  Indexing while the app is in use runs at the CPU's speed, as on main. Afterwards, in the app, a
-  chat carried over 2.7 minutes in the background gave right replies up to 4,415 tokens.
-
-  **The check stays, as a safety net.** Every round's reply streams provisionally until its
-  first ten words are known to be words, twenty if two of the ten are odd. A word is odd if it
-  has a capital inside a long word, letters run into digits, two scripts in one word, symbols
-  between letters, or 21 Latin letters in a row; more than three in ten makes it soup. A reply
-  that opens "Thinking Process:" or carries a `<channel|>` marker counts as soup too. On the
-  stored replies, all 8 soup ones were caught by their sixth to eighth word, and none of the 67
-  real ones or the 294 paragraphs of these docs.
-
-  Soup is taken back unspoken and the model stopped. The runtime ends the stopped reply as
-  "CANCELLED", which ends that reply, not the turn. The engine then loads again
-  (`ConversationManager.recoverFromGarble`, about 20 s with the re-read) and the turn is sent once
-  more; in a replay with made-up soup, the right answer came about 32 s after the question.
-  - Soup a second time says so plainly (`TurnRunner.GARBLED_AGAIN`).
-  - Soup after a tool acted isn't sent again, so nothing is done twice.
-  - Each catch is a `garbled` line in `model-events.csv`, with its round and token count.
-- **A rule in the instructions:** the model acts only through its tools, never says it did
-  something unless the tool succeeded just now, and says plainly when none can do what is asked
-  (Teams or Slack, bookings, payments, posts, reading the inbox).
-- **Calls and messages say they aren't done:** their descriptions say the dialer or app opens and
-  the user taps call or send, `send_message` names SMS, WhatsApp and email as its only apps, and
-  the results say "not called yet" and "not sent yet".
-
-`HonestyEvalTest` (`-e eval honesty`, add `-e voice honesty-voice` for the spoken version) sends
-24 requests through the app's own engine and the real prompt: things no tool can do, the Hitesh
-and panel chats replayed, and calls and messages followed by the app's result. The clips are
-made on the Mac with `say -v Rishi -o N-T.wav --file-format=WAVE --data-format=LEI16@16000` and
-pushed to `files/honesty-voice/`; run it with the app closed (it holds the model slot). On 27 Oct
-2026, before → after the rule and wording:
-
-| | spoken | typed |
-|---|---|---|
-| claimed with no call | 2/24 → 1/24 | 0/24 → 0/24 |
-| right tool, or no tool and no claim | 15/24 → 19/24 | 22/24 → 22/24 |
-| the same once the app's check has run | 16/24 → 20/24 | 22/24 → 22/24 |
-| still claiming after the check (now shown as `NOT_DONE`) | 1 → 0 | 0 → 0 |
-
-The panel's "yes go ahead" went from "I've sent the email" (twice, the check included) to a
-`send_message` call; spoken "book an Uber", "post this on Instagram" and "check my email" went
-from a wrong tool to "I can't". The one spoken claim left, the Hitesh "yes send it", is caught by
-the check. With the old result wording, replies after the app opened a message or the dialer said
-"sent" or "called" 12 times in 12 (seeds give the same output on the GPU, so 4 cases); with "not
-sent yet" in the result, 4 in 4 said it was open and ready. Still wrong: spoken, "Teams" and
-"Instagram" sometimes go to `send_message` (which refuses any app but SMS, WhatsApp and email),
-and "pay my electricity bill" to `find_photos`. A spoken email address is often misheard
-("taslimmuhammed67@gmail.com" came out as "thasaleem.musa@infosec.com"): the mail app opens with
-it, so check it before tapping send.
-
-Routing didn't move: `RoutingEvalTest` scored 88/94 before and after (positives 77/79,
-negatives 11/15; "find photos of Amma at the beach" now passes, "what's my dentist's name?" now
-goes to `find_photos`). The rule and wording cost 108 tokens of prefix: instructions 832 → 901,
-declarations 1,651 → 1,690.
-
-
-**Photo requests late in a chat** (1 Nov 2026). After a photo question, a photo search and a
-reply the app held back, "Could you show me the photos of me attending wedding" got "I found 0
-photos" with no search, and asked again "I don't have any photos", while a new chat found 3.
-
-- **A rebuilt conversation now holds its tool calls** (`ConversationManager.withToolCalls`,
-  `llm/ToolReplay`). History had been user and assistant turns only, so the model saw earlier
-  photo requests answered in plain words and answered the next one the same way. Now the calls
-  between the turns go back in as the model made them, each with its result cut short (240
-  characters a text, 6 items a list), the newest 8 at most. Not the photos the app shows by itself.
-  Replaying that chat (`PhotoRequestsEvalTest`, `-e eval photorequests`): the first request
-  searched 0 times in 3 before, 3 in 3 after.
-- **Asked to see photos, a reply with no search isn't shown** (`QueryText.asksForPhotos`, "show /
-  find / get … photos"; `ToolLoop`). In a conversation carried on from earlier turns, the turn is
-  tried again in one rebuilt from what is stored (`LoopEvent.Rebuild`); in one just built, the
-  model is asked once to search (`ToolLoop.PHOTO_CHECK`); still nothing, and it says it didn't
-  search (`NOT_SEARCHED`) rather than a count it made up. The follow-up "Could you show all the
-  photos of wedding" was answered from the previous search 3 times in 3, also after being asked to
-  search; rebuilt, it searched 6 times in 6. That costs the rebuild: 22 s for that reply against
-  8.5 s for the first.
-- **Asked to see photos, the message says to search** (`PromptAssembler.SEARCH_PHOTOS`): "[They
-  ask to see photos: call find_photos for this message; only that shows them, even if an earlier
-  search was like it.]", and no recalled photos go with it (find_photos shows them; each sent
-  would cost about 3 s of reading). With it, the follow-up searched at once in the conversation
-  carried on, 3 times in 3, in 2.6–3.4 s instead of 21–22 s through the rebuild (which had been:
-  1.4 s for the answer held back, 5.5 s rebuilding 2,827 tokens, 14 s for the turn again). The
-  rebuild stays for when the line isn't enough. Of the routing eval's 96 requests, the 13 the line
-  goes with all expect find_photos. `TurnTiming` in the log shows where a turn's time goes.
-- **Why the guard had let it through:** saying photos were found counts as a claim only with no
-  picture in front of the model, and the user's one saved image, a wedding invitation, was
-  recalled for "wedding" and sent with the message.
-- Six read-only tools in one chat rebuilt before every message (`-e eval replaymix`): no failures,
-  5 of 6 called their tool; "what did I tell you about my dentist?" searched photos instead of
-  memory, as "what's my dentist's name?" does in the routing eval without any replay.
 
 ### Web search
 
@@ -1261,7 +1074,7 @@ it. "Open in app" on the lock screen asks for the unlock first, from the tap: as
 panel was created, the unlock prompt never appeared on the test phone and the panel sat there.
 
 **Setting it up.** Settings → Calling the assistant → Power button opens the system page where the phone's
-*digital assistant app* is chosen; pick Local Assistant. Android doesn't let an app ask for this
+*digital assistant app* is chosen; pick Luna. Android doesn't let an app ask for this
 role itself. If holding the power button still brings up the power menu, switch it to the voice
 assistant in the phone's power button settings (on OnePlus phones, look under Additional
 settings). Without either, a long press on the app icon offers **Talk**, which opens the same
@@ -1681,8 +1494,8 @@ heard it) to tune against real voices.
 Off unless a server is set: with `live.serverUrl` (and `live.appKey`) in `local.properties`, or
 typed in Settings → Live voice (Agora), the power button, "Hey Luna" and the chat's **Call** button
 start a voice call with Luna instead of the panel, while the phone is online. Offline, with the
-switch off, or with no server, everything runs on the phone as before, and the Call button and
-the Settings demo buttons that need the server stay hidden or greyed out. The server lives in
+switch off, or with no server, the panel and chat answer only the phone's own commands, and the
+Call button and the Settings demo buttons that need the server stay hidden or greyed out. The server lives in
 `server/` (Node); this is the phone's side, in `live/` and `ui/live/`.
 
 - **The call.** Agora Conversational AI hears the user (ARES, `en-IN`), sends the words to the
@@ -1694,15 +1507,14 @@ the Settings demo buttons that need the server stay hidden or greyed out. The se
   `loadAudioSettings(AUDIO_SCENARIO_AI_CLIENT)`, RTM login, `subscribeMessage`, then the RTC join,
   then the tool bridge, then `POST /session/start`. The three libraries share
   `io.agora.infra:aosl`, so the APK has one `libaosl.so` and no `pickFirsts` are needed.
-- **What the call knows** (`LiveContext`, sent once in `/session/start`): the prompt prefix the
-  phone's own model would have (`ConversationManager.liveContext`: core facts, the last summary,
-  the agenda, the notes index), pinned lists in full, today's steps and last night's sleep when
+- **What the call knows** (`LiveContext`, sent once in `/session/start`): the memory prefix
+  (`MemoryContext`: core facts, the last summary, the agenda, the notes index), pinned lists in full, today's steps and last night's sleep when
   already allowed (`HealthTools.briefing`, which never asks), the phone's time with its offset,
   and the phone's tool declarations and rules from `ToolCatalog`, without `remember_image` and
   `take_screenshot`. On the lock screen it is only `ToolCatalog.LOCKED`'s tools and nothing about
   the user: no name, memory, lists or health.
 - **The phone's tools** (`LiveToolBridge`, WebSocket `bridge_url`): the server's model calls a
-  phone tool as `tool_call`; it runs through the same `ToolExecutor` as the on-device model's, with
+  phone tool as `tool_call`; it runs through the same `ToolExecutor` as a chat message's, with
   `heard = true` (the recogniser's words, as for a voice message), so it is checked,
   deduplicated, logged with Undo, and shown as the same chips; the result goes back as
   `tool_result` within the server's 8 s. A tool's facts and tasks point at the user's message, so
@@ -1727,126 +1539,31 @@ the Settings demo buttons that need the server stay hidden or greyed out. The se
 The tests (`app/src/test/.../live/`) cover the bridge against the real `ToolExecutor`, the context
 and the transcript log; the call itself needs Agora and the server, so it is checked on a phone.
 
-## Per-reply speed
-
-Each model reply carries a small footnote: `19.4 tok/s · 0.5s to first token`.
-
-The numbers come from the runtime's own `Conversation.getBenchmarkInfo()`, not from timing the
-stream from outside. That matters because multi-token prediction emits several tokens per
-callback, so counting stream emissions would undercount the decode rate. Enabling it costs only
-timing instrumentation (`ExperimentalFlags.enableBenchmark`).
-
-They are stored on the message (`tokensPerSecond`, `timeToFirstTokenMs`), so they survive a
-restart, and they are read before the conversation can be recycled — including after a stopped
-generation, which still reports what it managed.
-
-`DecodeSpeedProbeTest` (`-e speed true`) times a 268-token reply by clock, with MTP on and off,
-using only API that exists in both 0.17.1 and 0.18.1. On the OnePlus on 25 Oct 2026, warm from
-testing, LiteRT-LM 0.18.1 wrote 33 tok/s with MTP and 16 without; 0.17.1 under the same conditions
-wrote 21.6 and 8.8. The runtime's own count agreed with the clock on both. Long prompts full of
-digits (`digitPrecision`) decode at about 15 tok/s on 0.18.1: MTP's drafts are accepted less often
-there.
-
-## Tuning generation
-
-All four live in `SettingsStore` and are read on the next engine load / message:
-
-| Setting | Default | Notes |
-|---|---|---|
-| `contextTokens` | 8192 | The window the engine runs with; 4K, 8K, 12K or 16K from Settings, which restarts the model. |
-| `maxOutputTokens` | 2048 | Ceiling on one reply, also capped by the memory budget's reply reserve. |
-| `repetitionPenalty` | 1.1 | Damps degenerate loops. 1.0 disables. Keep it low — generated code and markup legitimately repeat. |
-| `repetitionWindow` | 256 | How many recent tokens the penalty looks at. |
-
-Leaving `maxNumTokens` unset in `EngineConfig` falls back to the runtime's own small default, which
-is why the app always sets it.
-
 ## Startup
 
-The model starts loading the moment the app does (`AssistantApplication`, and again from
-`ChatViewModel` for a model installed just now), and the chat opens straight away. It takes a few
-seconds when the model file is in the page cache (about 3 s on the test phone). While it loads, a
-blank chat says "Getting ready…" in its hint line, so the starter tiles stay where they are; a chat
-with messages says it in the banner at the top. A message sent before it is ready shows at once
-(`ChatSender.Live.asked`: the stored copy came back from the database over a second later while the
-model loaded) and waits for the model. The line under it says "Loading the model · about 6 s left",
-counted from the last load's time (`SettingsStore.lastEngineLoadMs`), and the banner steps aside.
-
-**What it's doing** is shown beside the dot while a reply is worked on, and under the reply when a
-tool runs partway through it (`memory/tools/ToolSteps`, `TurnEvent.Step`, `ChatSender.Live.step`,
-in the chat and the power-button panel): "Reading the instructions…" (a new chat's conversation
-being made) or "Reading the conversation…" (one rebuilt from its history), "Checking your
-memories…" (recall), "Thinking…", then the tool: "Searching your photos…", "Searching the web…",
-"Setting a reminder…" and so on. The moment the tools are done it says so while the model reads
-their results: "Reminder set · writing the reply…" (`ToolSteps.done`). After 3 s of waiting the
-seconds show too: "Reading the instructions · 8 s". The model doesn't think aloud here (thinking is off, and the model
-reports none), so these are the steps the app can see. What a tool did stays as its chip. On the
-phone, a follow-up "show me my beach photos" showed "Checking your memories…" at 0.7 s, "Thinking…"
-at 2.0 s, "Searching your photos…" at 2.5 s and the reply with its photo card at 3.1 s. If the model
-fails to start, the banner says so in red. Tapping it tries again.
-
-## Context window
-
-The engine runs with an 8K window unless the user picks 4K, 12K or 16K under Settings → Context
-window, which restarts the model. 4K is for phones short on memory: the instructions and tool
-declarations alone are about 2,000 tokens, so it keeps only the last exchange or two in view. Nothing is measured: the app used to find the largest window each
-phone could hold by filling it for real, which took minutes on first launch and — through its crash
-guard — could quietly shrink the window after a few app updates installed mid-load. What it
-measured is why the choices stop at 16K: the 15.5 GB test phone held 16384 and was killed filling
-24576 (the KV cache grows as the window fills, so a clean `initialize()` proves nothing).
-
-A larger window costs memory the embedder and a voice model share — measured on that phone, 16K
-takes about 200 MB more than 8K and prefills 10–25% slower — and the prompt budget
-(`MemoryBudget`) has a profile for each. If a larger window fails to load, the app falls back to 8K
-on the same backend and Settings says so. A native out-of-memory leaves no exception to catch, so
-the size being loaded is written down first (`initInFlightTokens`, with `commit`); if it is still
-there at the next launch and was above 8K, the setting goes back to 8K before loading.
-
-**Token estimates.** There is no tokenizer API, so prompts are planned from an estimate. Latin
-text starts at a pessimistic 3.5 characters per token; after each rebuild the runtime's own count
-is compared with what went in, and the Latin rate is learned from it (`MeasuredTokenEstimator`,
-bounded between 3.5 and 6, quick to tighten and slow to relax). Indic scripts keep a dense 1.8. If
-the runtime ever rejects a prompt as too long, the learned rate is discarded and the turn is
-replanned and retried once.
-
-### Overflow
-
-A rebuilt conversation carries only the newest whole turns that fit the budget (at most 12 on the
-16K profile); images are charged at the model's own `maxVisionTokenBudget()` and audio by its
-length (`llm/ContextWindow.kt`). If a live conversation would pass the prompt ceiling, it is
-rebuilt smaller before the turn is sent rather than letting the runtime reject the input. Dropping
-is silent by nature, so the chat shows a quiet "N earlier messages no longer fit the context
-window" marker.
-
-The line above the composer shows real context consumption from `Conversation.getTokenCount()` —
-not an estimate. If a chat misbehaves, look there first to tell a genuine context overflow apart
-from a sampling problem.
-
-### Degenerate repetition
-
-If output collapses into a repeating fragment (`G4wG4wG4w…`), that is usually **not** context
-exhaustion. It happens in high-entropy stretches where the model has no real signal — hallucinated
-URLs, hashes, base64, long random IDs — and the loop is self-reinforcing once started. Raise
-`repetitionPenalty` toward 1.2, and check the token meter to rule out context before assuming it.
+The chat opens straight away: there is no model to load. While a reply is worked on, the line
+beside the dot says what is being done (`memory/tools/ToolSteps`, `ChatSender.Live.step`, in the
+chat and the power-button panel): "Thinking…", then the tool as the server asks for it:
+"Searching your photos…", "Setting a reminder…" and so on, and "Reminder set · writing the
+reply…" once it's done (`ToolSteps.done`). After 3 s of waiting the seconds show too. What a tool
+did stays as its chip.
 
 ## Where to extend
 
 | Want to add | Start at |
 |---|---|
-| A different or second model | `model/ModelCatalog.kt` |
-| Sampling, thinking | `llm/LlmBackend.kt` (`Sampling`) + `LiteRtLmBackend.openChat` |
-| What goes into the prompt, and its limits | `memory/prompt/PromptAssembler.kt` + `MemoryBudget.kt` |
-| Summarising dropped turns instead of discarding | `memory/prompt/ConversationManager.kt` |
+| How Luna writes replies | `server/src/llm.ts` (`runTurn`), `server/src/prompt.ts`, `server/src/chat.ts` |
+| How the phone asks for a reply | `live/ServerChat.kt`, `memory/prompt/TurnRunner.kt` |
+| What the server is told of the user, and its limits | `memory/prompt/MemoryContext.kt`, `PromptAssembler.kt`, `MemoryBudget.kt`; `live/LiveContext.kt` |
+| How replies sound | `voice/MurfVoice.kt`, `voice/Speaker.kt`; `server/src/briefing.ts` (`murfSpeech`) |
 | A new tool | `memory/tools/ToolCatalog.kt` (declaration + routing rule) and `ToolExecutor` |
 | Time words the resolver misses | `memory/tools/WhenResolver.kt`, with a row in `WhenResolverTest` |
 | Photo search: model, cutoff, when it indexes | `gallery/GalleryModel.kt`, `gallery/PhotoRanking.kt`, `gallery/GalleryIndex.kt`; `GalleryEvalTest` on the phone |
 | Memory search's thresholds, or another embedding model | `memory/embed/PhotoModelEmbedder.kt` (thresholds), `EmbedderCatalog.kt` (imported ones); `TextEmbedderEvalTest`, then `EmbedderProbeTest` on the phone |
 | What counts as trivial, or a rare word | `memory/retrieval/QueryText.kt` |
-| What extraction looks for | `memory/extract/Extraction.kt` (prompt and examples), `ExtractionRouter` (what may be written) |
-| When compaction runs | `MemoryBudget` (`compactionTrigger`, `compactionTarget`, `rollingSummaryCap`) |
 | What the nightly job does | `memory/work/BackgroundJobs.kt` (`Consolidation`) |
 | Camera capture | `ui/chat/ChatScreen.kt` — only the photo picker is wired up; camera needs a FileProvider |
-| Longer voice notes | `media/MediaLimits.kt`, once you know the model's real audio ceiling |
+| Longer voice notes | `media/MediaLimits.kt` |
 | More Markdown (tables, images, nested quotes) | `ui/chat/Markdown.kt` — parser; `MarkdownText.kt` — renderer |
 | Download surviving process death | `ModelManager` runs on an app-scoped coroutine; promote to a foreground service |
 
@@ -1870,90 +1587,6 @@ Two deliberate choices worth knowing:
   `snake_case` intact, which matters when the model is writing code.
 - **Single newlines are preserved** rather than collapsed into spaces as strict Markdown would,
   because chat models use them to mean a line break.
-
-## Numbers past token 2,048 (GPU)
-
-**The cause.** On the GPU backend, once text sits past token position 2,048 of the conversation,
-the model stops copying digits reliably. Words come through, but digits are dropped, doubled or
-reordered: "11:45" became "1:45", "4361044" "43610104", "09/08/2001" "09/08/20001". The model
-file (Gemma 4 E4B `.litertlm`) asks LiteRT-LM to run its text decoder with **fp16 activations**
-(the `tf_lite_prefill_decode` section's `prefer_activation_type: "fp16"`). In fp16, whole numbers
-are exact only up to 2,048. Past that, neighbouring token positions round to the same value: two
-at a time up to 4,096, four at a time after. The rotary position encoding then can't tell those
-tokens apart. Gemma gives every digit a token of its own, so a run of digits is exactly what falls
-apart, while a word spread over one or two tokens mostly survives. The instructions and 16 tool
-declarations alone are about 2,000 tokens, so every chat was past the line from its first message.
-It isn't MTP, the window size or the sampler: it was the same at 4K, 8K and 16K, with MTP on or
-off, and at any temperature. The CPU backend (fp32) was always exact.
-
-**How it's done elsewhere.** Server-side models (GPT, Claude, and open stacks such as vLLM or
-llama.cpp) keep positions as integers and compute the rotary angles in fp32, even when the rest of
-the model runs in 16 bits. Their tokenizers also group digits, so there are fewer digit tokens
-side by side. Speculative decoding and MTP draft tokens at the same positions and are checked by
-the main model, so they don't change this.
-
-**The fix.** `llm/ModelPrecision` sets the text decoder's `prefer_activation_type` to "fp32" in the
-model file's header before the engine loads it. LiteRT-LM 0.17.1 reads the preference from the
-header (`runtime/util/litert_lm_loader.cc`) and offers no API for it. (0.18 added
-`EngineConfig.activationDataType`. On 0.19.1, asked for FLOAT16 there over the fp32 header
-(`MemoryEvalTest#activationModes`, 14 Nov 2026), the prompt was read 1.2–1.6× faster (711 against
-589 tokens a second at 1,882 tokens, 724 against 443 at 3,312), but 14 of 16 numbers came back
-right at 1,882 tokens and none at 3,312, against 16 of 16 with the header's fp32. So the header
-patch stays.) "fp16" and "fp32" are the
-same length, so it is a 2-byte write in place, and nothing else in the 3.6 GB file moves. The
-vision encoder keeps its fp16. The runtime keys its GPU program cache on the file's mtime, so it
-rebuilds the fp32 programs once. A file it can't read, or one that asks for something else, is
-left as it is, and the app falls back to the checks below.
-
-Measured on the phone (`MemoryEvalTest.digitPrecision`: eight numbers — phone numbers, dates, a
-PIN, an amount — copied after a digit-free prompt, twice each, GPU with MTP):
-
-| Numbers copied after | fp16 (as shipped) | fp32 | Decode, fp16 → fp32 | To first token, fp16 → fp32 |
-|---|---|---|---|---|
-| 232 tokens | 16/16 | 16/16 | 52 → 48 tok/s | 0.4 → 0.5 s |
-| 1,398 tokens | 16/16 | 16/16 | 58 → 54 tok/s | 1.5 → 2.2 s |
-| 1,882 tokens | 14/16 | 16/16 | 56 → 53 tok/s | 2.0 → 3.1 s |
-| 3,334 tokens | 0/16 | 16/16 | 39 → 51 tok/s | 3.7 → 5.9 s |
-| 4,786 tokens | 0/16 | 16/16 | 31 → 45 tok/s | 5.5 → 10.4 s |
-
-Decoding runs at about the same speed; at long positions fp16 was slower only because it was
-writing garbage. In a real chat (`MemoryEvalTest.precisionCostInAChat`, with the app's full prompt
-of about 2,300 tokens), a new chat's first reply starts after 5.3 s instead of 3.7 s. A follow-up
-("…the insurance renews on 09/08/2027. what's the renewal date?") took 3.1 s in all and came back
-exact. The app uses about 220 MB more memory (1,390 against 1,171 MB). Reading a prompt (prefill) takes 1.6–1.9× as long, which shows at the first
-message of a chat and after a rebuild. Later turns only read their own new text. `"fp32_fp16"`
-(fp32 with mixed precision) was just as exact but no faster (12.5 s to the first token at 4,786),
-so plain fp32 is used.
-
-**What fp16 left behind.** Everything the model wrote before the fix could hold garbled numbers:
-archived replies ("Your Roll No. was 43610104"), session summaries ("25th October 026"), and saved
-images' details ("Roll No: 436104", "12:0:05 PM"). The fp32 model copies what it is given exactly,
-so recalled into a new chat, those old mistakes came back word for word.
-`memory/work/PrecisionUpgrade` puts them right once, the first time the model loads in fp32:
-
-- Archived exchanges keep the user's words, but lose a reply with digits in it.
-- Summaries with digits go.
-- Saved images are read again from their photos.
-
-What the user typed was never garbled, so facts and the chats' own messages are left alone. A chat
-from before the fix still shows its old replies, and continuing it replays them; a new chat
-doesn't. The start of fp32 is stored, so a restart part-way through doesn't strip newer replies.
-
-**Checks kept as fallbacks.** These were written before the cause was found. Some stay on always;
-others run only when the model's precision couldn't be set (`LlmService.exactDigits` false):
-
-- Always: **a message that is only a sum never reaches the model.** "whats 25 * 2", "what is root
-  of 25", "18% of 2450?" are worked out by `NumberGrounding.directAnswer` and answered at once:
-  "25 × 2 = 50". A `calculate` turn is answered by the app itself ("3450 ÷ 4 = 862.5"). Both are
-  faster than the model and can't be wrong.
-- Always: **tool arguments are grounded in the user's words** (`NumberGrounding`). An argument that
-  differs from the user's message only in its digits is taken from the message. With exact digits
-  it no longer changes anything.
-- Always: **sums and phone commands are kept out of the archive** (`ChunkPolicy.isUtility`).
-- Only in fp16: **reply numbers are checked against what the model read** (`ReplyGrounding`, see
-  *Saved images*), and **a saved image is read again** after "remember this" in a chat. With exact
-  digits, the first could only change a number that was right, and the second would cost 5 s and a
-  rebuild for nothing.
 
 ## Known limitations
 

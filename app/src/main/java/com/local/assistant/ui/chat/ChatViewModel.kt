@@ -19,13 +19,11 @@ import com.local.assistant.data.db.Role
 import com.local.assistant.data.prefs.SettingsStore
 import com.local.assistant.data.repo.ChatRepository
 import com.local.assistant.device.PermissionBroker
-import com.local.assistant.llm.LlmService
 import com.local.assistant.media.AttachmentStore
 import com.local.assistant.media.AudioRecorder
 import com.local.assistant.media.Recording
 import com.local.assistant.media.RecordingState
 import com.local.assistant.voice.Transcriber
-import com.local.assistant.memory.prompt.ConversationManager
 import com.local.assistant.memory.prompt.TurnRunner
 import com.local.assistant.memory.tools.ChatToolLog
 import com.local.assistant.memory.tools.MemoryChip
@@ -45,6 +43,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
@@ -53,9 +52,8 @@ import kotlinx.coroutines.launch
 
 class ChatViewModel(
     private val repository: ChatRepository,
-    private val llm: LlmService,
-    private val conversations: ConversationManager,
-    private val turns: TurnRunner,
+    /** Whether a message beyond the phone's own commands can be answered now: Luna's server, online. */
+    private val server: () -> ServerState,
     private val sender: ChatSender,
     private val tools: ToolExecutor,
     private val clockAlarms: SystemAlarms,
@@ -76,6 +74,8 @@ class ChatViewModel(
     /** How often the phone closed the app lately, when worth a note ([com.local.assistant.AppContainer.phoneKills]). */
     val phoneKills: StateFlow<Int?> = MutableStateFlow(null),
     private val onPhoneKillsAnswered: () -> Unit = {},
+    /** Family news Luna's server has for the user, shown in the chat on screen as Luna's message. */
+    private val familyAnswers: com.local.assistant.live.FamilyAnswers? = null,
 ) : ViewModel() {
 
     /** A tool waiting on the user's answer to a permission dialog, e.g. contacts for "call amma". */
@@ -134,18 +134,10 @@ class ChatViewModel(
         live?.takeIf { isHere(it, chatId) }?.text
     }.stateIn(viewModelScope, SharingStarted.Eagerly, null)
 
-    /**
-     * What the user just sent, shown at once until the stored copy comes back from the database:
-     * that took over a second while the model loaded (seen on the phone, 13 Nov 2026).
-     */
+    /** What the user just sent, shown at once until the stored copy comes back from the database. */
     val pendingQuestion: StateFlow<String?> = combine(sender.live, _activeChatId, messages) { live, chatId, shown ->
         live?.takeIf { isHere(it, chatId) }?.asked?.takeIf { live.askedId == null || shown.none { it.id == live.askedId } }
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
-
-    /** What the reply on screen is waiting on, while it is: "Searching your photos…" ([ChatSender.Live.step]). */
-    val streamingStep: StateFlow<String?> = combine(sender.live, _activeChatId) { live, chatId ->
-        live?.takeIf { isHere(it, chatId) }?.step
-    }.stateIn(viewModelScope, SharingStarted.Eagerly, null)
 
     /** The chat on screen is generating a reply. */
     val isGenerating: StateFlow<Boolean> = streamingText
@@ -153,8 +145,8 @@ class ChatViewModel(
         .stateIn(viewModelScope, SharingStarted.Eagerly, false)
 
     /**
-     * Another chat's reply is in flight — the overlay's, asked from the power button — and there is
-     * only one model, so a send here waits until it is done.
+     * Another chat's reply is in flight — the overlay's, asked from the power button — and one turn
+     * runs at a time, so a send here waits until it is done.
      */
     val busyElsewhere: StateFlow<Boolean> = combine(sender.live, _activeChatId) { live, chatId ->
         live != null && !isHere(live, chatId)
@@ -169,7 +161,17 @@ class ChatViewModel(
     private val _error = MutableStateFlow<String?>(null)
     val error: StateFlow<String?> = _error.asStateFlow()
 
-    val engineState: StateFlow<LlmService.State> = llm.state
+    private val _serverState = MutableStateFlow(server())
+
+    /** Luna's server can answer now; when not, the chat says why above the composer ([serverNotice]). */
+    val serverReady: StateFlow<Boolean> = _serverState.map { it == ServerState.READY }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, _serverState.value == ServerState.READY)
+
+    /** Why only the phone's own commands work now. */
+    fun serverNotice(): String = when (_serverState.value) {
+        ServerState.OFFLINE -> "Offline: alarms, timers, sums and phone switches still work"
+        else -> "Set up Luna's server in Settings to chat: alarms and timers work already"
+    }
 
     /** A reply is being read aloud: one to a voice message, or one from its speaker button. */
     val speaking: StateFlow<Boolean> = speaker.speaking
@@ -186,17 +188,6 @@ class ChatViewModel(
     val readingAloud: StateFlow<Long?> = _readingAloud.asStateFlow()
 
     init {
-        // The chat opens at once and the model loads behind it; a message sent before it is ready
-        // waits for it. Also covers a model installed just now, which the app's start didn't see.
-        llm.warmUp()
-
-        // What is on screen decides which conversation is made ready: a new chat's at once, once
-        // the model is loaded (ConversationManager.showing).
-        viewModelScope.launch {
-            combine(_activeChatId, llm.state.map { it is LlmService.State.Ready }.distinctUntilChanged(), ::Pair)
-                .collect { (chatId, ready) -> conversations.showing(chatId, ready) }
-        }
-
         // A reply to a voice message is spoken sentence by sentence as it arrives, as in the overlay.
         viewModelScope.launch {
             sender.live.collect { live ->
@@ -229,6 +220,13 @@ class ChatViewModel(
         // And it stops when its chat is left: another one, a new one, or this one deleted.
         viewModelScope.launch {
             _activeChatId.collect { if (_readingAloud.value != null) stopSpeaking() }
+        }
+
+        // What the family answered, briefed by Luna: into the chat on screen, or a new one.
+        familyAnswers?.let { answers ->
+            viewModelScope.launch {
+                answers.briefing.filterNotNull().collect { answers.showIn(_activeChatId.value)?.let(::openChat) }
+            }
         }
     }
 
@@ -273,31 +271,15 @@ class ChatViewModel(
         if (_readingAloud.value != null) stopSpeaking()
     }
 
-    /** After the model failed to start: from the banner that says so. */
-    fun retryLoad() = llm.retryLoad()
-
-    /** Real context consumption reported by the runtime, for the indicator above the composer. */
-    val contextUsage: StateFlow<LlmService.ContextUsage?> = combine(conversations.contextUsage, _activeChatId) { usage, chatId ->
-        usage?.takeIf { it.chatId == null || it.chatId == chatId }
-    }.stateIn(viewModelScope, SharingStarted.Eagerly, null)
-
-    /** A send is waiting while older turns are summarised to make room. */
-    val tidying: StateFlow<Boolean> = conversations.tidying
-
     val memoryPaused: StateFlow<Boolean> = settings.observeMemoryPaused()
         .stateIn(viewModelScope, SharingStarted.Eagerly, settings.memoryPaused)
 
-    /** How many older turns fell out of the context window for the active chat. */
-    val droppedFromContext: StateFlow<Int> = conversations.droppedFromContext
+    /** Photos go to Luna's server, which looks at them; the composer offers them while it's set up. */
+    val supportsImages: StateFlow<Boolean> = _serverState.map { it != ServerState.NONE }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, _serverState.value != ServerState.NONE)
 
-    /** Drives whether the composer offers the image and mic buttons at all. */
-    val supportsImages: StateFlow<Boolean> = llm.modalities
-        .map { it?.vision == true }
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), false)
-
-    val supportsAudio: StateFlow<Boolean> = llm.modalities
-        .map { it?.audio == true }
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), false)
+    /** Voice messages are written down on the phone ([Transcriber]); the words are what's answered. */
+    val supportsAudio: StateFlow<Boolean> = MutableStateFlow(transcriber != null).asStateFlow()
 
     private val _pendingAttachment = MutableStateFlow<PendingAttachment?>(null)
     val pendingAttachment: StateFlow<PendingAttachment?> = _pendingAttachment.asStateFlow()
@@ -308,14 +290,12 @@ class ChatViewModel(
         if (generatingHere()) return
         stopSpeaking()
         _activeChatId.value = null
-        conversations.onChatSelected(null)
     }
 
     fun selectChat(chatId: Long) {
         if (generatingHere() || _activeChatId.value == chatId) return
         stopSpeaking()
         _activeChatId.value = chatId
-        conversations.onChatSelected(chatId)
     }
 
     /**
@@ -327,25 +307,16 @@ class ChatViewModel(
         viewModelScope.launch { repository.showChat(chatId) }
         if (_activeChatId.value == chatId) return
         _activeChatId.value = chatId
-        conversations.onChatSelected(chatId)
-    }
-
-    /**
-     * Every keystroke: background model work yields to the person typing, and the conversation
-     * their message will go into is made ready if it isn't.
-     */
-    fun onTyping(draft: String) {
-        turns.onUserActivity()
-        conversations.typing(draft)
     }
 
     /** The chat screen came into view again (back from the panel, Settings or another app). */
-    fun onScreenShown() = conversations.showing(_activeChatId.value, llm.state.value is LlmService.State.Ready)
+    fun onScreenShown() {
+        _serverState.value = server()
+    }
 
     fun deleteChat(chatId: Long) {
         viewModelScope.launch {
             repository.deleteChat(chatId)
-            conversations.forget(chatId)
             // The rows are gone, so any file they referenced is now orphaned.
             attachments.pruneExcept(repository.attachmentPaths())
             if (_activeChatId.value == chatId) _activeChatId.value = null
@@ -368,8 +339,8 @@ class ChatViewModel(
     }
 
     /**
-     * A PDF, Word, Excel or other document to send with the next message. The app reads it
-     * ([com.local.assistant.files.DocumentReader]), so it works with any model, vision or not.
+     * A PDF, Word, Excel or other document to send with the next message. It stays on the phone:
+     * read_file reads what the reply needs of it ([com.local.assistant.files.DocumentExcerpts]).
      */
     fun attachDocument(uri: Uri) {
         viewModelScope.launch {
@@ -412,6 +383,7 @@ class ChatViewModel(
 
     fun send(text: String) {
         stopSpeaking()
+        _serverState.value = server()
         val attachment = _pendingAttachment.value
         val started = sender.send(
             chatId = _activeChatId.value,
@@ -425,7 +397,7 @@ class ChatViewModel(
 
     /**
      * A finished recording goes straight out, and its reply is read aloud (Settings: Answer out
-     * loud). With [transcript], the words are the message's text: the model reads them, and the
+     * loud). With [transcript], the words are the message's text: Luna reads them, and the
      * recording stays for playing back.
      */
     private fun sendVoice(recording: Recording, transcript: String?) {
@@ -465,10 +437,8 @@ class ChatViewModel(
     /** Puts back whatever the chip's tool call changed. */
     fun undo(recordId: Long) {
         viewModelScope.launch {
-            when (tools.undo(recordId)) {
-                ToolExecutor.UndoResult.UNDONE -> conversations.prefixMayHaveChanged()
-                ToolExecutor.UndoResult.CHANGED_SINCE -> _error.value = "That has changed since, so it was left as it is."
-                else -> Unit
+            if (tools.undo(recordId) == ToolExecutor.UndoResult.CHANGED_SINCE) {
+                _error.value = "That has changed since, so it was left as it is."
             }
         }
     }
@@ -476,11 +446,7 @@ class ChatViewModel(
     /** Moves the chip's reminder or event to [at]. */
     fun editTime(recordId: Long, at: Long) {
         viewModelScope.launch {
-            if (tools.editTime(recordId, at)) {
-                conversations.prefixMayHaveChanged()
-            } else {
-                _error.value = "That reminder no longer exists."
-            }
+            if (!tools.editTime(recordId, at)) _error.value = "That reminder no longer exists."
         }
     }
 
@@ -526,9 +492,7 @@ class ChatViewModel(
             initializer {
                 ChatViewModel(
                     repository = container.chatRepository,
-                    llm = container.llmService,
-                    conversations = container.conversations,
-                    turns = container.turnRunner,
+                    server = container::serverState,
                     sender = container.chatSender,
                     tools = container.toolExecutor,
                     clockAlarms = container.clockAlarms,
@@ -544,6 +508,7 @@ class ChatViewModel(
                     appVersion = container.appVersion,
                     phoneKills = container.phoneKills,
                     onPhoneKillsAnswered = container::toldAboutPhoneKills,
+                    familyAnswers = container.familyAnswers,
                 )
             }
         }
@@ -607,4 +572,16 @@ internal fun replyReport(
         listOfNotNull(attached, message.text.takeIf { it.isNotBlank() }?.let(SensitiveText::masked)).joinToString(" ")
     }.orEmpty()
     return ReplyReport(reason, note, question, SensitiveText.masked(reply.text), version)
+}
+
+/** Whether the chat's replies can come from Luna's server now. */
+enum class ServerState {
+    /** Set up and on, and the phone is online. */
+    READY,
+
+    /** Set up and on, but the phone is offline. */
+    OFFLINE,
+
+    /** No server set, or live voice and family turned off. */
+    NONE,
 }

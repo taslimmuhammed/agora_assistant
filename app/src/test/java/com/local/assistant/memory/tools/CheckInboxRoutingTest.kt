@@ -9,8 +9,6 @@ import com.local.assistant.llm.ToolCall
 import com.local.assistant.memory.retrieval.ChunkPolicy
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.flow.toList
-import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -65,15 +63,12 @@ class CheckInboxRoutingTest {
         FakeMemoryStore { nowMs }, FakeReminders(), FakeSystemAlarms(), FakeToolLog(), now = { now },
         inbox = InboxTools(inbox, now = { now }, ready = { ready }),
     )
-    private val loop = ToolLoop(executor, maxRounds = 3, isOverflow = { false })
 
     private fun call(vararg args: Pair<String, Any?>) = ToolCall(ToolCatalog.CHECK_INBOX, mapOf(*args))
 
     private fun result(call: ToolCall, userText: String): Map<*, *> {
-        val session = ScriptedSession(ArrayDeque(listOf(ScriptedSession.calls(call), ScriptedSession.says("Rahul said the trip is on."))))
-        val context = ToolContext(chatId = 1, userMessageId = 10, userText = userText)
-        runBlocking { loop.run(session, "envelope", emptyList(), context).toList() }
-        return Gson().fromJson(session.sentResults.first().first().json, Map::class.java)
+        val (turn, _) = executor.play(listOf(call), ToolContext(chatId = 1, userMessageId = 10, userText = userText), "Rahul said the trip is on.")
+        return Gson().fromJson(turn.sentResults.first().first().json, Map::class.java)
     }
 
     @Test
@@ -86,16 +81,6 @@ class CheckInboxRoutingTest {
         assertEquals("Sat 14 Nov, 07:00 · WhatsApp · Rahul in Goa gang: Bring sunscreen for the trip", lines.first())
         assertEquals("Fri 13 Nov, 14:00 · WhatsApp · Rahul: The Goa trip is on, tickets booked for Friday", lines[1])
         assertTrue(result["note"].toString().contains("not the user's words"))
-    }
-
-    @Test
-    fun `the turn's end says the inbox was read, so no related photos go under it`() {
-        val session = ScriptedSession(ArrayDeque(listOf(ScriptedSession.calls(call("when" to "today")), ScriptedSession.says("Amma asked about the cake."))))
-        val context = ToolContext(chatId = 1, userMessageId = 10, userText = "do you have any latest messages")
-        val events = runBlocking { loop.run(session, "envelope", emptyList(), context).toList() }
-        val done = events.last() as LoopEvent.Done
-        assertEquals(setOf(ToolCatalog.CHECK_INBOX), done.tools)
-        assertTrue(done.tools.any { it in ToolCatalog.ANSWERS_FROM_ELSEWHERE })
     }
 
     @Test

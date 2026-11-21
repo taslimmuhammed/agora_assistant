@@ -1,21 +1,25 @@
 <div align="center">
 
-# Local Assistant
+# Luna
 
-**A private AI assistant that lives on your Android phone.**
+**An AI companion for your Android phone, with a voice.**
 
-It runs Google's Gemma 4 entirely on the device. It chats, listens, remembers you, sets reminders
-and alarms, and answers when you hold the power button. No account, no server: nothing leaves the
-phone for it to think.
+Luna thinks on her own server: Google's Gemini, the same brain whether you call her through
+Agora, type, send a voice message or hold the power button. She speaks in Murf's voice. Your
+memory, reminders, photos and files stay on the phone, which runs her tools for her. Nothing to
+download before the first chat.
 
-Android 8 or newer · 64-bit phone · 8 GB of RAM or more · about 4.5 GB free
+Android 8 or newer · 64-bit phone · Luna's server (`server/`) · about 1 GB free
 
 </div>
 
 ## What it can do
 
+- **Talks with you.** **Call** in the chat is a phone call with Luna over Agora's Conversational
+  AI. Typed and voice messages get the same Luna, answered aloud in Murf's voice when you ask by
+  voice.
 - **Answers from the power button.** Hold it over any app, like Gemini, or say "Hey Luna": it
-  listens, sends when you pause, and answers out loud in a voice you pick. It can see the screen
+  listens, sends when you pause, and answers out loud. It can see the screen
   you called it over: "summarise this", "share this with Anjali".
 - **Remembers you.** Your profile, facts you mention ("my dentist is Dr. Rao"), images you ask it
   to keep, and what you talked about in earlier chats. **About you** shows what it knows, to edit
@@ -40,43 +44,42 @@ Android 8 or newer · 64-bit phone · 8 GB of RAM or more · about 4.5 GB free
   workouts.
 - **Tells you what you missed** (off by default). When you come back to your phone, a card shows
   who called and who's waiting on a reply, with replies ready to send.
-- **Looks things up** on the web, once you add a free [Tavily](https://tavily.com) key.
 - **Sees and hears.** Send it a photo or a voice message.
-- **Stays private.** It thinks on the phone, and keeps card numbers, ID numbers and photos of your
-  documents hidden until you confirm it's you with your fingerprint, face or PIN.
+- **Keeps your things on the phone.** Memory, photos, files and messages are kept and searched on
+  the phone; Luna's server sees only what a message needs (see [Privacy](#privacy)). Card numbers,
+  ID numbers and photos of your documents stay hidden until you confirm it's you with your
+  fingerprint, face or PIN.
 
 ## Install
 
 1. **Build.** Build the APK from this repository (see [For developers](#for-developers)):
    `./gradlew :app:installDebug` with the phone connected, or `./gradlew :app:demoApk -Pdemo`
-   for a file to copy to the phone, `apk/LocalAssistant.apk`.
+   for a file to copy to the phone, `apk/Luna.apk`.
 2. **Install.** Copied over, open the file, and let your file manager install apps when Android
    asks. The app isn't on Google Play and is signed with a development key, so Play Protect may
    warn you: choose to install anyway.
-3. **Get the model.** Open Local Assistant. It asks a few optional things about you and for an
-   optional web-search key, then for the model:
-   - **Download** fetches Gemma 4 E4B (3.66 GB) from Hugging Face. Use Wi-Fi; it picks up where
-     it stopped if interrupted.
-   - **Load from device storage** uses a `.litertlm` model file you already have.
+3. **Open Luna.** It asks a few optional things about you and which permissions to give, then
+   opens the chat. Calls, chat and voice messages all go to Luna's server: set its address and
+   key in Settings → Live voice and family, or build with `live.serverUrl` and `live.appKey` in
+   `local.properties`. Without it, or offline, the phone still sets alarms and timers, works out
+   sums and switches the flashlight, ringer, Do Not Disturb and volume.
 
-   Right after it, the app also downloads EmbeddingGemma 2 (0.39 GB) by itself, so it can find
-   past conversations by meaning; the same model searches your photos. Nothing to do; no account
-   needed.
+   Once photos are allowed, the app downloads EmbeddingGemma 2 (0.39 GB) by itself, to find
+   photos by what's in them and past conversations by meaning. It's optional: Settings → Photo
+   and memory search. No account needed.
 
-It then takes about 15 seconds to get ready (it loads the model and reads its instructions), and
-from then on answers right away.
+An older install's Gemma 4 E4B file (3.66 GB) is deleted on the first start after updating.
 
 ### Use it from the power button
 
-In the app, go to **Settings → Calling the assistant → Power button** and choose Local Assistant as the
+In the app, go to **Settings → Calling the assistant → Power button** and choose Luna as the
 *digital assistant app*. If holding the power button still brings up the power menu, switch it to
 the voice assistant in your phone's power-button settings. You can also long-press the app icon
 and pick **Talk**.
 
 In the same place:
 
-- While Local Assistant is the phone's digital assistant, the model stays loaded between questions
-  (about 1.8 GB of memory), so the power button gets an answer in about a second. Some phones
+- While Luna is the phone's digital assistant, the app stays ready between questions. Some phones
   close it in the background anyway; if yours does it often, the chat says so once, with a link
   to the app's battery settings.
 - **Use on the lock screen** (off by default) lets it answer without unlocking, with the power
@@ -84,9 +87,10 @@ In the same place:
   or chats. It can set reminders, events, alarms and timers, change phone settings, work out sums
   and look things up. For anything else, like remembering something or messaging someone, it asks
   you to unlock first and then carries on.
-- **Voice** and **Answer out loud** set how it speaks. At the top of Voice is a natural voice that
-  sounds like a person: a 334 MB download that uses about 600 MB of memory while it talks.
-  Without it, the assistant uses your phone's own voices.
+- **Voice** and **Answer out loud** set how it speaks. **Speak in Murf's voice** (on by default)
+  reads replies in the voice Luna's calls use, made by Murf through Luna's server. Offline, or
+  with it off, the phone speaks instead: a natural voice that sounds like a person (a 334 MB
+  download that uses about 600 MB of memory while it talks), or the phone's own voices.
 - **Wake word** (off by default): say "Hey Luna" to open the assistant, from anywhere, this app
   included, either only while charging or always. **Try it** checks that it hears you. Two small
   models in the app listen on the phone, one of them trained for this phrase, and the assistant
@@ -96,9 +100,9 @@ In the same place:
 
 ### Optional extras
 
-- **Memory search** is set up with the model. If the download didn't finish, get it from
-  Settings → Model and memory search. Without it, past chats are still found by keywords.
-- **Web search**: Settings → Web search, and paste a free key from [tavily.com](https://tavily.com).
+- **Photo and memory search** downloads by itself once photos are allowed. If it didn't finish,
+  get it from Settings → Photo and memory search. Without it, past chats are still found by
+  keywords.
 - **Photos, files and messages** are offered on a page when the app first opens; each can be
   skipped and turned on later. Photos and faces are indexed on their own from then on (a
   notification shows it while the first index runs in the background). In **Photos** in the chat
@@ -111,18 +115,19 @@ In the same place:
 - **While you were away**: Settings → While you were away, then allow notification access. The
   notifications are read on the phone and kept for two days.
 - **Live voice (Agora)**: a phone call with Luna in Indian English, with the family hub behind
-  her, and a call at each medicine's time. It needs Luna's server (`server/`): set its address
-  and key in Settings → Live voice (Agora), or build with `live.serverUrl` and `live.appKey` in
-  `local.properties`. Then **Call** in the chat, the power button and "Hey Luna" start a call
-  while the phone is online; offline it all works on the phone as before. See
+  her, and a call at each medicine's time, through the same server as the chat. **Call** in the
+  chat, the power button and "Hey Luna" start a call while the phone is online. Messages to the family
+  go from Luna's WhatsApp, in a call or the chat, and Luna tells you what they answer: in the call
+  as it comes, otherwise aloud while the app is open, or as a notification, and in your chat. See
   [Live voice](docs/TECHNICAL.md#live-voice-agora).
 
 ### Models and licences
 
-- **Local Assistant** itself: [GNU General Public License v3](LICENSE). The natural voice's
+- **Luna** itself: [GNU General Public License v3](LICENSE). The natural voice's
   pronunciation comes from eSpeak NG (GPL v3), linked into the app through sherpa-onnx, so the
   whole app is under the same licence.
-- **Gemma 4 E4B**, the assistant: by Google, from Hugging Face, Apache License 2.0.
+- **Luna's replies and voice** come from services her server calls, under their own terms:
+  Google's Gemini writes them, Murf speaks them, and Agora's Conversational AI carries calls.
 - **EmbeddingGemma 2 (text and vision, 440M)**, memory search and photo search: by Google,
   downloaded from litert-community on Hugging Face, Apache License 2.0.
 - **YuNet** (MIT) and **SFace** (Apache License 2.0), finding and telling faces apart for People:
@@ -134,18 +139,19 @@ In the same place:
 
 ## Privacy
 
-- The model runs on your phone. Your chats, what it remembers, your photos, your health data and
-  your voice stay on the phone.
-- The internet is used to download the models, and for these only when you use them:
-  - **Web search**, once you add a key: your search goes to Tavily.
+- Your memory, photos, files, messages, health data and chat history are kept on the phone.
+- **Luna's server** writes every reply, so a message sends it: the chat's recent messages (a
+  voice message as the words the phone heard), a photo you attach, the screen you called her
+  over only when you ask about it, and the context a call gets (your core facts, the agenda,
+  pinned lists and today's steps and sleep if allowed; none of these on the lock screen). What
+  her tools find for that message goes too: memory or photos searched, a file she reads, the
+  messages she looks up. The server writes with Gemini and, for spoken replies and calls, speaks
+  with Murf; calls' audio goes through Agora.
+- The internet is also used to download the photo search model, and for these only when you use them:
   - **Place reminders**: the place's name ("DMart") and a rough area about 30 km across go to
     OpenStreetMap's [Nominatim](https://nominatim.openstreetmap.org) search, to find it. Never the
     reminder, nor exactly where you are.
   - **Maps** for place reminders load from [OpenFreeMap](https://openfreemap.org).
-  - **Live voice**, only once you set a server and turn it on: a call's audio goes through Agora
-    to that server, which writes the reply with Gemini and speaks it with Murf. The call is given
-    your core facts, the agenda, pinned lists and today's steps and sleep if allowed, and, on the
-    lock screen, none of these.
   - **Report this reply** (the flag under a reply): that reply, the question before it and the
     reason you pick go to the developer through a Google Form. Nothing that says who you are.
 - Card numbers, ID numbers and photos of your documents stay hidden until you confirm it's you
@@ -158,13 +164,15 @@ In the same place:
 |---|---|
 | "App not installed" | It needs a 64-bit phone with Android 8 or newer, and room for the app. |
 | Play Protect warns about it | Expected for apps from outside Google Play. Choose to install anyway. |
-| "Getting ready…" for a while | The model is loading: about 10 s on a recent phone, longer on older ones. |
-| The model download stopped | Open the app again; it carries on from where it stopped. |
-| The app closes or is slow on a phone with less memory | Settings → Context window → 4K. |
+| "To answer that I need Luna's server" | Set its address and key in Settings → Live voice and family. |
+| "I need the internet to answer that" | The phone is offline; the phone's own commands still work. |
+| The photo search download stopped | Open the app again; it carries on from where it stopped. |
 
 ## For developers
 
-The app is Kotlin and Jetpack Compose on top of [LiteRT-LM](https://ai.google.dev/edge/litert-lm/android).
+The app is Kotlin and Jetpack Compose; replies come from Luna's server in `server/` (Node and
+TypeScript: Gemini, Agora Conversational AI, Murf). [LiteRT-LM](https://ai.google.dev/edge/litert-lm/android)
+runs only EmbeddingGemma 2, for photo and memory search.
 To build it you need JDK 17, the Android SDK, NDK 28.2.13676358 and CMake 3.22.1 (for
 sqlite-vec):
 
@@ -173,7 +181,7 @@ sqlite-vec):
 ```
 
 [docs/TECHNICAL.md](docs/TECHNICAL.md) explains how it all fits together: the memory system,
-tools, the power-button assistant, and the measurements behind each choice.
+tools, the power-button assistant, live voice, and the measurements behind each choice.
 
 **An APK to share**, for a phone you can't connect:
 
@@ -182,5 +190,5 @@ tools, the power-button assistant, and the measurements behind each choice.
 ```
 
 That builds for 64-bit phones only, compresses the native code, signs with the local debug key
-(see `app/build.gradle.kts`), and writes `apk/LocalAssistant.apk`. APKs and videos stay out of
+(see `app/build.gradle.kts`), and writes `apk/Luna.apk`. APKs and videos stay out of
 git: share them directly.

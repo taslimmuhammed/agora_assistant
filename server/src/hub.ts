@@ -19,6 +19,8 @@ export interface Member {
   role: Role
   phone: string | null
   aliases: string[]
+  /** Added from the app (picked from her contacts), not in the seed: the app may remove them. */
+  added: boolean
 }
 
 export interface Dose {
@@ -83,13 +85,21 @@ export interface HubEvent {
   /** Written to be said to the elder: "Rahul will take you to Dr. Rao's at 4:30 PM today." */
   text: string
   item: unknown
+  /** She heard it in a call as it came (announce.ts), so the phone needn't tell her again. */
+  told?: boolean
 }
+
+/** What Luna tells her when it comes: the family's answers, and the shops'. */
+export const ANSWER_KINDS = ['reply', 'task_reply', 'request_reply']
+
+/** What the phone tells her outside a call: the answers, and what Luna told the family for her. */
+export const UPDATE_KINDS = [...ANSWER_KINDS, 'alert']
 
 export type DoseState = 'taken' | 'not_yet' | 'due' | 'missed' | 'upcoming'
 
 export interface Seed {
   elder: string
-  members: Array<Omit<Member, 'phone' | 'aliases'> & { phone?: string; aliases?: string[] }>
+  members: Array<Omit<Member, 'phone' | 'aliases' | 'added'> & { phone?: string; aliases?: string[] }>
   doses: Dose[]
 }
 
@@ -107,6 +117,12 @@ export class Hub {
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true })
     this.db = new DatabaseSync(path)
     this.db.exec(SCHEMA)
+    // Numbers picked from her phone's contacts live in app_phone, so a new seed never loses them.
+    const columns = this.db.prepare('PRAGMA table_info(members)').all().map(c => String(c.name))
+    if (!columns.includes('app_phone')) this.db.exec('ALTER TABLE members ADD COLUMN app_phone TEXT')
+    if (!columns.includes('added')) this.db.exec('ALTER TABLE members ADD COLUMN added INTEGER NOT NULL DEFAULT 0')
+    const eventColumns = this.db.prepare('PRAGMA table_info(events)').all().map(c => String(c.name))
+    if (!eventColumns.includes('told')) this.db.exec('ALTER TABLE events ADD COLUMN told INTEGER NOT NULL DEFAULT 0')
     this.elderId = seed.elder
     this.doses = seed.doses
     // The seed decides who's in the family, and their numbers are their WhatsApp chats.
@@ -126,6 +142,27 @@ export class Hub {
 
   members(): Member[] {
     return this.db.prepare('SELECT * FROM members ORDER BY rowid').all().map(toMember)
+  }
+
+  /** A number set from the app (picked from her contacts); empty clears it, back to the seed's. */
+  setPhone(id: string, phone: string): Member | null {
+    this.db.prepare('UPDATE members SET app_phone = ? WHERE id = ?').run(phone.trim() || null, id)
+    return this.member(id)
+  }
+
+  /** Someone new, picked from her contacts in the app: family, a caregiver, or a shop or service. */
+  addMember(person: { name: string; relation: string; role: Exclude<Role, 'elder'>; phone: string }): Member {
+    const base = person.name.toLowerCase().normalize('NFKD').replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'someone'
+    let id = base
+    for (let n = 2; this.member(id); n++) id = `${base}-${n}`
+    this.db.prepare(`INSERT INTO members (id, name, relation, role, phone, aliases, app_phone, added) VALUES (?, ?, ?, ?, NULL, '[]', ?, 1)`)
+      .run(id, person.name.trim(), person.relation.trim(), person.role, person.phone.trim() || null)
+    return this.member(id)!
+  }
+
+  /** Removes someone added from the app; the seed's people stay. */
+  removeMember(id: string): boolean {
+    return Number(this.db.prepare('DELETE FROM members WHERE id = ? AND added = 1').run(id).changes) > 0
   }
 
   member(id: string): Member | null {
@@ -330,6 +367,27 @@ export class Hub {
       .filter(e => !kinds || kinds.includes(e.kind))
   }
 
+  /** She was told [id] in her call as it came. */
+  markTold(id: number) {
+    this.db.prepare('UPDATE events SET told = 1 WHERE id = ?').run(id)
+  }
+
+  /** The answers and alerts after event [afterId], for the phone to tell her outside a call. */
+  answersAfter(afterId: number): HubEvent[] {
+    return this.db.prepare('SELECT * FROM events WHERE id > ? ORDER BY id').all(afterId).map(toEvent).filter(e => UPDATE_KINDS.includes(e.kind))
+  }
+
+  lastEventId(): number {
+    return Number((this.db.prepare('SELECT MAX(id) AS id FROM events').get() as Row | undefined)?.id ?? 0)
+  }
+
+  /** Someone may answer soon: a task or request with no answer yet, or a message in the last hour. */
+  awaitingAnswers(now: number): boolean {
+    return this.tasks().some(t => t.status === 'open') ||
+      this.requests().some(r => r.status === 'sent') ||
+      this.eventsSince(now - 60 * 60_000, ['message', 'task', 'request']).length > 0
+  }
+
   /** Back to the seed, keeping the family group: between rehearsals. */
   reset() {
     this.db.exec('DELETE FROM tasks; DELETE FROM requests; DELETE FROM checkins; DELETE FROM dose_alerts; DELETE FROM events;')
@@ -387,8 +445,9 @@ function toMember(row: Row): Member {
     name: String(row.name),
     relation: String(row.relation),
     role: row.role as Role,
-    phone: (row.phone as string | null) ?? null,
+    phone: (row.app_phone as string | null) || (row.phone as string | null) || null,
     aliases: JSON.parse(String(row.aliases ?? '[]')),
+    added: Number(row.added ?? 0) === 1,
   }
 }
 
@@ -439,7 +498,7 @@ function toCheckin(row: Row): Checkin {
 }
 
 function toEvent(row: Row): HubEvent {
-  return { id: Number(row.id), at: Number(row.at), kind: String(row.kind), text: String(row.text), item: JSON.parse(String(row.item ?? 'null')) }
+  return { id: Number(row.id), at: Number(row.at), kind: String(row.kind), text: String(row.text), item: JSON.parse(String(row.item ?? 'null')), told: Number(row.told ?? 0) === 1 }
 }
 
 function normalise(words: string): string {

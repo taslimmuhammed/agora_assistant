@@ -29,7 +29,6 @@ import androidx.compose.material.icons.outlined.Call
 import androidx.compose.material.icons.outlined.FavoriteBorder
 import androidx.compose.material.icons.outlined.Forum
 import androidx.compose.material.icons.outlined.History
-import androidx.compose.material.icons.outlined.Explore
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.Memory
 import androidx.compose.material.icons.outlined.Mic
@@ -37,7 +36,6 @@ import androidx.compose.material.icons.outlined.NotificationsNone
 import androidx.compose.material.icons.outlined.Person
 import androidx.compose.material.icons.outlined.Public
 import androidx.compose.material.icons.outlined.RecordVoiceOver
-import androidx.compose.material.icons.outlined.Science
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.runtime.key
 import androidx.activity.compose.BackHandler
@@ -47,15 +45,12 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
-import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
-import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -85,8 +80,6 @@ import com.local.assistant.assist.KeepReadyService
 import com.local.assistant.assist.LockScreenNotice
 import com.local.assistant.away.AwayBrief
 import com.local.assistant.data.prefs.SettingsStore
-import com.local.assistant.llm.LlmService
-import com.local.assistant.model.ModelCatalog
 import com.local.assistant.model.formatBytes
 import com.local.assistant.ui.memory.MemoryViewModel
 import com.local.assistant.ui.theme.AppColors
@@ -102,7 +95,6 @@ import com.local.assistant.voice.NaturalVoices
 import com.local.assistant.voice.VoiceOption
 import com.local.assistant.voice.VoicePack
 import com.local.assistant.voice.VoicePackInstaller
-import com.local.assistant.wake.WakeSamples
 import com.local.assistant.wake.WakeTry
 import com.local.assistant.wake.WakeWord
 import com.local.assistant.wake.WakeWordMode
@@ -116,34 +108,28 @@ enum class SettingsSection(val title: String) {
     AWAY("While you were away"),
     MESSAGES("Messages"),
     HEALTH("Health data"),
-    LIVE("Live voice (Agora)"),
-    MODEL("Model"),
+    LIVE("Live voice and family"),
     MEMORY("Memory and history"),
     ABOUT("About"),
-    TEST_BUILD("Test build"),
 }
 
 /**
  * Settings, as the phone's own are: a main page with one row per section, each showing how it is
  * set, and a page per section with its settings (the user, 2026-11-01: one long page was "too
- * much scrolling … bad UX"). The profile and web search open their own screens straight from the
- * main page, as do the model file and the Tavily key. [section] is the page open, null for the
+ * much scrolling … bad UX"). The profile opens its own screen straight from the main page, as
+ * does photo and memory search's. [section] is the page open, null for the
  * main one; it is kept by the caller, so coming back from one of those screens returns to it.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SettingsScreen(
-    llmService: LlmService,
     settings: SettingsStore,
     speaker: Speaker,
     voicePacks: List<VoicePackInstaller>,
-    webSearchOn: Boolean,
     memory: MemoryViewModel,
     awayBrief: AwayBrief,
     inbox: com.local.assistant.inbox.Inbox,
     smsSync: com.local.assistant.inbox.SmsSync,
-    /** The tools a chat is given may have changed (check_inbox came or went). */
-    onToolsChanged: () -> Unit,
     health: com.local.assistant.health.HealthSource,
     secrets: com.local.assistant.data.prefs.SecretStore,
     liveCalls: com.local.assistant.live.LiveCalls,
@@ -152,9 +138,7 @@ fun SettingsScreen(
     onSection: (SettingsSection?) -> Unit,
     onBack: () -> Unit,
     onOpenProfile: () -> Unit,
-    onOpenModel: () -> Unit,
-    onOpenWebSearch: () -> Unit,
-    onOpenTour: () -> Unit,
+    onOpenMemorySearch: () -> Unit,
 ) {
     val snackbar = remember { SnackbarHostState() }
     LaunchedEffect(memory) { memory.notices.collect { snackbar.showSnackbar(it.message) } }
@@ -190,28 +174,15 @@ fun SettingsScreen(
                 // Each page is one card of glass, the brief's.
                 GlassCard(Modifier.padding(start = 12.dp, end = 12.dp, top = 8.dp), padding = 6.dp) {
                 when (section) {
-                    null -> MainPage(settings, webSearchOn, memory, health, smsSync, liveCalls, onSection, onOpenProfile, onOpenWebSearch, onOpenTour)
+                    null -> MainPage(settings, memory, health, smsSync, liveCalls, onSection, onOpenProfile, onOpenMemorySearch)
                     SettingsSection.CALLING -> CallingSettings(settings)
-                    SettingsSection.VOICE -> VoiceSettings(settings, speaker, voicePacks)
+                    SettingsSection.VOICE -> VoiceSettings(settings, speaker, voicePacks, liveCalls)
                     SettingsSection.AWAY -> AwaySettings(settings, awayBrief)
-                    SettingsSection.MESSAGES -> MessagesSettings(settings, inbox, smsSync, onToolsChanged)
+                    SettingsSection.MESSAGES -> MessagesSettings(settings, inbox, smsSync)
                     SettingsSection.HEALTH -> HealthSettings(health, settings)
                     SettingsSection.LIVE -> LiveSettings(settings, secrets, liveCalls, checkIns)
-                    SettingsSection.MODEL -> {
-                        val state by llmService.state.collectAsStateWithLifecycle()
-                        NavRow(
-                            "Model and memory search",
-                            listOfNotNull(
-                                ModelCatalog.DISPLAY_NAME,
-                                (state as? LlmService.State.Ready)?.let { "running on ${it.backend}" },
-                            ).joinToString(" · "),
-                            onOpenModel,
-                        )
-                        ContextWindow(llmService, settings)
-                    }
                     SettingsSection.MEMORY -> MemorySettings(memory)
                     SettingsSection.ABOUT -> LicenceEntries()
-                    SettingsSection.TEST_BUILD -> TestBuildSettings()
                 }
                 }
                 Spacer(Modifier.height(32.dp))
@@ -224,15 +195,13 @@ fun SettingsScreen(
 @Composable
 private fun MainPage(
     settings: SettingsStore,
-    webSearchOn: Boolean,
     memory: MemoryViewModel,
     health: com.local.assistant.health.HealthSource,
     smsSync: com.local.assistant.inbox.SmsSync,
     liveCalls: com.local.assistant.live.LiveCalls,
     onSection: (SettingsSection) -> Unit,
     onOpenProfile: () -> Unit,
-    onOpenWebSearch: () -> Unit,
-    onOpenTour: () -> Unit,
+    onOpenMemorySearch: () -> Unit,
 ) {
     val context = LocalContext.current
     val healthAccess = rememberHealthAccess(health)
@@ -257,7 +226,7 @@ private fun MainPage(
         SettingsSection.VOICE.title,
         listOfNotNull(
             if (settings.speakReplies) "Answers out loud" else "Answers in text",
-            NaturalVoices.byId(settings.naturalVoice)?.name,
+            if (settings.murfReplies && liveCalls.available()) "Murf's voice" else NaturalVoices.byId(settings.naturalVoice)?.name,
             SettingsStore.SPEECH_RATES.firstOrNull { it.first == settings.speechRate }?.second?.let { "$it pace" },
         ).joinToString(" \u00b7 "),
     ) { onSection(SettingsSection.VOICE) }
@@ -267,96 +236,17 @@ private fun MainPage(
     SectionRow(Icons.Outlined.Call, SettingsSection.LIVE.title, liveSummary(settings, liveCalls)) { onSection(SettingsSection.LIVE) }
     SectionRow(
         Icons.Outlined.Memory,
-        SettingsSection.MODEL.title,
-        listOfNotNull(
-            ModelCatalog.DISPLAY_NAME,
-            "${settings.contextTokens / 1024}K window",
-        ).joinToString(" \u00b7 "),
-    ) { onSection(SettingsSection.MODEL) }
-    SectionRow(Icons.Outlined.Public, "Web search", if (webSearchOn) "On \u00b7 Tavily" else "Off \u00b7 add a Tavily key to turn it on", onOpenWebSearch)
+        "Photo and memory search",
+        "Optional \u00b7 finds photos by what's in them, earlier chats by meaning",
+        onOpenMemorySearch,
+    )
     SectionRow(
         Icons.Outlined.History,
         SettingsSection.MEMORY.title,
         if (paused) "Memory paused" else "Remembering \u00b7 " + if (retention == 0) "chats kept for good" else "chats kept for ${retentionLabel(retention)}",
     ) { onSection(SettingsSection.MEMORY) }
-    SectionRow(Icons.Outlined.Explore, "Take the tour", "What the assistant can do, in eight short pages", onOpenTour)
     SectionRow(Icons.Outlined.Info, SettingsSection.ABOUT.title, "The models, data and libraries the app uses, and their licences") { onSection(SettingsSection.ABOUT) }
-    if (WakeSamples.available(context)) {
-        SectionRow(Icons.Outlined.Science, SettingsSection.TEST_BUILD.title, "Wake word samples for training") { onSection(SettingsSection.TEST_BUILD) }
-    }
 }
-
-/**
- * The window the model runs with. 8K by default; more keeps longer chats in view, at the cost of
- * memory and a slower start. A size the phone can't hold falls back to 8K on its own.
- */
-@Composable
-private fun ContextWindow(llmService: LlmService, settings: SettingsStore) {
-    val active by llmService.activeContextTokens.collectAsStateWithLifecycle()
-    var pending by remember { mutableStateOf<Int?>(null) }
-    val chosen = settings.contextTokens
-
-    Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)) {
-        Text("Context window", style = MaterialTheme.typography.bodyLarge, color = AppColors.TextPrimary)
-        Text(
-            "How much of a chat the model keeps in view. Larger windows keep longer chats but use more memory and take longer to start.",
-            style = MaterialTheme.typography.bodySmall,
-            color = AppColors.TextSecondary,
-        )
-        for (tokens in SettingsStore.CONTEXT_CHOICES) {
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .selectable(selected = tokens == chosen, role = Role.RadioButton) { if (tokens != chosen) pending = tokens }
-                    .padding(vertical = 2.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                RadioButton(selected = tokens == chosen, onClick = null)
-                Column(Modifier.padding(start = 8.dp)) {
-                    Text(
-                        "${tokens / 1024}K tokens" + if (tokens == SettingsStore.DEFAULT_CONTEXT_TOKENS) " (default)" else "",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = AppColors.TextPrimary,
-                    )
-                    CONTEXT_NOTES[tokens]?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = AppColors.TextSecondary) }
-                }
-            }
-        }
-        if (settings.contextFellBack) {
-            Text(
-                "The larger window didn't fit on this phone, so the model is running at 8K.",
-                style = MaterialTheme.typography.bodySmall,
-                color = AppColors.Danger,
-            )
-        } else if (active > 0 && active != chosen) {
-            Text("Running at ${active / 1024}K until the model restarts.", style = MaterialTheme.typography.bodySmall, color = AppColors.TextSecondary)
-        }
-    }
-
-    pending?.let { tokens ->
-        AlertDialog(
-            onDismissRequest = { pending = null },
-            title = { Text("Use a ${tokens / 1024}K window?") },
-            text = {
-                Text(
-                    "The model restarts, which takes a few seconds, and any open chat is rebuilt. " + when {
-                        tokens > SettingsStore.DEFAULT_CONTEXT_TOKENS -> "If this phone can't hold it, the app goes back to 8K."
-                        tokens < SettingsStore.DEFAULT_CONTEXT_TOKENS -> "The assistant will see only the last exchange or two of a chat."
-                        else -> ""
-                    },
-                )
-            },
-            confirmButton = {
-                TextButton(onClick = {
-                    pending = null
-                    llmService.setContextTokens(tokens)
-                }) { Text("Restart the model") }
-            },
-            dismissButton = { TextButton(onClick = { pending = null }) { Text("Cancel") } },
-        )
-    }
-}
-
 /**
  * The ways to call the assistant up: the power button, the wake word, and whether either works
  * on the lock screen. Being the phone's assistant is the system's to grant, so this only says
@@ -380,7 +270,7 @@ private fun CallingSettings(settings: SettingsStore) {
         if (isAssistant) {
             "On. Press and hold the power button to talk."
         } else {
-            "Off. Tap, then choose Local Assistant as the digital assistant app."
+            "Off. Tap, then choose Luna as the digital assistant app."
         },
     ) { AssistantRole.openSettings(context) }
     if (!isAssistant) {
@@ -437,7 +327,7 @@ private fun CallingSettings(settings: SettingsStore) {
 
 /** How the assistant sounds: whether it answers aloud, in which voice, how fast. */
 @Composable
-private fun VoiceSettings(settings: SettingsStore, speaker: Speaker, voicePacks: List<VoicePackInstaller>) {
+private fun VoiceSettings(settings: SettingsStore, speaker: Speaker, voicePacks: List<VoicePackInstaller>, liveCalls: com.local.assistant.live.LiveCalls) {
     val context = LocalContext.current
     var speak by remember { mutableStateOf(settings.speakReplies) }
     SwitchRow(
@@ -447,6 +337,21 @@ private fun VoiceSettings(settings: SettingsStore, speaker: Speaker, voicePacks:
         onCheckedChange = {
             speak = it
             settings.speakReplies = it
+        },
+    )
+    var murf by remember { mutableStateOf(settings.murfReplies) }
+    SwitchRow(
+        "Speak in Murf's voice",
+        if (liveCalls.available()) {
+            "The voice Luna's calls use, made by Murf through Luna's server. Offline, the phone's own voice below speaks instead."
+        } else {
+            "Needs Luna's server (Live voice and family). Until then the phone's own voice below speaks."
+        },
+        checked = murf,
+        onCheckedChange = {
+            murf = it
+            settings.murfReplies = it
+            if (speak) speaker.preview()
         },
     )
 
@@ -767,7 +672,7 @@ private fun WakeWordSettings(settings: SettingsStore, onLockScreen: Boolean, rea
         }
         if (mode != WakeWordMode.OFF && !ready) {
             Text(
-                "Needs Local Assistant as the phone's digital assistant app. If it already is, pick another app there and then Local Assistant again: " +
+                "Needs Luna as the phone's digital assistant app. If it already is, pick another app there and then Luna again: " +
                     "Android only takes up the wake word when the choice is made.",
                 style = MaterialTheme.typography.bodySmall,
                 color = AppColors.Danger,
@@ -777,138 +682,6 @@ private fun WakeWordSettings(settings: SettingsStore, onLockScreen: Boolean, rea
         if (micRefused) {
             Text("The wake word needs the microphone. Allow it in the phone's settings for this app.", style = MaterialTheme.typography.bodySmall, color = AppColors.Danger)
         }
-    }
-}
-
-/** Test builds only: what they keep, and recording samples to train the wake word on the user's voice. */
-@Composable
-private fun TestBuildSettings() {
-    Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)) {
-        Text(
-            "Each wake word try is kept on the phone, so the wake word can be tuned to your voice.",
-            style = MaterialTheme.typography.bodySmall,
-            color = AppColors.TextSecondary,
-        )
-        WakeSampleRecorder()
-    }
-}
-
-/**
- * Test builds: record "Hey Luna" over and over, or ordinary talk, to train a wake word model on
- * the user's voice (wake/WakeSamples). The screen stays on while it records, since putting the
- * phone down across the room is part of it.
- */
-@Composable
-private fun WakeSampleRecorder() {
-    val context = LocalContext.current
-    val view = androidx.compose.ui.platform.LocalView.current
-    val scope = rememberCoroutineScope()
-    var kind by remember { mutableStateOf(WakeSamples.Kind.PHRASE) }
-    var place by remember { mutableStateOf(WakeSamples.Place.CLOSE) }
-    var job by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
-    var summary by remember { mutableStateOf(WakeSamples.summary(context)) }
-    var confirmDelete by remember { mutableStateOf(false) }
-    val progress by WakeSamples.progress.collectAsStateWithLifecycle()
-    val recording = job?.isActive == true
-    androidx.compose.runtime.DisposableEffect(recording) {
-        view.keepScreenOn = recording
-        onDispose { view.keepScreenOn = false }
-    }
-    fun start() {
-        job = scope.launch {
-            try {
-                WakeSamples.record(context, kind, place)
-            } finally {
-                summary = WakeSamples.summary(context)
-                job = null
-            }
-        }
-    }
-    val micPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted -> if (granted) start() }
-    @Composable
-    fun <T> Chips(options: List<T>, chosen: T, label: (T) -> String, onPick: (T) -> Unit) {
-        Row(Modifier.padding(top = 6.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            for (option in options) {
-                FilterChip(
-                    selected = option == chosen,
-                    enabled = !recording,
-                    onClick = { onPick(option) },
-                    label = { Text(label(option)) },
-                    colors = FilterChipDefaults.filterChipColors(
-                        containerColor = Glass.Raised,
-                        labelColor = AppColors.TextPrimary,
-                        selectedContainerColor = AppColors.Accent,
-                        selectedLabelColor = AppColors.OnAccent,
-                    ),
-                )
-            }
-        }
-    }
-    Column(Modifier.padding(top = 12.dp)) {
-        Text("Samples for training", style = MaterialTheme.typography.bodyMedium, color = AppColors.TextPrimary)
-        Text(
-            "To train a \u201c${WakeWord.PHRASE}\u201d model on your voice. Each session is kept in the app's files until you delete it here.",
-            style = MaterialTheme.typography.bodySmall,
-            color = AppColors.TextSecondary,
-        )
-        Chips(WakeSamples.Kind.entries, kind, { if (it == WakeSamples.Kind.PHRASE) WakeWord.PHRASE else "Normal talk" }) { kind = it }
-        Chips(WakeSamples.Place.entries, place, { it.label }) { place = it }
-        Text(
-            when (kind) {
-                WakeSamples.Kind.PHRASE -> "Say \u201c${WakeWord.PHRASE}\u201d, wait a second or two, and say it again, as many times as you like (up to 3 minutes). Vary it: fast, slow, quiet, tired, as you'd really say it."
-                WakeSamples.Kind.TALK -> "Talk as you normally would: chat, read something aloud, take a call on speaker. Don't say \u201c${WakeWord.PHRASE}\u201d."
-            },
-            style = MaterialTheme.typography.bodySmall,
-            color = AppColors.TextSecondary,
-            modifier = Modifier.padding(top = 6.dp),
-        )
-        Row(Modifier.padding(top = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-            OutlinedButton(onClick = {
-                if (recording) {
-                    job?.cancel()
-                } else {
-                    val granted = context.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) == android.content.pm.PackageManager.PERMISSION_GRANTED
-                    if (granted) start() else micPermission.launch(android.Manifest.permission.RECORD_AUDIO)
-                }
-            }) { Text(if (recording) "Stop" else "Start recording") }
-            progress?.let { p ->
-                Text(
-                    "%d:%02d".format(p.seconds / 60, p.seconds % 60) + when (kind) {
-                        WakeSamples.Kind.PHRASE -> " \u00b7 ${p.said} said \u00b7 heard ${p.heard}"
-                        WakeSamples.Kind.TALK -> " \u00b7 ${if (p.heard > 0) "woke by mistake ${p.heard}\u00d7" else "no false wakes"}"
-                    },
-                    style = MaterialTheme.typography.bodySmall,
-                    color = AppColors.TextPrimary,
-                    modifier = Modifier.padding(start = 12.dp),
-                )
-            }
-        }
-        progress?.let { p -> LinearProgressIndicator(progress = { p.level }, modifier = Modifier.fillMaxWidth().padding(top = 4.dp)) }
-        Text(
-            "Saved: ${summary.phrases} \u00d7 \u201c${WakeWord.PHRASE}\u201d in ${summary.phraseSessions} sessions, " +
-                "%d:%02d of normal talk.".format(summary.talkSeconds / 60, summary.talkSeconds % 60),
-            style = MaterialTheme.typography.bodySmall,
-            color = AppColors.TextSecondary,
-            modifier = Modifier.padding(top = 6.dp),
-        )
-        if (!recording && (summary.phraseSessions > 0 || summary.talkSeconds > 0)) {
-            TextButton(onClick = { confirmDelete = true }, contentPadding = PaddingValues(0.dp)) { Text("Delete all samples", color = AppColors.Danger) }
-        }
-    }
-    if (confirmDelete) {
-        AlertDialog(
-            onDismissRequest = { confirmDelete = false },
-            title = { Text("Delete all samples?") },
-            text = { Text("Every recording made here goes, and can't be brought back.") },
-            confirmButton = {
-                TextButton(onClick = {
-                    WakeSamples.deleteAll(context)
-                    summary = WakeSamples.summary(context)
-                    confirmDelete = false
-                }) { Text("Delete", color = AppColors.Danger) }
-            },
-            dismissButton = { TextButton(onClick = { confirmDelete = false }) { Text("Keep them") } },
-        )
     }
 }
 
@@ -951,7 +724,7 @@ private fun LicenceEntries() {
         }
     }
     Entry(
-        "Local Assistant",
+        "Luna",
         "Free software under the GNU General Public License v3: you may use, change and share it " +
             "under that licence. The source code of every version is public.",
         listOf(
@@ -960,9 +733,10 @@ private fun LicenceEntries() {
         ),
     )
     Entry(
-        "Gemma 4 E4B (the assistant)",
-        "By Google, in LiteRT-LM format. Apache License 2.0.",
-        listOf("Apache License 2.0" to "https://www.apache.org/licenses/LICENSE-2.0"),
+        "Luna's replies and voice",
+        "Written by Google's Gemini, spoken by Murf, with calls carried by Agora's Conversational AI, " +
+            "all through Luna's server. Nothing of this runs on the phone, and their own terms apply.",
+        emptyList(),
     )
     Entry(
         "EmbeddingGemma 2 (memory and photo search)",

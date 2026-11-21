@@ -89,12 +89,7 @@ class SessionEndWorker(context: Context, params: WorkerParameters) : CoroutineWo
     override suspend fun doWork(): Result {
         val container = applicationContext.appContainer
         val ended = container.sessionSummaries.endQuietSessions()
-        // Only an engine still in memory: loading gigabytes for a paragraph can wait for the charger.
-        val pending = container.sessionSummaries.summarisePending(
-            deadline = System.currentTimeMillis() + BackgroundJobs.RUN_BUDGET_MS,
-            loadModel = false,
-        )
-        Log.i(TAG, "Ended $ended sessions; $pending summaries left for the nightly job")
+        Log.i(TAG, "Ended $ended sessions")
         return Result.success()
     }
 
@@ -115,7 +110,7 @@ class NightlyWorker(context: Context, params: WorkerParameters) : CoroutineWorke
         }
         val container = applicationContext.appContainer
         val deadline = System.currentTimeMillis() + BackgroundJobs.RUN_BUDGET_MS
-        // Memory first; the photos only once it is done and the chat model has been let go.
+        // Memory first; the photos only once it is done and memory search's model has been let go.
         val finished = container.consolidation.run(deadline) && container.galleryIndex.indexUntil(deadline)
         if (!finished) container.backgroundJobs.continueNightly()
         return Result.success()
@@ -127,19 +122,17 @@ class NightlyWorker(context: Context, params: WorkerParameters) : CoroutineWorke
 }
 
 /**
- * The nightly steps, in order. Each keeps its own place — the embedding backlog and pending
- * summaries by their state in the database, extraction by its watermark — so running this again
- * after an interruption repeats nothing.
+ * The nightly steps, in order. Each keeps its own place (the embedding backlog by its state in the
+ * database), so running this again after an interruption repeats nothing.
  */
 class Consolidation(
     private val embeddings: EmbeddingQueue,
     private val sessions: com.local.assistant.memory.summary.SessionSummaries,
-    private val extractor: com.local.assistant.memory.extract.Extractor,
     private val memory: com.local.assistant.memory.db.MemoryRepository,
     private val database: com.local.assistant.data.db.AppDatabase,
     private val retentionDays: () -> Int,
     private val applyRetention: suspend (Int) -> Int,
-    /** Frees the chat model afterwards if nobody is using the app. */
+    /** Frees memory search's model afterwards if nobody is using the app. */
     private val releaseModel: suspend () -> Unit,
     /** Removes saved-image files whose note was deleted; returns how many. */
     private val pruneSavedImages: suspend () -> Int = { 0 },
@@ -161,8 +154,7 @@ class Consolidation(
                 .onFailure { Log.w(TAG, "Tidying the kept messages failed", it) }
             embeddings.drainNow()
             sessions.endQuietSessions()
-            if (sessions.summarisePending(deadline, loadModel = true) > 0) return false
-            if (!extractor.run(deadline)) return false
+            if (clock() > deadline) return false
             memory.normalizeAttributes()
             val merged = memory.mergeCertainAliases()
             if (merged > 0) Log.i(TAG, "Merged $merged facts under their canonical names")

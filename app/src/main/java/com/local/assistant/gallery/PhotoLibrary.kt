@@ -371,7 +371,7 @@ class PhotoLibrary(private val context: Context) {
         private const val SQL_BATCH = 500
 
         /** The app's package names: the first install's, the Play one, and its debug and demo builds. */
-        val OWN_PACKAGES = listOf("com.local.assistant", "com.taslim.localassistant", "com.taslim.localassistant.dev", "com.taslim.localassistant.demo")
+        val OWN_PACKAGES = listOf("com.local.assistant", "com.taslim.localassistant", "com.taslim.localassistant.dev", "com.taslim.localassistant.demo", "com.taslim.luna", "com.taslim.luna.dev", "com.taslim.luna.demo")
 
         /** Its name as Samsung and Pixel put it in a screenshot's file name. */
         val OWN_LABELS = listOf("local assistant", "localassistant")

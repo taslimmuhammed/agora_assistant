@@ -51,7 +51,7 @@ class HealthPrivacyActivity : ComponentActivity() {
 
 /** What is read, when, and where it goes: nowhere. */
 internal val HEALTH_PRIVACY = listOf(
-    "Local Assistant reads your steps, distance, calories, heart rate, resting heart rate, sleep and workouts from Health " +
+    "Luna reads your steps, distance, calories, heart rate, resting heart rate, sleep and workouts from Health " +
         "Connect, where your phone's health apps and watch keep them, and only when you ask about them: “how many steps " +
         "today?”, “how did I sleep?”.",
     "It only reads. It never writes to Health Connect or changes anything there.",

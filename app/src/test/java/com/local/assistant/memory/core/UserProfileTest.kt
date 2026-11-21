@@ -3,7 +3,6 @@ package com.local.assistant.memory.core
 import com.local.assistant.memory.db.FactEntity
 import com.local.assistant.memory.db.FactOrigin
 import com.local.assistant.memory.prompt.HeuristicTokenEstimator
-import com.local.assistant.memory.prompt.Instructions
 import com.local.assistant.memory.prompt.MemoryBudget
 import com.local.assistant.memory.prompt.PrefixInputs
 import com.local.assistant.memory.prompt.PromptAssembler
@@ -60,7 +59,7 @@ class UserProfileTest {
         )
         val profile = listOf(core("name", "Taslim"), core("age", "29"), core("job", "Software engineer"), core("city", "Kochi"), core("languages", "English, Malayalam"))
         val prefix = PromptAssembler(MemoryBudget.EIGHT_K, HeuristicTokenEstimator, ZoneId.of("Asia/Kolkata")).buildPrefix(
-            PrefixInputs(Instructions.render("You are a helpful assistant."), profile, null, LocalDate.of(2026, 9, 25), emptyList()),
+            PrefixInputs("You are a helpful assistant.", profile, null, LocalDate.of(2026, 9, 25), emptyList()),
         )
         assertTrue(prefix.text.startsWith("You are a helpful assistant."))
         assertTrue(CoreMemoryRenderer.HEADER in prefix.text)

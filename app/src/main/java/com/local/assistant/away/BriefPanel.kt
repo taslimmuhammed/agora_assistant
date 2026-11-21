@@ -134,7 +134,6 @@ fun BriefPanel(
     val sends by viewModel.sends.collectAsStateWithLifecycle()
     val drafts by viewModel.drafts.collectAsStateWithLifecycle()
     val listening by viewModel.listening.collectAsStateWithLifecycle()
-    val reading by viewModel.reading.collectAsStateWithLifecycle()
     val speaking by viewModel.speaking.collectAsStateWithLifecycle()
     val notice by viewModel.notice.collectAsStateWithLifecycle()
     val glass = remember(blurred) { Glass(blurred) }
@@ -175,7 +174,6 @@ fun BriefPanel(
     val energy = animateFloatAsState(
         targetValue = when {
             listening != null -> 0.55f + 0.45f * level.coerceIn(0f, 1f)
-            reading -> 0.95f
             speaking -> 0.8f
             else -> 0.3f
         },
@@ -215,7 +213,6 @@ fun BriefPanel(
                 awayMs = awayMs,
                 needCount = shown.needs.size,
                 energy = energy,
-                reading = reading,
                 speaking = speaking,
                 canSpeak = !shown.isEmpty,
                 glass = glass,
@@ -231,7 +228,6 @@ fun BriefPanel(
                         sends = sends,
                         drafts = drafts,
                         listening = listening,
-                        reading = reading,
                         glass = glass,
                         viewModel = viewModel,
                         onListen = listen,
@@ -317,7 +313,6 @@ private fun Header(
     awayMs: Long,
     needCount: Int,
     energy: State<Float>,
-    reading: Boolean,
     speaking: Boolean,
     canSpeak: Boolean,
     glass: Glass,
@@ -337,7 +332,7 @@ private fun Header(
             Modifier.fillMaxWidth().padding(start = 18.dp, end = 10.dp, top = 6.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Mark(energy, reading)
+            Mark(energy)
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
                 Text("While you were away", style = TitleStyle, color = Ink)
@@ -359,9 +354,9 @@ private fun Header(
     }
 }
 
-/** The app's dot, breathing; while the model reads, a small light circles it. */
+/** The app's dot, breathing. */
 @Composable
-private fun Mark(energy: State<Float>, reading: Boolean) {
+private fun Mark(energy: State<Float>) {
     val transition = rememberInfiniteTransition(label = "mark")
     val breath = transition.animateFloat(
         initialValue = 0.82f,
@@ -369,29 +364,10 @@ private fun Mark(energy: State<Float>, reading: Boolean) {
         animationSpec = infiniteRepeatable(tween(1300, easing = FastOutSlowInEasing), RepeatMode.Reverse),
         label = "breath",
     )
-    val orbit = transition.animateFloat(
-        initialValue = 0f,
-        targetValue = 360f,
-        animationSpec = infiniteRepeatable(tween(1100, easing = LinearEasing)),
-        label = "orbit",
-    )
     Canvas(Modifier.size(28.dp)) {
         val r = size.minDimension / 2
         drawCircle(Ink.copy(alpha = 0.1f + 0.1f * energy.value), radius = r * 0.78f * breath.value)
         drawCircle(Ink, radius = r * 0.32f)
-        if (reading) {
-            rotate(orbit.value) {
-                drawArc(
-                    color = Ink.copy(alpha = 0.7f),
-                    startAngle = 0f,
-                    sweepAngle = 70f,
-                    useCenter = false,
-                    topLeft = Offset(size.width / 2 - r * 0.92f, size.height / 2 - r * 0.92f),
-                    size = Size(r * 1.84f, r * 1.84f),
-                    style = Stroke(width = 1.6.dp.toPx(), cap = StrokeCap.Round),
-                )
-            }
-        }
     }
 }
 
@@ -411,7 +387,7 @@ private fun RoundButton(icon: ImageVector, label: String, background: Color, onC
 }
 
 @Composable
-private fun Headline(headline: String?, reading: Boolean, modifier: Modifier = Modifier) {
+private fun Headline(headline: String?, modifier: Modifier = Modifier) {
     Column(modifier.fillMaxWidth().padding(start = 6.dp, end = 6.dp, top = 2.dp, bottom = 2.dp)) {
         AnimatedContent(
             targetState = headline,
@@ -420,30 +396,6 @@ private fun Headline(headline: String?, reading: Boolean, modifier: Modifier = M
         ) { text ->
             if (text != null) Text(text, style = HeadlineStyle, color = Ink)
         }
-        AnimatedVisibility(visible = reading) {
-            ReadingLine(Modifier.padding(top = 6.dp))
-        }
-    }
-}
-
-/** "Reading your messages", with the dots going. */
-@Composable
-private fun ReadingLine(modifier: Modifier = Modifier) {
-    val transition = rememberInfiniteTransition(label = "reading")
-    val phase = transition.animateFloat(0f, 3f, infiniteRepeatable(tween(1200, easing = LinearEasing)), label = "phase")
-    Row(modifier, verticalAlignment = Alignment.CenterVertically) {
-        Canvas(Modifier.size(width = 22.dp, height = 8.dp)) {
-            repeat(3) { i ->
-                val lift = (1f - abs(phase.value - i - 0.5f).coerceAtMost(1f))
-                drawCircle(
-                    Ink.copy(alpha = 0.3f + 0.6f * lift),
-                    radius = 2.4.dp.toPx(),
-                    center = Offset(4.dp.toPx() + i * 7.dp.toPx(), size.height / 2 - lift * 2.dp.toPx()),
-                )
-            }
-        }
-        Spacer(Modifier.width(6.dp))
-        Text("Reading your messages and drafting replies", style = SmallStyle, color = Ink3)
     }
 }
 
@@ -456,7 +408,6 @@ private fun BriefList(
     sends: Map<String, BriefViewModel.Send>,
     drafts: Map<String, String>,
     listening: BriefViewModel.Listening?,
-    reading: Boolean,
     glass: Glass,
     viewModel: BriefViewModel,
     onListen: (BriefItem) -> Unit,
@@ -474,7 +425,7 @@ private fun BriefList(
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         // Part of the list, so a long headline scrolls away rather than holding half the card.
-        item(key = "#headline") { Headline(shown.headline, reading, Modifier.animateItem()) }
+        item(key = "#headline") { Headline(shown.headline, Modifier.animateItem()) }
         if (shown.needs.isNotEmpty()) {
             item(key = "#needs") { SectionLabel("Needs you", shown.needs.size, Modifier.animateItem()) }
             itemsIndexed(shown.needs, key = { _, it -> it.key }) { index, item ->
@@ -486,7 +437,6 @@ private fun BriefList(
                         send = sends[item.key],
                         draft = drafts[item.key].orEmpty(),
                         listening = listening?.takeIf { it.key == item.key },
-                        reading = reading,
                         opened = opened[item.key] ?: false,
                         canReply = viewModel.canReply(item),
                         canCallBack = viewModel.canCallBack(item),
@@ -597,7 +547,6 @@ private fun NeedTile(
     send: BriefViewModel.Send?,
     draft: String,
     listening: BriefViewModel.Listening?,
-    reading: Boolean,
     opened: Boolean,
     canReply: Boolean,
     canCallBack: Boolean,
@@ -672,7 +621,6 @@ private fun NeedTile(
                     send = send,
                     draft = draft,
                     listening = listening,
-                    reading = reading,
                     canReply = canReply,
                     glass = glass,
                     onDraft = onDraft,
@@ -729,7 +677,6 @@ private fun ReplyArea(
     send: BriefViewModel.Send?,
     draft: String,
     listening: BriefViewModel.Listening?,
-    reading: Boolean,
     canReply: Boolean,
     glass: Glass,
     onDraft: (String) -> Unit,
@@ -780,7 +727,6 @@ private fun ReplyArea(
                         ) {
                             item.replies.forEach { reply -> Suggestion(reply, glass) { onSend(reply) } }
                         }
-                        reading && !item.read -> DraftingChips()
                     }
                     Spacer(Modifier.height(8.dp))
                     Composer(
@@ -815,36 +761,6 @@ private fun Suggestion(text: String, glass: Glass, onClick: () -> Unit) {
         Text(text, style = BodyStyle, color = Ink, maxLines = 3, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
         Spacer(Modifier.width(6.dp))
         Icon(Icons.AutoMirrored.Outlined.Send, contentDescription = null, tint = Ink3, modifier = Modifier.size(14.dp))
-    }
-}
-
-/** Where drafted replies will be, shimmering while the model writes them. */
-@Composable
-private fun DraftingChips() {
-    val transition = rememberInfiniteTransition(label = "drafting")
-    val sweep = transition.animateFloat(-1f, 2f, infiniteRepeatable(tween(1400, easing = LinearEasing)), label = "sweep")
-    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-        listOf(132.dp, 96.dp).forEach { width ->
-            Box(
-                Modifier
-                    .size(width = width, height = 34.dp)
-                    .clip(ChipShape)
-                    .drawWithCache {
-                        val base = Ink.copy(alpha = 0.06f)
-                        onDrawBehind {
-                            drawRect(base)
-                            val x = sweep.value * size.width
-                            drawRect(
-                                Brush.horizontalGradient(
-                                    listOf(Color.White.copy(alpha = 0f), Color.White.copy(alpha = 0.75f), Color.White.copy(alpha = 0f)),
-                                    startX = x - size.width * 0.5f,
-                                    endX = x + size.width * 0.5f,
-                                ),
-                            )
-                        }
-                    },
-            )
-        }
     }
 }
 

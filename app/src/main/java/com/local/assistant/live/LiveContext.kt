@@ -21,7 +21,7 @@ data class LiveContext(
     @SerializedName("time_zone") val timeZone: String,
     /** The phone's time when the call began, ISO with its offset: the server never guesses the zone. */
     val now: String,
-    /** "user" when she called Luna, "checkin" when Luna rang her about a dose. */
+    /** "user" when she called Luna, "checkin" when Luna rang her about a dose, "chat" for a typed message ([ServerChat]). */
     val purpose: String,
     @SerializedName("dose_id") val doseId: String? = null,
     /** On the lock screen: only [ToolCatalog.LOCKED] tools, and no memory, lists or health. */
@@ -47,6 +47,7 @@ data class LiveContext(
         const val LOCALE = "en-IN"
         const val PURPOSE_USER = "user"
         const val PURPOSE_CHECKIN = "checkin"
+        const val PURPOSE_CHAT = "chat"
 
         /**
          * Tools a call can't use: remember_image needs a picture sent in the chat, and a screenshot
@@ -61,16 +62,16 @@ data class LiveContext(
          * [declarations] (ToolCatalog's JSON) as the server takes them, without [EXCLUDED], and
          * with only [ToolCatalog.LOCKED] when [locked]: the same line the phone's own model keeps.
          */
-        fun deviceTools(declarations: List<String>, locked: Boolean): List<Map<String, Any?>> =
+        fun deviceTools(declarations: List<String>, locked: Boolean, excluded: Set<String> = EXCLUDED): List<Map<String, Any?>> =
             declarations.mapNotNull { json -> runCatching { gson.fromJson<Map<String, Any?>>(json, mapType) }.getOrNull() }
                 .filter { declaration ->
                     val name = declaration["name"] as? String ?: return@filter false
-                    name !in EXCLUDED && (!locked || name in ToolCatalog.LOCKED)
+                    name !in excluded && (!locked || name in ToolCatalog.LOCKED)
                 }
 
-        /** [rules] without the lines about [EXCLUDED] tools, which the call doesn't have. */
-        fun toolRules(rules: String): String =
-            rules.lines().filterNot { line -> EXCLUDED.any { it in line } }.joinToString("\n")
+        /** [rules] without the lines about [excluded] tools, which the call doesn't have. */
+        fun toolRules(rules: String, excluded: Set<String> = EXCLUDED): String =
+            rules.lines().filterNot { line -> excluded.any { it in line } }.joinToString("\n")
 
         /** The pinned lists, in full: what's in a list is otherwise only read when asked about. */
         fun pinnedLists(notes: List<UserNoteEntity>): List<ListContent> =
@@ -84,7 +85,7 @@ data class LiveContext(
  * own; the app's are wired in `AppContainer`.
  */
 class LiveContextBuilder(
-    /** [com.local.assistant.memory.prompt.ConversationManager.liveContext]. */
+    /** [com.local.assistant.memory.prompt.MemoryContext.liveContext]. */
     private val memory: suspend (chatId: Long?) -> String,
     /** ToolCatalog.declarations, for what is set up on this phone now. */
     private val declarations: () -> List<String>,
@@ -99,9 +100,14 @@ class LiveContextBuilder(
     private val clock: () -> Long = System::currentTimeMillis,
 ) {
 
-    /** [chatId]: the chat the call was started from, whose summary the memory then carries; null for none. */
+    /**
+     * [chatId]: the chat the call was started from, whose summary the memory then carries; null
+     * for none. A typed chat ([LiveContext.PURPOSE_CHAT]) has every tool: a photo to remember, a
+     * screenshot to take.
+     */
     suspend fun build(purpose: String, doseId: String?, locked: Boolean, chatId: Long? = null): LiveContext {
         val zone = zone()
+        val excluded = if (purpose == LiveContext.PURPOSE_CHAT) emptySet() else LiveContext.EXCLUDED
         val now = Instant.ofEpochMilli(clock()).atZone(zone)
         return LiveContext(
             userName = if (locked) null else userName(),
@@ -113,8 +119,8 @@ class LiveContextBuilder(
             memory = if (locked) "" else memory(chatId),
             lists = if (locked) emptyList() else LiveContext.pinnedLists(notes()),
             health = if (locked) null else health(),
-            toolRules = LiveContext.toolRules(rules()),
-            deviceTools = LiveContext.deviceTools(declarations(), locked),
+            toolRules = LiveContext.toolRules(rules(), excluded),
+            deviceTools = LiveContext.deviceTools(declarations(), locked, excluded),
             murfVoice = murfVoice()?.takeIf { it.isNotBlank() },
         )
     }

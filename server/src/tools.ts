@@ -104,6 +104,11 @@ async function messageFamily(args: Record<string, unknown>, { hub, whatsapp, now
   const elder = hub.elder()
   const to = text(args.to)
   const everyone = !to || /\b(every|everyone|everybody|all|family|sab|sabko)\b/i.test(to)
+  const group = hub.familyGroupChat()
+  const people = everyone ? familyRecipients(hub) : [hub.findMember(to, ['caregiver', 'family', 'provider'])].filter((m): m is Member => !!m)
+  if (!(everyone && group !== null) && !people.length) {
+    throw new ToolError(everyone ? 'No one in her family has a WhatsApp number saved yet.' : `No one called "${to}". Her family: ${familyList(hub)}.`)
+  }
   const event = hub.addEvent('message', `${urgent ? 'Urgent message' : 'Message'} to ${everyone ? 'the family' : to}: ${body}`, { urgent }, now.getTime())
   const message = urgent
     ? `🔴 *Urgent from ${elder.name}*, through Luna:\n\n${body}${elder.phone ? `\n\n📞 Call her: ${elder.phone}` : ''}`
@@ -111,22 +116,19 @@ async function messageFamily(args: Record<string, unknown>, { hub, whatsapp, now
   const options: Option[] = urgent ? [{ text: "👍 I'm on it", data: `ack:${event.id}` }] : []
 
   const told: string[] = []
-  const group = hub.familyGroupChat()
   if (everyone && group !== null) {
-    await send(whatsapp, group, message, options)
+    await send(whatsapp, group, message, options, true)
     told.push('the family group')
   } else {
-    const people = everyone ? familyRecipients(hub) : [hub.findMember(to, ['caregiver', 'family', 'provider'])].filter((m): m is Member => !!m)
-    if (!people.length) throw new ToolError(everyone ? 'No one in her family has a WhatsApp number saved yet.' : `No one called "${to}". Her family: ${familyList(hub)}.`)
     for (const person of people) {
-      await deliver(hub, whatsapp, person, message, options)
+      await deliver(hub, whatsapp, person, message, options, true)
       told.push(person.name)
     }
   }
   if (urgent) {
     for (const carer of hub.caregivers()) {
       if (told.includes(carer.name) || chatOf(carer) === null || told.includes('the family group')) continue
-      await deliver(hub, whatsapp, carer, message, options)
+      await deliver(hub, whatsapp, carer, message, options, true)
       told.push(carer.name)
     }
   }
@@ -213,20 +215,21 @@ const TASK_STATES = { open: 'no answer yet', accepted: 'said yes', done: 'done',
 const REQUEST_STATES = { sent: 'not confirmed yet', confirmed: 'confirmed', within_hour: 'confirmed, within the hour', another_time: 'asked for another time' }
 
 /** Sends to [member] on WhatsApp, or to the family group naming them when there's no number for them. */
-async function deliver(hub: Hub, whatsapp: WhatsApp | null, member: Member, message: string, options?: Option[]) {
+async function deliver(hub: Hub, whatsapp: WhatsApp | null, member: Member, message: string, options?: Option[], hers = false) {
   const chat = chatOf(member)
-  if (chat !== null) return { chatId: chat, messageId: await send(whatsapp, chat, message, options) }
+  if (chat !== null) return { chatId: chat, messageId: await send(whatsapp, chat, message, options, hers) }
   const group = hub.familyGroupChat()
   if (group !== null && member.role !== 'provider') {
-    return { chatId: group, messageId: await send(whatsapp, group, `*For ${member.name}*\n${message}`, options) }
+    return { chatId: group, messageId: await send(whatsapp, group, `*For ${member.name}*\n${message}`, options, hers) }
   }
   throw new ToolError(`There's no WhatsApp number for ${member.name}, so nothing was sent.`)
 }
 
-async function send(whatsapp: WhatsApp | null, chat: string, message: string, options?: Option[]): Promise<string> {
+/** [hers]: a message of hers ("Lakshmi, through Luna: …"), whose reactions are told to her. */
+async function send(whatsapp: WhatsApp | null, chat: string, message: string, options?: Option[], hers = false): Promise<string> {
   if (!whatsapp) throw new ToolError("WhatsApp isn't set up on the server, so nothing was sent.")
   try {
-    return await whatsapp.send(chat, message, options)
+    return await whatsapp.send(chat, message, options, { hers })
   } catch (e) {
     throw new ToolError(`The WhatsApp message couldn't be sent (${(e as Error).message}), so nothing went.`)
   }

@@ -1,7 +1,7 @@
 package com.local.assistant.files
 
+import com.local.assistant.gallery.IdField
 import com.local.assistant.gallery.PhotoPeriod
-import com.local.assistant.gallery.PhotoReader
 import com.local.assistant.memory.tools.ActionResult
 import com.local.assistant.memory.tools.AttachedDocument
 import com.local.assistant.memory.tools.FileRef
@@ -16,14 +16,13 @@ import java.util.Locale
 
 /**
  * read_file: files and folders on the phone found by name or kind, shown under the reply; with a
- * question, the best-matching document read and the question answered from it on its own
- * ([DocumentReader]), which ends the turn with that answer, as find_photos does with a photo.
+ * question, the best-matching document read and what of it bears on the question sent back with
+ * the result ([DocumentExcerpts]), for the model to answer from.
  */
 class FileTools(
     private val find: suspend (asked: String, type: FileNames.Type, period: PhotoPeriod.Range?) -> List<FileFinder.Found>,
     private val folders: suspend (asked: String) -> List<FileFinder.Folder>,
     private val read: suspend (FileFinder.Found) -> DocumentText.Read,
-    private val reader: DocumentReader,
     private val now: () -> ZonedDateTime,
     /** All files access is given. */
     private val ready: () -> Boolean,
@@ -88,13 +87,17 @@ class FileTools(
             "found" to found.size,
             "files" to found.map { describe(it) },
         )
-        var reply: String? = null
         if (chosen != null) {
             onStep("Reading ${chosen.name}")
-            val text = read(chosen)
-            val answer = reader.answer(chosen.name, text, wanted, onStep)
-            reply = if (text is DocumentText.Read.Unreadable) answer else "From ${chosen.name}:\n\n$answer"
-            result["answered"] = "from ${chosen.name}, read on its own"
+            val excerpt = DocumentExcerpts.of(chosen.name, read(chosen), wanted)
+            if (excerpt.text != null) {
+                result["read"] = chosen.name
+                result["text"] = excerpt.text
+                notes += "Answer \"$wanted\" from the text of ${chosen.name} above, naming it, and copy names, numbers, dates and amounts exactly as written. " +
+                    "If it doesn't say, say so in a few words." + (excerpt.note?.let { " $it" } ?: "")
+            } else {
+                notes += excerpt.note ?: "Couldn't read ${chosen.name} just now."
+            }
         } else {
             notes += "The app shows them under your reply, and the user can tap one to open it: say in one short sentence what you found, naming the best match. Don't list them all, and don't say what's in them: you haven't read them."
         }
@@ -105,50 +108,17 @@ class FileTools(
             if (found.size == 1) found.first().name else "${found.size} files for \"$label\"",
             files = FileSet(label, found.map(::refOf), read = chosen?.name, readPath = chosen?.path),
         )
-        return ActionResult(result, chip, reply = reply)
-    }
-
-    /**
-     * A document attached to the user's message, read for [question], or summarised when there's
-     * none or it asks for that. The reply is the answer itself: the document is already shown
-     * with the message, so nothing is put under the reply.
-     */
-    internal suspend fun readAttached(document: AttachedDocument, question: String?, onStep: (String) -> Unit = {}): ActionResult {
-        val found = foundOf(document)
-        onStep("Reading ${found.name}")
-        val answer = reader.answer(found.name, read(found), question?.trim()?.takeIf { it.isNotEmpty() }, onStep)
-        return ActionResult(
-            linkedMapOf("ok" to true, "attached" to found.name, "answered" to "read on its own"),
-            reply = answer,
-        )
-    }
-
-    /**
-     * Notes on a document attached to a request to act on it ("remind me to pay this bill"): what
-     * it is and the names, amounts and dates the request needs, for the chat model to use with its
-     * tools ([DocumentReader.gist]). Kept as the call's result, so the chat's history has them.
-     */
-    internal suspend fun notesOnAttached(document: AttachedDocument, request: String): ActionResult {
-        val found = foundOf(document)
-        val text = read(found)
-        val notes = reader.gist(found.name, text, request)
-        val result = linkedMapOf<String, Any?>("ok" to true, "attached" to found.name)
-        if (notes != null) {
-            result["notes"] = notes
-        } else {
-            result["note"] = "Couldn't read it" + if (text is DocumentText.Read.Unreadable) ": ${text.why.said}." else " just now."
-        }
-        return ActionResult(result)
+        return ActionResult(result, chip)
     }
 
     /**
      * The ID number [field] asks for ("what's my PAN number?"), from a document named after its
      * card ("e-PAN.pdf", "EAadhaar_….pdf"): its text read here, in well under a second, and a
-     * number taken only when it has that number's shape and check digit ([PhotoReader.Field.valueIn]).
+     * number taken only when it has that number's shape and check digit ([IdField.valueIn]).
      * Pictures of pages are left to the photos. The ones locked with a password are named, so
      * the reply can say why they weren't read.
      */
-    internal suspend fun idNumber(field: PhotoReader.Field): IdFiles {
+    internal suspend fun idNumber(field: IdField): IdFiles {
         val names = ID_FILE_NAMES[field] ?: return IdFiles(null)
         if (!ready()) return IdFiles(null)
         val candidates = LinkedHashMap<String, FileFinder.Found>()
@@ -238,10 +208,10 @@ class FileTools(
 
         /** What a file holding each ID number is called by ("e-PAN", "EAadhaar_1234"); none for bank cards. */
         private val ID_FILE_NAMES = mapOf(
-            PhotoReader.Field.AADHAAR to listOf("aadhaar", "aadhar"),
-            PhotoReader.Field.PAN to listOf("pan"),
-            PhotoReader.Field.DRIVING_LICENCE to listOf("driving licence", "driving license", "licence", "license"),
-            PhotoReader.Field.PASSPORT to listOf("passport"),
+            IdField.AADHAAR to listOf("aadhaar", "aadhar"),
+            IdField.PAN to listOf("pan"),
+            IdField.DRIVING_LICENCE to listOf("driving licence", "driving license", "licence", "license"),
+            IdField.PASSPORT to listOf("passport"),
         )
 
         /** Where a document attached in the chat is, as the results and the list under the reply say. */
@@ -265,7 +235,7 @@ class FileTools(
         fun questionIn(userText: String): String? {
             val text = userText.trim()
             if (text.isEmpty()) return null
-            return text.takeIf { DocumentReader.Plan.isSummary(it) || ASKS_WHAT.containsMatchIn(it.lowercase(Locale.ROOT)) }
+            return text.takeIf { DocumentExcerpts.Plan.isSummary(it) || ASKS_WHAT.containsMatchIn(it.lowercase(Locale.ROOT)) }
         }
 
         /** "what does my lease say about pets", "what's the deposit in my rental agreement". */

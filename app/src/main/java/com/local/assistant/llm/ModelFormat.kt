@@ -14,8 +14,8 @@ import java.nio.ByteOrder
  * loaded at every launch, a wrong file imported once crashed the app at every launch after
  * (seen on the emulator, 2026-09-30). So a wrong file is refused here, with a message.
  *
- * The check is the start of the layout [ModelPrecision] reads: "LITERTLM", then at 24 where the
- * header ends, which has to lie inside the file. Every model the app uses has it: Gemma 4 E4B,
+ * The check is the start of the layout [ModelSections] reads: "LITERTLM", then at 24 where the
+ * header ends, which has to lie inside the file. Every model the app uses has it:
  * EmbeddingGemma 2 and Granite.
  *
  * A LiteRT-LM file of the wrong kind is just as fatal: handed an embedding model as the chat
@@ -28,10 +28,7 @@ object ModelFormat {
 
     /** What a file is to be used as, and the sections (`model_type`) that have to be in it. */
     enum class Kind(val wrongKind: String, vararg val sections: String) {
-        /** Gemma 4 E4B's text decoder; embedding models have none. */
-        CHAT("That's not a chat model: it can't write replies. Pick the Gemma model file.", "tf_lite_prefill_decode"),
-
-        /** An imported text embedder's encoder (Granite, say); chat models have none. */
+        /** An imported text embedder's encoder (Granite, say). */
         EMBEDDER("That's not a memory-search (embedding) model.", "tf_lite_text_encoder"),
 
         /** EmbeddingGemma 2's text and image encoders, for photo search; text-only embedders lack the second. */
@@ -41,7 +38,7 @@ object ModelFormat {
     /** Why [file] can't be used as [kind], or null when it can. */
     fun problem(file: File, kind: Kind): String? {
         if (!isLiteRtLm(file)) return NOT_A_MODEL
-        val sections = ModelPrecision.sectionTypes(file) ?: return NOT_A_MODEL
+        val sections = ModelSections.sectionTypes(file) ?: return NOT_A_MODEL
         return if (sections.containsAll(kind.sections.asList())) null else kind.wrongKind
     }
 

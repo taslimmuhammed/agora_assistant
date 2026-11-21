@@ -1,10 +1,6 @@
 package com.local.assistant.memory.tools
 
-import com.local.assistant.llm.ChatSession
-import com.local.assistant.llm.GenEvent
-import com.local.assistant.llm.PromptAttachment
 import com.local.assistant.llm.ToolCall
-import com.local.assistant.llm.ToolResult
 import com.local.assistant.memory.core.FactDecision
 import com.local.assistant.memory.core.FactKeys
 import com.local.assistant.memory.core.FactUpsertPolicy
@@ -30,6 +26,7 @@ import com.local.assistant.memory.notes.FoundImage
 import com.local.assistant.memory.notes.ImageNotes
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.runBlocking
 
 /** The memory store in plain maps, applying the same upsert policy as the real one. */
 class FakeMemoryStore(private val clock: () -> Long) : MemoryStore {
@@ -149,51 +146,38 @@ class FakeToolLog : ToolLog {
     override suspend fun update(id: Long, record: ToolRecord) { records[id] = record }
 }
 
+/** What one tool call gave back, as Luna's server reads it. */
+class SentResult(val name: String, val json: String)
+
+/** One message's tool calls, in the order Luna's server asked for them, and what each gave back. */
+class ToolTurn(val sentResults: List<List<SentResult>>)
+
+/** What the chat shows from a message's tool calls: their chips, then the reply. */
+sealed interface ToolEvent {
+    data class Text(val delta: String) : ToolEvent
+
+    data class Memory(val recordId: Long, val chip: MemoryChip, val tool: String? = null) : ToolEvent
+}
+
 /**
- * Plays the model: each send gets the next scripted list of events. Records what it was sent,
- * so a test can see the envelope and the tool results the model would have read.
+ * Runs [calls] through the real executor, one after another, as Luna's server has the phone do
+ * when its model calls them, and ends with [reply], or with the reply a tool wrote itself.
  */
-class ScriptedSession(private val script: ArrayDeque<List<GenEvent>>) : ChatSession {
-    val sentEnvelopes = mutableListOf<String>()
-    val sentResults = mutableListOf<List<ToolResult>>()
-
-    /** How many times the model was stopped mid-reply. */
-    var cancelled = 0
-
-    override val isAlive = true
-
-    override fun send(envelope: String, attachment: PromptAttachment?): Flow<GenEvent> {
-        sentEnvelopes += envelope
-        return next()
-    }
-
-    override fun sendToolResults(results: List<ToolResult>): Flow<GenEvent> {
-        sentResults += results
-        return next()
-    }
-
-    /** Stopped mid-reply, it ends as the runtime does: cancelled ("CANCELLED: Task cancelled"). */
-    private fun next(): Flow<GenEvent> {
-        val events = script.removeFirstOrNull() ?: listOf(GenEvent.Done(null))
-        val stoppedBefore = cancelled
-        return flow {
-            for (event in events) {
-                if (cancelled > stoppedBefore) throw kotlinx.coroutines.CancellationException("Task cancelled")
-                emit(event)
-            }
+fun ToolExecutor.play(calls: List<ToolCall>, context: ToolContext, reply: String = "Done."): Pair<ToolTurn, List<ToolEvent>> = runBlocking {
+    val events = mutableListOf<ToolEvent>()
+    val results = mutableListOf<SentResult>()
+    var written: String? = null
+    for (call in calls) {
+        val outcome = execute(call, context)
+        results += SentResult(call.name, outcome.result)
+        if (outcome.chip != null && outcome.recordId != null) events += ToolEvent.Memory(outcome.recordId, outcome.chip, call.name)
+        if (outcome.reply != null) {
+            written = outcome.reply
+            break
         }
     }
-
-    override fun tokenCount(): Int? = null
-    override fun cancel() {
-        cancelled++
-    }
-    override fun close() = Unit
-
-    companion object {
-        fun calls(vararg calls: ToolCall) = listOf(GenEvent.ToolCalls(calls.toList()), GenEvent.Done(null))
-        fun says(text: String) = listOf(GenEvent.TextDelta(text), GenEvent.Done(null))
-    }
+    events += ToolEvent.Text(written ?: reply)
+    ToolTurn(if (results.isEmpty()) emptyList() else listOf(results)) to events
 }
 
 /** Images by message: what `remember_image` can find, and what it saved. */

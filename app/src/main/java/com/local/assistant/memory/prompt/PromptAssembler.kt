@@ -1,40 +1,21 @@
 package com.local.assistant.memory.prompt
 
-import com.local.assistant.data.db.MessageEntity
-import com.local.assistant.data.db.Role
-import com.local.assistant.llm.ContextWindow
 import com.local.assistant.memory.core.CoreMemoryRenderer
-import com.local.assistant.memory.core.FactKeys
 import com.local.assistant.memory.core.FactLabels
-import com.local.assistant.memory.db.FactEntity
-import java.time.Duration
 import java.time.Instant
 import java.time.ZoneId
-import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
 import java.util.Locale
 
 /**
- * Builds the two halves of every prompt and keeps them inside [budget].
- *
- * **System prefix** (built only when a conversation is created, then byte-stable for its life):
- * A instructions, B core memory, C summary, D agenda.
- *
- * **Envelope** (the user message, every turn): E the current time — only when it has moved on —
- * then F facts and snippets recalled for this turn, then G the user's own words.
- *
- * Anything that changes per turn goes in the envelope; the prefix never contains the time of
- * day, so the conversation's KV cache survives from one turn to the next.
- *
- * When the whole does not fit, parts are shed in a fixed order: snippets, then facts, then the
- * summary, then the oldest verbatim turns, then core memory by priority (keeping preferences).
+ * Builds what a live call is told of the user ([com.local.assistant.live.LiveContext]), within
+ * [budget]: B core memory, C the last summary, D the agenda and the names of their notes, after
+ * any A instructions.
  */
 class PromptAssembler(
     private val budget: MemoryBudget,
     private val estimator: TokenEstimator,
     private val zone: ZoneId,
-    /** What one image costs, as reported by the model. */
-    private val visionTokensPerImage: Int = DEFAULT_VISION_TOKENS,
 ) {
 
     private val coreRenderer = CoreMemoryRenderer(estimator)
@@ -119,300 +100,6 @@ class PromptAssembler(
         return if (item.allDay) DAY.format(time) else DAY_TIME.format(time)
     }
 
-    // ---- Envelope (E–G) ----
-
-    /** Whether "Now" has to be repeated: first turn, a new day, or [MemoryBudget.nowRefreshMinutes] on. */
-    fun shouldShowNow(lastShown: ZonedDateTime?, now: ZonedDateTime): Boolean =
-        lastShown == null ||
-            lastShown.toLocalDate() != now.toLocalDate() ||
-            Duration.between(lastShown, now).toMinutes() >= budget.nowRefreshMinutes
-
-    /**
-     * The user turn as the model receives it. [EnvelopeInputs.userText] is never trimmed or
-     * dropped; everything above it is held to [MemoryBudget.envelopeCap].
-     */
-    fun buildEnvelope(inputs: EnvelopeInputs): Envelope {
-        val nowLine = if (inputs.showNow) "[Now: ${NOW.format(inputs.now)}]" else null
-
-        val facts = inputs.facts.take(budget.maxEnvelopeFacts)
-        val snippets = mutableListOf<String>()
-        val keptSnippets = mutableListOf<Snippet>()
-        var snippetTokens = 0
-        for (snippet in inputs.snippets.take(budget.maxSnippets)) {
-            val line = renderSnippet(snippet)
-            val cost = estimator.estimate(line)
-            if (snippetTokens + cost > budget.snippetsCap) break
-            snippetTokens += cost
-            snippets += line
-            keptSnippets += snippet
-        }
-        val imageLine = inputs.savedImage?.let(::renderSavedImage)
-        val photosLine = renderPhotos(inputs.photos) ?: SEARCH_PHOTOS.takeIf { inputs.asksForPhotos }
-        val (noteLines, keptNotes) = renderNotes(inputs.notes)
-
-        // Hold the app-added part to its cap: snippets go before facts. The image line has its
-        // own allowance ([MemoryBudget.savedImageTokens]) on top: the user asked for it to be kept.
-        var keptFacts = facts
-        fun header() = listOfNotNull(nowLine, renderFacts(keptFacts)) + snippets
-        while (estimator.estimate(header().joinToString("\n")) > budget.envelopeCap) {
-            when {
-                snippets.isNotEmpty() -> {
-                    snippets.removeAt(snippets.lastIndex)
-                    keptSnippets.removeAt(keptSnippets.lastIndex)
-                }
-                keptFacts.isNotEmpty() -> keptFacts = keptFacts.dropLast(1)
-                else -> break
-            }
-        }
-
-        val screenLine = SCREEN.takeIf { inputs.screen }
-        val said = if (inputs.heard) heard(inputs.userText) else inputs.userText
-        val text = (header() + inputs.doneByApp + noteLines + listOfNotNull(imageLine, photosLine, screenLine) + said).joinToString("\n")
-        val attachments = inputs.attachmentTokens +
-            (if (inputs.screen) visionTokensPerImage else 0) +
-            (if (imageLine != null && inputs.savedImage.attached) visionTokensPerImage else 0) +
-            inputs.photos.count { it.attached } * visionTokensPerImage
-        return Envelope(
-            text = text,
-            tokens = estimator.estimate(text) + attachments + ContextWindow.TURN_OVERHEAD_TOKENS,
-            facts = keptFacts,
-            snippets = keptSnippets,
-            showedNow = nowLine != null,
-            savedImage = inputs.savedImage.takeIf { imageLine != null },
-            photos = inputs.photos,
-            notes = keptNotes,
-        )
-    }
-
-    /**
-     * The notes' lines, within [MemoryBudget.noteTokens] together: each whole if it fits, else the
-     * parts that matched, cut short if even they don't. One already in the conversation as it is
-     * now is only pointed at. The lines, and the notes that made it in.
-     */
-    private fun renderNotes(notes: List<NoteLine>): Pair<List<String>, List<NoteLine>> {
-        val lines = mutableListOf<String>()
-        val kept = mutableListOf<NoteLine>()
-        var room = budget.noteTokens
-        for (note in notes) {
-            val line = renderNote(note, room) ?: break
-            room -= estimator.estimate(line)
-            lines += line
-            kept += note
-        }
-        return lines to kept
-    }
-
-    /** "[List “Shopping list” (list 3): Milk; Eggs (ticked); Bread]"; null when not even its name fits in [room]. */
-    private fun renderNote(note: NoteLine, room: Int): String? {
-        val kind = if (note.list) "List" else "Note"
-        val head = "[$kind “${FactLabels.inline(note.title)}” (${kind.lowercase(Locale.ROOT)} ${note.id})"
-        val separator = if (note.list) "; " else " / "
-        fun joined(lines: List<String>) = lines.joinToString(separator) { FactLabels.inline(it) }
-        // Each as the opening and what follows it.
-        val candidates = when {
-            note.shownAbove -> listOf("$head: " to "as shown above, unchanged.")
-            note.whole.isEmpty() -> listOf("$head: " to "empty")
-            else -> listOfNotNull(
-                "$head: " to joined(note.whole),
-                note.matched.takeIf { it.isNotEmpty() && it.size < note.whole.size }?.let { "$head, the part about this (more in it): " to joined(it) },
-            )
-        }
-        candidates.map { (open, body) -> "$open$body]" }.firstOrNull { estimator.estimate(it) <= room }?.let { return it }
-        // Even the matched part is too long: as much of it as fits.
-        val (open, body) = candidates.last()
-        val cut = truncateToTokens(body, room - estimator.estimate("$open]"))
-        return if (cut.isEmpty()) null else "$open$cut]"
-    }
-
-    /**
-     * What the model is told about [photos]: that they're the user's own, already found for this
-     * message, and to leave them unmentioned when they aren't about it (they're found for every
-     * question). Told only "may be about this message", it searched the photos again every time
-     * (4 of 4 on the phone), and once answered only "I found one photo related to…".
-     */
-    private fun renderPhotos(photos: List<PhotoLine>): String? {
-        if (photos.isEmpty()) return null
-        val each = photos.mapIndexed { i, photo ->
-            val taken = photo.takenAt?.let { " taken ${SNIPPET_DATE.format(Instant.ofEpochMilli(it).atZone(zone))}" }.orEmpty()
-            val where = if (photo.attached) "attached" else "attached earlier in this chat; look at it again"
-            "${i + 1}.$taken ($where)"
-        }
-        return "[Photos from the user's own gallery, already found for this message: ${each.joinToString("; ")}. " +
-            "If they show the answer, answer from them directly, saying it's from their photos; no need to search the photos again. " +
-            "If they don't, don't mention them.]"
-    }
-
-    /** "[Saved image (21 Sep 2026) “Dr. Mehta's card”: … It is attached to this message.]" */
-    private fun renderSavedImage(image: SavedImageLine): String {
-        val date = SNIPPET_DATE.format(Instant.ofEpochMilli(image.at).atZone(zone))
-        val head = "[Saved image ($date) “${FactLabels.inline(image.title)}”: "
-        val tail = if (image.attached) " It is attached to this message.]" else " It is attached earlier in this chat; look at it again.]"
-        val room = budget.savedImageTokens - estimator.estimate(head + tail)
-        return head + truncateToTokens(FactLabels.inline(image.details), room) + tail
-    }
-
-    private fun renderFacts(facts: List<FactEntity>): String? {
-        if (facts.isEmpty()) return null
-        return facts.joinToString(separator = "; ", prefix = "[Memory: ", postfix = "]") { fact ->
-            val attribute = FactLabels.attribute(fact.attribute)
-            val label = if (fact.subject == FactKeys.USER) attribute else "${fact.subject.replace('_', ' ')} $attribute"
-            "$label: ${FactLabels.inline(fact.value)}"
-        }
-    }
-
-    private fun renderSnippet(snippet: Snippet): String {
-        val date = Instant.ofEpochMilli(snippet.at).atZone(zone)
-        val heading = "[Memory (${SNIPPET_DATE.format(date)}): "
-        val body = truncateToTokens(FactLabels.inline(snippet.text), budget.snippetTokens - estimator.estimate(heading))
-        return "$heading$body]"
-    }
-
-    // ---- History ----
-
-    /** What one stored message costs in the conversation, attachments and turn markers included. */
-    fun historyCost(message: MessageEntity): Int {
-        val text = if (message.tokenEst > 0 || message.text.isEmpty()) {
-            message.tokenEst
-        } else {
-            estimator.estimate(message.text)
-        }
-        return text + ContextWindow.attachmentTokens(message, visionTokensPerImage) +
-            ContextWindow.TURN_OVERHEAD_TOKENS
-    }
-
-    /**
-     * The newest whole turns that fit both [maxTurns] and [budgetTokens]. A window always starts
-     * at a user message, so the model never sees a reply without the question that prompted it.
-     */
-    fun selectHistory(
-        history: List<MessageEntity>,
-        maxTurns: Int = budget.maxVerbatimTurns,
-        budgetTokens: Int = budget.historyCap,
-    ): HistorySelection {
-        var start = history.size
-        var tokens = 0
-        var turns = 0
-        var end = history.lastIndex
-        while (end >= 0 && turns < maxTurns) {
-            var turnStart = end
-            while (turnStart > 0 && history[turnStart].role != Role.USER) turnStart--
-            val cost = (turnStart..end).sumOf { historyCost(history[it]) }
-            if (tokens + cost > budgetTokens) break
-            tokens += cost
-            turns++
-            start = turnStart
-            end = turnStart - 1
-        }
-        return HistorySelection(history.subList(start, history.size), start, tokens)
-    }
-
-    // ---- Whole prompt ----
-
-    /**
-     * A prompt for a freshly built conversation that fits [MemoryBudget.promptCeiling], shedding
-     * in the fixed order until it does. If even the unsheddable minimum — instructions,
-     * preferences, the user's words — is over, the plan is returned anyway: refusing to answer
-     * would be worse than a long prompt, and the window still has headroom.
-     */
-    fun plan(
-        prefixInputs: PrefixInputs,
-        history: List<MessageEntity>,
-        envelopeInputs: EnvelopeInputs,
-        toolTokens: Int,
-    ): PromptPlan {
-        val shed = mutableListOf<ShedStep>()
-        var snippets = envelopeInputs.snippets
-        var facts = envelopeInputs.facts
-        var image = envelopeInputs.savedImage
-        var photos = envelopeInputs.photos
-        var notes = envelopeInputs.notes
-        var summaryCap = summaryCapFor(prefixInputs.summary)
-        var maxTurns = budget.maxVerbatimTurns
-        var coreCap = budget.coreCap
-
-        while (true) {
-            val envelope = buildEnvelope(envelopeInputs.copy(facts = facts, snippets = snippets, savedImage = image, photos = photos, notes = notes))
-            // Shedding inside buildEnvelope already applied; carry its result forward.
-            snippets = envelope.snippets
-            facts = envelope.facts
-            notes = envelope.notes
-
-            val prefix = buildPrefix(prefixInputs, coreCap = coreCap, summaryCap = summaryCap)
-            val rolling = if (prefixInputs.summary?.kind == SummaryBlock.Kind.EARLIER_IN_CHAT) prefix.summaryTokens else 0
-            val selection = selectHistory(history, maxTurns, budget.historyCap - rolling)
-            val plan = PromptPlan(prefix, selection, envelope, toolTokens, shed.toList())
-            if (plan.totalTokens <= budget.promptCeiling) return plan
-
-            val turnsKept = selection.messages.count { it.role == Role.USER }
-            when {
-                snippets.isNotEmpty() -> {
-                    snippets = snippets.dropLast(1)
-                    shed.addOnce(ShedStep.SNIPPETS)
-                }
-                photos.isNotEmpty() -> {
-                    photos = photos.dropLast(1)
-                    shed.addOnce(ShedStep.PHOTOS)
-                }
-                facts.isNotEmpty() -> {
-                    facts = facts.dropLast(1)
-                    shed.addOnce(ShedStep.FACTS)
-                }
-                notes.isNotEmpty() -> {
-                    notes = notes.dropLast(1)
-                    shed.addOnce(ShedStep.NOTES)
-                }
-                image != null -> {
-                    image = null
-                    shed.addOnce(ShedStep.IMAGE)
-                }
-                prefix.summaryTokens > 0 -> {
-                    // Halve what is actually there; a summary too short to halve usefully goes.
-                    val half = prefix.summaryTokens / 2
-                    summaryCap = if (half > MIN_SUMMARY_TOKENS) half else 0
-                    shed.addOnce(ShedStep.SUMMARY)
-                }
-                turnsKept > 0 -> {
-                    maxTurns = turnsKept - 1
-                    shed.addOnce(ShedStep.HISTORY)
-                }
-                prefix.core.included.isNotEmpty() && coreCap > 0 -> {
-                    coreCap = (minOf(coreCap, prefix.core.tokens) - CORE_STEP_TOKENS).coerceAtLeast(0)
-                    shed.addOnce(ShedStep.CORE)
-                }
-                else -> return plan
-            }
-        }
-    }
-
-    /**
-     * The envelope for a turn on a live conversation already holding [liveTokens] (the runtime's
-     * real count). Only the envelope can shed here — the rest is already in the KV cache — so a
-     * null result means the conversation itself has to be rebuilt smaller before sending.
-     */
-    fun fitEnvelope(liveTokens: Int, inputs: EnvelopeInputs): Envelope? {
-        var snippets = inputs.snippets
-        var facts = inputs.facts
-        var image = inputs.savedImage
-        var photos = inputs.photos
-        var notes = inputs.notes
-        while (true) {
-            val envelope = buildEnvelope(inputs.copy(facts = facts, snippets = snippets, savedImage = image, photos = photos, notes = notes))
-            if (liveTokens + envelope.tokens <= budget.promptCeiling) return envelope
-            snippets = envelope.snippets
-            facts = envelope.facts
-            notes = envelope.notes
-            when {
-                snippets.isNotEmpty() -> snippets = snippets.dropLast(1)
-                // A photo costs as much as several snippets; the least likely goes first.
-                photos.isNotEmpty() -> photos = photos.dropLast(1)
-                facts.isNotEmpty() -> facts = facts.dropLast(1)
-                notes.isNotEmpty() -> notes = notes.dropLast(1)
-                image != null -> image = null
-                else -> return null
-            }
-        }
-    }
-
     /** Cuts [text] at a word boundary so it fits [capTokens], marking the cut with an ellipsis. */
     fun truncateToTokens(text: String, capTokens: Int): String {
         if (capTokens <= 0) return ""
@@ -428,45 +115,11 @@ class PromptAssembler(
         return if (atWord.isEmpty()) "" else "$atWord…"
     }
 
-    private fun <T> MutableList<T>.addOnce(item: T) {
-        if (item !in this) add(item)
-    }
-
     companion object {
-        /**
-         * Before a message asking to see photos. Late in a chat the model answered such requests
-         * from an earlier search instead of searching (1 Nov 2026): "I found 3 photos of you at a
-         * wedding" for "show all the photos of wedding", with nothing shown.
-         */
-        const val SEARCH_PHOTOS = "[They ask to see photos: call find_photos for this message; only that shows them, " +
-            "even if an earlier search was like it.]"
-
-        /**
-         * Before a message sent from the assistant over another app, with the screenshot of it.
-         * Told nothing, the model read a news page fine but had no way to know it was the screen
-         * the user meant by "this" (MultiStepEvalTest).
-         */
-        const val SCREEN = "[The image is a screenshot of the screen they were on when they called you: \"this\" means what's on it.]"
-
-        /**
-         * A voice message's words, sent with its recording (`ContextWindow.heard`): what the
-         * phone wrote down, marked as a hearing that can be wrong. As the words alone, the model
-         * took them for the user's own and, with the recording, once saved the user's name as
-         * "Uma" from "and Uma"; with this line it asked what they meant (VoiceInputEvalTest).
-         */
-        fun heard(words: String) =
-            "[The phone's speech recogniser wrote this voice message down as: \"$words\". It may have misheard a name or a number.]"
-
-        const val DEFAULT_VISION_TOKENS = 256
-
         const val NOTES_HEADING = "Notes and lists: "
-        private const val MIN_SUMMARY_TOKENS = 50
-        private const val CORE_STEP_TOKENS = 100
 
-        private val NOW = DateTimeFormatter.ofPattern("EEE d MMM yyyy, HH:mm", Locale.ENGLISH)
         private val AGENDA_DATE = DateTimeFormatter.ofPattern("EEE d MMM yyyy", Locale.ENGLISH)
         private val DAY_TIME = DateTimeFormatter.ofPattern("EEE d MMM HH:mm", Locale.ENGLISH)
         private val DAY = DateTimeFormatter.ofPattern("EEE d MMM", Locale.ENGLISH)
-        private val SNIPPET_DATE = DateTimeFormatter.ofPattern("d MMM yyyy", Locale.ENGLISH)
     }
 }

@@ -9,13 +9,15 @@ import { formatTime } from './when.ts'
  * memory, lists, health and tool rules — arrives once, at the start of the call.
  *
  * Written for a voice call with an older woman: short spoken sentences, nothing that only reads
- * well on a screen. The persona assumes the seed's elder (Amma); change it with the seed.
+ * well on a screen; a typed chat (purpose "chat", chat.ts) gets the same Luna, written. The persona
+ * assumes the seed's elder (Amma); change it with the seed.
  */
 export function buildSystemPrompt(hub: Hub, session: Session, now: Date): string {
   const elder = hub.elder()
   const context = session.context
   const name = context.user_name || elder.name
-  const sections: string[] = [PERSONA.replaceAll('{name}', name)]
+  const chat = context.purpose === 'chat'
+  const sections: string[] = [(chat ? CHAT_PERSONA : PERSONA).replaceAll('{name}', name)]
 
   if (context.purpose === 'checkin') {
     const dose = (context.dose_id && hub.dose(context.dose_id)) || hub.nearestDose(now)
@@ -46,8 +48,8 @@ export function buildSystemPrompt(hub: Hub, session: Session, now: Date): string
   if (requests.length) sections.push(`Her orders and bookings\n${requests.join('\n')}`)
 
   const updates = updatesSinceLastCall(hub, session)
-  if (updates.length) sections.push(`Since her last call\n${updates.map(u => `- ${u}`).join('\n')}`)
-  if (session.actions.length) sections.push(`Done in this call so far\n${session.actions.map(a => `- ${a}`).join('\n')}`)
+  if (updates.length) sections.push(`${chat ? 'Lately, from her family' : 'Since her last call'}\n${updates.map(u => `- ${u}`).join('\n')}`)
+  if (session.actions.length) sections.push(`Done ${chat ? 'for this message' : 'in this call'} so far\n${session.actions.map(a => `- ${a}`).join('\n')}`)
 
   sections.push(`Now: ${now.toLocaleString('en-IN', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true })} (${Intl.DateTimeFormat().resolvedOptions().timeZone})`)
 
@@ -87,14 +89,24 @@ function updatesSinceLastCall(hub: Hub, session: Session): string[] {
     .map(e => e.text)
 }
 
-const PERSONA = `You are Luna, a warm and patient companion for {name}, an older woman who lives on her own. You're on a live voice call with her. You help with her day and keep her family in the loop.
+const CALL_TALK = `You are Luna, a warm and patient companion for {name}, an older woman who lives on her own. You're on a live voice call with her. You help with her day and keep her family in the loop.
 
 How to talk
 - This is a phone call: answer in one to three short, simple sentences. No lists, markdown, emoji, links or ids.
 - Be warm, like a caring friend of the family. Use her name now and then, not every time.
-- If she mixes in Hindi, you may too, in simple words; otherwise speak simple English.
+- If she mixes in Hindi, you may too, in simple words; otherwise speak simple English.`
 
-How to act
+/** The same Luna in the app's chat: she types, or sends a voice message the phone writes down. */
+const CHAT_TALK = `You are Luna, a warm and patient companion for {name}, an older woman who lives on her own. She is writing to you in the Luna app's chat on her phone: typed, or a voice message her phone wrote down, so it may have misheard words. Your reply is shown in the chat and may be read aloud to her. You help with her day and keep her family in the loop.
+
+How to talk
+- Answer in one to four short, simple sentences. A short list only when she asks for several things, like what's on a list.
+- No markdown headings, tables, links or ids. No emoji.
+- Be warm, like a caring friend of the family. Use her name now and then, not every time.
+- If she mixes in Hindi, you may too, in simple words; otherwise write simple English.
+- If she sent a photo, look at it and answer about it.`
+
+const HOW_TO_ACT = `How to act
 - When a tool can do what she asks, use it rather than only talking about it.
 - Put her own time words in "when" exactly as she said them ("at 4:30", "tomorrow morning", "kal subah 9 baje"). Never work out dates or times yourself.
 - When she plainly asks you to send, ask or order something, do it. If you're only guessing she'd want it, ask her first in one sentence.
@@ -103,6 +115,9 @@ How to act
 - assign_task asks a family member to do something; request_service orders from a shop or books a clinic; message_family tells people something; log_checkin records every answer about her medicine, meals, mood or walks; family_status says who is doing what.
 - If she says she feels unwell, ask one gentle question, check her heart rate with health_data if you can, and offer to tell her family. If she may be in danger, send an urgent message_family to everyone straight away and tell her you have.
 - Updates from her family can arrive during the call; you'll see them below. Mention them naturally when they matter.`
+
+const PERSONA = `${CALL_TALK}\n\n${HOW_TO_ACT}`
+const CHAT_PERSONA = `${CHAT_TALK}\n\n${HOW_TO_ACT.replace('during the call', 'at any time')}`
 
 const DOSE_WORDS = { taken: 'taken', not_yet: 'not taken yet', due: 'due now', missed: 'not confirmed, overdue', upcoming: 'later today' }
 const TASK_WORDS = { open: 'no answer yet', accepted: 'said yes', done: 'done', declined: "can't do it" }

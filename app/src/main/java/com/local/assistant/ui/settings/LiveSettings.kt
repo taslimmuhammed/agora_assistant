@@ -93,7 +93,7 @@ internal fun LiveSettings(settings: SettingsStore, secrets: SecretStore, calls: 
         modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
     )
     SwitchRow(
-        "Live voice (Agora)",
+        "Live voice",
         when {
             !calls.api.configured -> "Add the server below to turn it on."
             on -> "On: the power button, “${WakeWord.PHRASE}” and Call in the chat start a call when online."
@@ -158,6 +158,8 @@ internal fun LiveSettings(settings: SettingsStore, secrets: SecretStore, calls: 
             ask("Fetching the medicines…", "Check-ins set from the family hub.") { doses = checkIns.refresh() }
         }) { Text("Refresh check-ins") }
     }
+
+    FamilyOnWhatsApp(settings, calls.api, configured = server.isNotBlank() || calls.api.configured)
 
     Text(
         "Demo",

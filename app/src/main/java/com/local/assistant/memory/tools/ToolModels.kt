@@ -127,7 +127,7 @@ data class ToolRecord(
  * Where a tool call happens: which chat, and the user message that asked for it. [userText] is
  * that message as typed, which numbers in the call's arguments are checked against.
  */
-/** [locked]: the phone is locked, so only [ToolCatalog.LOCKED] tools run (see [ToolLoop]). */
+/** [locked]: the phone is locked, so only [ToolCatalog.LOCKED] tools run. */
 data class ToolContext(
     val chatId: Long,
     val userMessageId: Long,
@@ -146,15 +146,8 @@ data class ToolContext(
      * asked ("when I reach avilora" after "remind me to buy chicken"), so its words are theirs too.
      */
     val earlierText: String = "",
-    /** How far a long call has got ("Reading part 2 of 5"), shown while it runs ([ToolLoop]). */
+    /** How far a long call has got ("Reading 2 MB of notes.pdf"), shown while it runs. */
     val onStep: (String) -> Unit = {},
-    /** A document attached to the message, which read_file reads when asked to ([ToolLoop.readAttached]). */
-    val document: AttachedDocument? = null,
-    /**
-     * What the app read from [document] for the model to act on: the numbers in a call that came
-     * from it are the document's, so they're checked against it as well as the user's words.
-     */
-    val documentNotes: String = "",
 )
 
 /** A document attached to a message: the app's copy of it, and the name it was picked with. */

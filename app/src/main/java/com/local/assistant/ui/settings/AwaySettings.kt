@@ -105,7 +105,7 @@ internal fun AwaySettings(settings: SettingsStore, awayBrief: AwayBrief) {
         ) {
             Text("Allow notification access", style = MaterialTheme.typography.titleSmall, color = AppColors.TextPrimary)
             Text(
-                "Android asks you to give this yourself. Tap below, then turn on Local Assistant.",
+                "Android asks you to give this yourself. Tap below, then turn on Luna.",
                 style = MaterialTheme.typography.bodySmall,
                 color = AppColors.TextSecondary,
                 modifier = Modifier.padding(top = 4.dp),
@@ -129,7 +129,7 @@ internal fun AwaySettings(settings: SettingsStore, awayBrief: AwayBrief) {
         when {
             !popUp -> "Off: it waits in a quiet notification."
             isAssistant -> "On: it opens by itself when someone is waiting on you."
-            else -> "On, once Local Assistant is the phone's assistant (Calling the assistant → Power button). Until then, a quiet notification."
+            else -> "On, once Luna is the phone's assistant (Calling the assistant → Power button). Until then, a quiet notification."
         },
         checked = popUp,
         onCheckedChange = {

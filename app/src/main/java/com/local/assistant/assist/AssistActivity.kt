@@ -34,10 +34,9 @@ import com.local.assistant.ui.theme.blurBehind
  * opening the dialer closes it, and a reply still coming finishes in its chat.
  *
  * On the lock screen it works without unlocking only when the user has turned that on (Settings →
- * Assistant, off by default), and then only partly: it sees none of the user's memory, photos or
- * chats, and can only set reminders, events, alarms and timers, change phone settings, work out
- * sums and look things up online. Anything more asks for an unlock first and then carries on
- * ([AssistViewModel.unlockFor]). With it off, it says how to turn it on, and leaves a notification.
+ * Assistant, off by default), and then only partly: a call gets none of the user's memory, photos
+ * or chats, and only the lock screen's tools. With it off, it says how to turn it on, and leaves a
+ * notification.
  */
 class AssistActivity : FragmentActivity() {
 
@@ -87,12 +86,6 @@ class AssistActivity : FragmentActivity() {
         }
         if (!lockedOut.value && openLiveCall()) return
 
-        // A lock-screen question that needs more: unlock, then it carries on here.
-        lifecycleScope.launch {
-            viewModel.unlockFor.collect { asked ->
-                if (asked != null) afterUnlock(cancelled = viewModel::unlockCancelled) { viewModel.continueAfterUnlock() }
-            }
-        }
 
         // Photos found over the lock screen stay hidden until the phone is unlocked, then open in the app.
         val photos = PhotoAccess(appContainer.photoThumbnails, hidden = ::isLocked, onUnlock = { openApp(viewModel.chatId.value) })

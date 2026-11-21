@@ -125,7 +125,7 @@ import com.local.assistant.data.db.AttachmentKind
 import com.local.assistant.data.db.MessageEntity
 import com.local.assistant.data.db.Role
 import com.local.assistant.device.PermissionBroker
-import com.local.assistant.llm.LlmService
+
 import com.local.assistant.ui.chat.MarkdownText
 import com.local.assistant.ui.chat.MemoryChips
 import com.local.assistant.ui.chat.ToolPermissionRequests
@@ -172,14 +172,14 @@ fun AssistOverlay(
     val chips by viewModel.chips.collectAsStateWithLifecycle()
     val pending by viewModel.pending.collectAsStateWithLifecycle()
     val streaming by viewModel.streamingText.collectAsStateWithLifecycle()
-    val step by viewModel.streamingStep.collectAsStateWithLifecycle()
+
     val listening by viewModel.listening.collectAsStateWithLifecycle()
     val level by viewModel.level.collectAsStateWithLifecycle()
     val speaking by viewModel.speaking.collectAsStateWithLifecycle()
     val input by viewModel.input.collectAsStateWithLifecycle()
     val muted by viewModel.muted.collectAsStateWithLifecycle()
     val notice by viewModel.notice.collectAsStateWithLifecycle()
-    val engine by viewModel.engineState.collectAsStateWithLifecycle()
+
     val chatId by viewModel.chatId.collectAsStateWithLifecycle()
     val askForNotifications by viewModel.askForNotifications.collectAsStateWithLifecycle()
 
@@ -256,8 +256,6 @@ fun AssistOverlay(
 
     // ---- What the assistant is doing, for the light, the orb and the waveform ----
 
-    val noModel = engine is LlmService.State.NoModel
-    val failed = engine as? LlmService.State.Failed
     val waiting = pending != null && streaming == null
     val busy = streaming != null || pending != null
     val orb = when {
@@ -344,7 +342,7 @@ fun AssistOverlay(
                         Header(
                             energy = energy,
                             muted = muted,
-                            showMute = !lockedOut && !noModel,
+                            showMute = !lockedOut,
                             onToggleMute = viewModel::toggleMute,
                             onOpenApp = openFully,
                         )
@@ -368,34 +366,27 @@ fun AssistOverlay(
                     val hasTranscript = messages.isNotEmpty() || pending != null || streaming != null
                     when {
                         lockedOut -> LockedOut(onOpenSettings)
-                        noModel -> NeedsApp("The assistant needs its model first. Open the app to download or import it.", onOpenApp = openFully)
-                        failed != null && !hasTranscript -> NeedsApp("${failed.message} Open the app to try again.", onOpenApp = openFully)
                         hasTranscript -> Transcript(
                             messages = messages,
                             chips = chips,
                             pending = pending,
                             streaming = streaming,
-                            step = step,
                             waiting = waiting,
-                            modelLoading = engine as? LlmService.State.Loading,
                             viewModel = viewModel,
                             modifier = Modifier.weight(1f, fill = false),
                         )
-                        listening -> Headline("Listening…", "Ask anything. It sends when you pause.")
-                        input == AssistViewModel.Input.TEXT -> Headline("How can I help?", null)
-                        else -> Headline("How can I help?", "Tap the mic and ask.")
+                        listening -> Headline("Listening…", "It sends when you pause.")
+                        input == AssistViewModel.Input.TEXT -> Headline("How can I help?", OFFLINE_HINT)
+                        else -> Headline("How can I help?", "Tap the mic and ask. $OFFLINE_HINT")
                     }
 
-                    if (!lockedOut && !noModel) {
+                    if (!lockedOut) {
                         if (listening || speaking) {
                             VoiceWave(
                                 level = shownLevel,
                                 speaking = speaking && !listening,
                                 modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
                             )
-                        }
-                        if (!hasTranscript && engine !is LlmService.State.Ready && failed == null) {
-                            Caption("Waking up the model. It answers as soon as it's ready.")
                         }
                         notice?.let { Caption(it, onClick = viewModel::dismissNotice) }
 
@@ -416,7 +407,7 @@ fun AssistOverlay(
                         } else {
                             TextControls(
                                 busy = busy,
-                                canTalk = engine !is LlmService.State.Ready || viewModel.hearsAudio(),
+                                canTalk = true,
                                 onSend = viewModel::sendText,
                                 onStop = viewModel::stop,
                                 onTalk = listen,
@@ -432,6 +423,9 @@ fun AssistOverlay(
 }
 
 private enum class OrbMode { LISTENING, BUSY, IDLE }
+
+/** Without a call, what the panel can do on the phone. */
+private const val OFFLINE_HINT = "Offline, I can set alarms and timers and change phone settings."
 
 /**
  * The panel: frosted glass, lit from above, with a bright inner rim, and a band of colour that
@@ -643,10 +637,7 @@ private fun Transcript(
     chips: Map<Long, List<com.local.assistant.ui.chat.ChatViewModel.ChipItem>>,
     pending: AssistViewModel.Pending?,
     streaming: String?,
-    /** What the reply is waiting on: recall, a tool. */
-    step: String?,
     waiting: Boolean,
-    modelLoading: LlmService.State.Loading?,
     viewModel: AssistViewModel,
     modifier: Modifier = Modifier,
 ) {
@@ -677,12 +668,8 @@ private fun Transcript(
         }
         pending?.let { Question(it.text, it.audioPath != null, it.durationMs) }
         when {
-            waiting || streaming?.isEmpty() == true ->
-                ThinkingIndicator(label = step, loading = modelLoading)
-            streaming != null -> {
-                Answer(streaming, streaming = true)
-                step?.let { ThinkingIndicator(label = it) }
-            }
+            waiting || streaming?.isEmpty() == true -> ThinkingIndicator()
+            streaming != null -> Answer(streaming, streaming = true)
         }
         asking?.let {
             MemoryChips(

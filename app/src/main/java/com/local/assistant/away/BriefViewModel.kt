@@ -92,7 +92,6 @@ class BriefViewModel(
     private val _notice = MutableStateFlow<String?>(null)
     val notice: StateFlow<String?> = _notice.asStateFlow()
 
-    val reading: StateFlow<Boolean> = awayBrief.reading
     val speaking: StateFlow<Boolean> = speaker.speaking
 
     /** Swiped away, replied to or called back: gone from the brief, whatever the database says yet. */
@@ -127,10 +126,6 @@ class BriefViewModel(
     private var words: Transcriber.Session? = null
     private val icons = ConcurrentHashMap<String, ImageBitmap?>()
 
-    init {
-        // Whatever the model hasn't read yet, it reads now: drafted replies arrive as it goes.
-        viewModelScope.launch { awayBrief.triage(user = true) }
-    }
 
     // ---- Replies ----
 

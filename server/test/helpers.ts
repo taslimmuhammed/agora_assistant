@@ -9,7 +9,7 @@ import type { ChatFn, ChunkLike } from '../src/llm.ts'
 import { handleEvent } from '../src/replies.ts'
 import { Sessions } from '../src/sessions.ts'
 import { runServerTool } from '../src/tools.ts'
-import { WhatsApp, type WhatsAppSocket, chatOf } from '../src/whatsapp.ts'
+import { type Understand, WhatsApp, type WhatsAppSocket, chatOf } from '../src/whatsapp.ts'
 
 process.env.TZ = 'Asia/Kolkata'
 
@@ -50,11 +50,19 @@ export const RAHUL = '919000000002@s.whatsapp.net'
 /** WhatsApp's side: keeps what Luna sent, and knows some LIDs. */
 export class FakeSocket implements WhatsAppSocket {
   readonly sent: Array<{ jid: string; text: string; quoted: string | null; id: string }> = []
+  /** Luna's reactions: [emoji] on the message [on]. */
+  readonly reactions: Array<{ jid: string; emoji: string; on: string }> = []
   readonly lids = new Map<string, string>()
+  /** Numbers that aren't on WhatsApp. */
+  readonly missing = new Set<string>()
   private next = 100
 
   async sendMessage(jid: string, content: Parameters<WhatsAppSocket['sendMessage']>[1], options?: Parameters<WhatsAppSocket['sendMessage']>[2]) {
     const id = `LUNA${this.next++}`
+    if ('react' in content) {
+      this.reactions.push({ jid, emoji: String(content.react.text), on: String(content.react.key?.id) })
+      return { key: { remoteJid: jid, id, fromMe: true } } as WAMessage
+    }
     this.sent.push({ jid, text: (content as { text: string }).text, quoted: options?.quoted?.key.id ?? null, id })
     return { key: { remoteJid: jid, id, fromMe: true } } as WAMessage
   }
@@ -63,15 +71,23 @@ export class FakeSocket implements WhatsAppSocket {
     return this.lids.get(lid) ?? null
   }
 
+  async download() {
+    return Buffer.from('voice')
+  }
+
+  async exists(jid: string) {
+    return !this.missing.has(jid)
+  }
+
   to(jid: string) {
     return this.sent.filter(m => m.jid === jid)
   }
 }
 
 /** A WhatsApp signed in as Lakshmi, on a fake socket. */
-export function fakeWhatsApp(hub: Hub, clock: () => Date = () => at(9, 5)) {
+export function fakeWhatsApp(hub: Hub, clock: () => Date = () => at(9, 5), understand: Understand | null = null) {
   const socket = new FakeSocket()
-  const whatsapp = new WhatsApp(hub, clock)
+  const whatsapp = new WhatsApp(hub, clock, understand)
   whatsapp.attach(socket, ACCOUNT)
   return { whatsapp, socket }
 }
@@ -183,13 +199,13 @@ export function toolCall(name: string, args: Record<string, unknown>, extra: Rec
 }
 
 /** The family's side, wired as index.ts wires it: WhatsApp in and out, announcements, the tools. */
-export function family(now = at(9, 5)) {
+export function family(now = at(9, 5), understand: Understand | null = null) {
   const hub = makeHub()
   const sessions = new Sessions()
   const bridge = new Bridge()
   const agents = new FakeAgents()
   const clock = () => now
-  const { whatsapp, socket } = fakeWhatsApp(hub, clock)
+  const { whatsapp, socket } = fakeWhatsApp(hub, clock, understand)
   const announce = announcer({ hub, sessions, bridge, agents, clock })
   whatsapp.onEvent(event => handleEvent(event, { hub, whatsapp, announce, clock }))
   const tool = (name: string, args: Record<string, unknown>, session = sessions.create('lakshmi', 0, now.getTime()), when = now) =>

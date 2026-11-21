@@ -260,7 +260,7 @@ class MemoryControls(
      * Chats stay as they are, but nothing is ever learned from what was said before now. The user's
      * notes and lists stay too: like chats, they are what the user wrote, not what was learned.
      */
-    suspend fun forgetEverything(skipExtractionTo: suspend (Long) -> Unit) {
+    suspend fun forgetEverything(skipExtractionTo: suspend (Long) -> Unit = {}) {
         for (task in agenda.allTasks()) reminders.cancel(task.id)
         for (event in agenda.allEvents()) reminders.cancelEvent(event.id)
         memory.transaction {

@@ -18,7 +18,7 @@ import java.io.File
  * is done. With nothing left to index that takes a few seconds.
  *
  *     adb shell am instrument -w -e eval indexservice -e class com.local.assistant.gallery.IndexServiceTest \
- *         com.taslim.localassistant.dev.test/androidx.test.runner.AndroidJUnitRunner
+ *         com.taslim.luna.dev.test/androidx.test.runner.AndroidJUnitRunner
  */
 @RunWith(AndroidJUnit4::class)
 class IndexServiceTest {

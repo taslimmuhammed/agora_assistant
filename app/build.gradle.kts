@@ -95,9 +95,9 @@ android {
     ndkVersion = "28.2.13676358"
 
     defaultConfig {
-        // The Play listing's name, fixed for good once uploaded. The code keeps its package
-        // (namespace above); only the installed app's name changed, from com.local.assistant.
-        applicationId = "com.taslim.localassistant"
+        // Luna installs as its own app, beside Local Assistant (com.taslim.localassistant), which
+        // it grew from. The code keeps its package (namespace above).
+        applicationId = "com.taslim.luna"
         minSdk = 26
         targetSdk = 36
         versionCode = 8
@@ -226,14 +226,14 @@ androidComponents {
     }
 }
 
-// The demo build, copied to apk/LocalAssistant.apk (ignored by git).
+// The demo build, copied to apk/Luna.apk (ignored by git).
 tasks.register<Copy>("demoApk") {
     val isDemo = demo // a plain value: the configuration cache can't keep the script itself
     dependsOn("assembleRelease")
     doFirst { check(isDemo) { "Build it with -Pdemo: ./gradlew :app:demoApk -Pdemo" } }
     from(layout.buildDirectory.file("outputs/apk/release/app-release.apk"))
     into(rootProject.layout.projectDirectory.dir("apk"))
-    rename { "LocalAssistant.apk" }
+    rename { "Luna.apk" }
 }
 
 dependencies {
@@ -271,7 +271,8 @@ dependencies {
     // Session-end summaries and the nightly consolidation run as scheduled background work.
     implementation(libs.androidx.work.runtime.ktx)
 
-    // On-device LLM runtime.
+    // LiteRT-LM, for its embedding engine only: EmbeddingGemma 2 (photo and memory search). No chat
+    // model runs on the phone: replies come from Luna's server, the brain her Agora calls use.
     implementation(libs.litertlm.android)
     // TensorFlow Lite's interpreter, for the two small face models (gallery/faces): 5.6 MB of
     // native code, against about 34 MB for ONNX Runtime or OpenCV.

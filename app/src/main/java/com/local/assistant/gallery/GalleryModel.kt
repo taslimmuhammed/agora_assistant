@@ -25,7 +25,7 @@ object GalleryModel {
 
     const val SIZE_BYTES = 387_710_976L
 
-    /** The repository's commit, not `main`, so a file re-published in place can't change under the app (see ModelCatalog). */
+    /** The repository's commit, not `main`, so a file re-published in place can't change under the app. */
     private const val REVISION = "e301f74d5551b0c2641bd5cb4652a76239d5c5f8"
 
     val FILE = ModelFile(

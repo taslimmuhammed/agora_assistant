@@ -11,6 +11,7 @@ import org.junit.Test
 class AwayBriefTest {
 
     private val now = 1_800_000_000_000L
+
     private val minute = 60_000L
 
     private fun seen(
@@ -207,98 +208,8 @@ class AwayBriefTest {
         assertEquals(2, BriefBuilder.build(listOf(shown, fresh), emptyList(), newOnly = false).needs.size)
     }
 
-    private fun entries(): List<BriefTriage.Entry> {
-        val chat = BriefBuilder.build(listOf(line("Dinner at 7 tomorrow? Can you come?")), emptyList(), newOnly = false).needs.single()
-        val call = BriefBuilder.build(listOf(line("Missed call", kind = Kind.CALL, key = "d|c|amma", title = "Amma")), emptyList(), newOnly = false).needs.single()
-        return listOf(BriefTriage.Entry(1, chat), BriefTriage.Entry(2, call))
-    }
-
-    @Test
-    fun `the answer is found inside fences and chatter`() {
-        val answer = """
-            Sure! Here it is:
-            ```json
-            {"headline": "Rahul asks about dinner; Amma called.",
-             "items": [
-               {"id": 1, "level": "need", "gist": "Asks if you can come to dinner", "replies": ["Yes, see you at 7!", "Can't tomorrow, sorry"]},
-               {"id": 2, "level": "need", "gist": "Missed call", "replies": ["Hi"]},
-               {"id": 9, "level": "need", "gist": "Not asked about"}
-             ]}
-            ```
-        """.trimIndent()
-        val reading = assertNotNullReading(BriefTriage.parse(answer, entries()))
-        assertEquals("Rahul asks about dinner; Amma called.", reading.headline)
-        assertEquals(setOf(1, 2), reading.items.keys)
-        assertEquals(listOf("Yes, see you at 7!", "Can't tomorrow, sorry"), reading.items[1]?.replies)
-        // No replies to a missed call.
-        assertTrue(reading.items[2]?.replies.orEmpty().isEmpty())
-    }
-
-    @Test
-    fun `a reply with a number they never said is dropped`() {
-        val answer = """{"items": [{"id": 1, "level": "need", "gist": "Dinner", "replies": ["See you at 7:30", "See you at 7"]}]}"""
-        assertEquals(listOf("See you at 7"), BriefTriage.parse(answer, entries())?.items?.get(1)?.replies)
-    }
-
-    @Test
-    fun `only needs get replies`() {
-        val answer = """{"items": [{"id": 1, "level": "fyi", "gist": "Dinner plan", "replies": ["Ok"]}]}"""
-        assertTrue(BriefTriage.parse(answer, entries())?.items?.get(1)?.replies.orEmpty().isEmpty())
-    }
-
-    @Test
-    fun `anything but the JSON asked for is no reading`() {
-        assertNull(BriefTriage.parse("I can't help with that.", entries()))
-        assertNull(BriefTriage.parse("""{"items": "none"}""", entries()))
-        assertNull(BriefTriage.parse("""{"items": [{"id": 1, "level": "urgent"}]}""", entries()))
-        assertNull(BriefTriage.parse("""{"items": [ {"id": 1, "level": "need" """, entries()))
-    }
-
     private fun chat(vararg said: String): BriefItem =
         BriefBuilder.build(said.map { line(it) }, emptyList(), newOnly = false).let { it.needs + it.fyi + it.skipped }.single()
-
-    @Test
-    fun `each chat is named with the language its person writes in`() {
-        assertEquals("English", BriefTriage.language(chat("Hey! Are we still on for dinner tomorrow at 8?", "Let me know, I'll book the table")))
-        assertEquals("Hinglish", BriefTriage.language(chat("Bhai aaj ki class ke notes bhej dena", "kal test hai")))
-        assertEquals("Hinglish", BriefTriage.language(chat("haan?")))
-        assertEquals("Hindi", BriefTriage.language(chat("कल मिलते हैं?")))
-        assertEquals("Malayalam", BriefTriage.language(chat("നാളെ വരുമോ?")))
-        assertNull(BriefTriage.language(chat("👍🙏")))
-        // English with a Hindi word in it is still English.
-        assertEquals("English", BriefTriage.language(chat("Thanks bhai, see you at the station tomorrow morning")))
-
-        val rendered = BriefTriage.render(entries(), java.time.ZoneOffset.UTC)
-        assertTrue(rendered, rendered.contains("chat with Rahul · 1 new · writes in English"))
-        assertFalse(rendered, rendered.contains("missed call from Amma · writes"))
-    }
-
-    @Test
-    fun `an English chat gets no Hinglish replies`() {
-        val answer = """{"items": [{"id": 1, "level": "need", "gist": "Dinner", "replies": ["Haan, dinner ke liye main free hoon.", "Yes, I'll come at 7!", "Sorry, kal nahi ho payega."]}]}"""
-        assertEquals(listOf("Yes, I'll come at 7!"), BriefTriage.parse(answer, entries())?.items?.get(1)?.replies)
-    }
-
-    @Test
-    fun `the gist leaves out the name it sits under`() {
-        assertEquals("Needs to know if you are free tomorrow.", BriefTriage.withoutName("Arjun Mehta needs to know if you are free tomorrow.", "Arjun Mehta"))
-        assertEquals("Needs today's class notes", BriefTriage.withoutName("Priya needs today's class notes", "Priya"))
-        assertEquals("Asking about dinner", BriefTriage.withoutName("Arjun is asking about dinner", "Arjun Mehta"))
-        assertEquals("Asks if you're coming", BriefTriage.withoutName("Asks if you're coming", "Priya"))
-        // Someone else, or the name as part of what it's about, stays.
-        assertEquals("Priyanka asks about notes", BriefTriage.withoutName("Priyanka asks about notes", "Priya"))
-        assertEquals("Priya's test is tomorrow", BriefTriage.withoutName("Priya's test is tomorrow", "Priya"))
-        // Nothing left but a word: keep it whole.
-        assertEquals("Amma called", BriefTriage.withoutName("Amma called", "Amma"))
-
-        val answer = """{"items": [{"id": 1, "level": "need", "gist": "Rahul asks if you can come to dinner"}]}"""
-        assertEquals("Asks if you can come to dinner", BriefTriage.parse(answer, entries())?.items?.get(1)?.gist)
-    }
-
-    private fun assertNotNullReading(reading: BriefTriage.Reading?): BriefTriage.Reading {
-        assertNotNull(reading)
-        return reading!!
-    }
 
     // ---- Voice ----
 

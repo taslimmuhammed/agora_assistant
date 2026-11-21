@@ -12,7 +12,6 @@ import com.local.assistant.live.LiveCalls
 import com.local.assistant.live.LiveContext
 import com.local.assistant.live.LiveSession
 import com.local.assistant.live.LiveToolBridge
-import com.local.assistant.memory.prompt.ConversationManager
 import com.local.assistant.memory.tools.SystemAlarms
 import com.local.assistant.memory.tools.ToolExecutor
 import com.local.assistant.ui.chat.ChatViewModel
@@ -43,7 +42,6 @@ class LiveCallViewModel(
     private val calls: LiveCalls,
     private val chats: ChatRepository,
     private val tools: ToolExecutor,
-    private val conversations: ConversationManager,
     private val clockAlarms: SystemAlarms,
     permissions: PermissionBroker,
 ) : ViewModel() {
@@ -99,21 +97,15 @@ class LiveCallViewModel(
     /** Puts back whatever the card's tool call changed, as a chat's Undo does. */
     fun undo(recordId: Long) {
         viewModelScope.launch {
-            when (tools.undo(recordId)) {
-                ToolExecutor.UndoResult.UNDONE -> conversations.prefixMayHaveChanged()
-                ToolExecutor.UndoResult.CHANGED_SINCE -> _error.value = "That has changed since, so it was left as it is."
-                else -> Unit
+            if (tools.undo(recordId) == ToolExecutor.UndoResult.CHANGED_SINCE) {
+                _error.value = "That has changed since, so it was left as it is."
             }
         }
     }
 
     fun editTime(recordId: Long, at: Long) {
         viewModelScope.launch {
-            if (tools.editTime(recordId, at)) {
-                conversations.prefixMayHaveChanged()
-            } else {
-                _error.value = "That reminder no longer exists."
-            }
+            if (!tools.editTime(recordId, at)) _error.value = "That reminder no longer exists."
         }
     }
 
@@ -130,7 +122,6 @@ class LiveCallViewModel(
                     calls = container.liveCalls,
                     chats = container.chatRepository,
                     tools = container.toolExecutor,
-                    conversations = container.conversations,
                     clockAlarms = container.clockAlarms,
                     permissions = container.permissions,
                 )

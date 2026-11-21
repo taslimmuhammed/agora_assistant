@@ -30,17 +30,13 @@ class PhotoTools(
     private val readable: suspend (mediaId: Long) -> String? = { null },
     /** Whether a found photo may be read out: not over the lock screen, where photos stay hidden. */
     private val mayRead: () -> Boolean = { true },
-    /**
-     * Answers a question from a found photo on its own ([PhotoReader]), the reply written; null
-     * when it can't, and then the photo goes to the chat model to read.
-     */
-    private val reader: (suspend (path: String, question: String) -> String?)? = null,
+
     private val now: () -> ZonedDateTime = ZonedDateTime::now,
     /**
      * An ID number looked for in the phone's documents first ([com.local.assistant.files.FileTools.idNumber]):
      * read from a file's text, it's exact and takes no model.
      */
-    private val documents: (suspend (PhotoReader.Field) -> com.local.assistant.files.FileTools.IdFiles)? = null,
+    private val documents: (suspend (IdField) -> com.local.assistant.files.FileTools.IdFiles)? = null,
 ) {
 
     /**
@@ -56,7 +52,7 @@ class PhotoTools(
         place: String? = null,
         question: String? = null,
     ): ActionResult {
-        val field = question?.let { PhotoReader.Field.of(it) }
+        val field = question?.let { IdField.of(it) }
         val files = if (field != null && mayRead()) documents?.invoke(field) else null
         return withIdFiles(field, files) { search(query, person, taken, place, question) }
     }
@@ -193,13 +189,12 @@ class PhotoTools(
         )
     }
 
-    /** A found photo read for a question: the reply written from it, or the photo for the chat model. */
+    /** A found photo read for a question: the photo for the model to look at. */
     private class Read(val image: String? = null, val reply: String? = null)
 
     /**
-     * The best photo among [ids] (best first; videos skipped) read for [question]: answered by
-     * [reader], or else as a file for the chat model to read, with what to do with it added to
-     * [notes]; null when none can be read.
+     * The best photo among [ids] (best first; videos skipped) read for [question]: a file for the
+     * model to look at, with what to do with it added to [notes]; null when none can be read.
      */
     private suspend fun read(ids: List<Long>, videos: Set<Long>, question: String, notes: MutableList<String>): Read? {
         if (!mayRead()) {
@@ -208,7 +203,7 @@ class PhotoTools(
         }
         val best = ids.firstOrNull { it !in videos } ?: return null
         val file = readable(best) ?: return null
-        reader?.invoke(file, question)?.let { return Read(reply = it) }
+
         // Named first: given a plus-two question and the SSLC certificate, the model read out the
         // SSLC marks as the answer; said as "Your SSLC certificate shows…", the user can tell.
         notes += "The best-matching photo is attached. Say what document or photo it is, then answer \"$question\" from what it " +
@@ -239,7 +234,7 @@ class PhotoTools(
          * with a password is named in the reply when no photo gave the number, or told to the
          * model when the photos go to it, or when the photos can't be searched at all.
          */
-        internal suspend fun withIdFiles(field: PhotoReader.Field?, files: com.local.assistant.files.FileTools.IdFiles?, search: suspend () -> ActionResult): ActionResult {
+        internal suspend fun withIdFiles(field: IdField?, files: com.local.assistant.files.FileTools.IdFiles?, search: suspend () -> ActionResult): ActionResult {
             files?.answer?.let { return it }
             val locked = files?.lockedNote ?: return search()
             val found = try {

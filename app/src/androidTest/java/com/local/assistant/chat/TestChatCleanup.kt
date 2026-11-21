@@ -17,7 +17,7 @@ import org.junit.runner.RunWith
  *
  *     adb shell am instrument -w -e cleanup true -e since 1763048460000 -e title "Good evening!" \
  *         -e class com.local.assistant.chat.TestChatCleanup \
- *         com.taslim.localassistant.dev.test/androidx.test.runner.AndroidJUnitRunner
+ *         com.taslim.luna.dev.test/androidx.test.runner.AndroidJUnitRunner
  */
 @RunWith(AndroidJUnit4::class)
 class TestChatCleanup {
@@ -36,7 +36,6 @@ class TestChatCleanup {
         if (args.getString("delete") == "true") {
             for (chat in found) {
                 container.chatRepository.deleteChat(chat.id)
-                container.conversations.forget(chat.id)
             }
             Log.i(TAG, "deleted ${found.size}")
         }

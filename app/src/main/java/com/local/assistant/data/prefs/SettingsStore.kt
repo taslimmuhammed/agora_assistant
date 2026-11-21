@@ -3,7 +3,6 @@ package com.local.assistant.data.prefs
 import android.content.Context
 import androidx.core.content.edit
 import com.local.assistant.BuildConfig
-import com.local.assistant.memory.prompt.TokenRateStore
 import com.local.assistant.wake.WakeWord
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
@@ -19,11 +18,6 @@ class SettingsStore(context: Context) {
     private val prefs = context.getSharedPreferences("settings", Context.MODE_PRIVATE).also { prefs ->
         if (RETIRED_KEYS.any(prefs::contains)) prefs.edit { RETIRED_KEYS.forEach(::remove) }
     }
-
-    /** Absolute path of the installed .litertlm file, or null when no model is installed. */
-    var modelPath: String?
-        get() = prefs.getString(KEY_MODEL_PATH, null)
-        set(value) = prefs.edit { if (value == null) remove(KEY_MODEL_PATH) else putString(KEY_MODEL_PATH, value) }
 
     /** Absolute path of the installed embedding bundle, or null when there is none. */
     var embedderPath: String?
@@ -142,18 +136,6 @@ class SettingsStore(context: Context) {
     var contextFellBack: Boolean
         get() = prefs.getBoolean(KEY_CONTEXT_FELL_BACK, false)
         set(value) = prefs.edit { putBoolean(KEY_CONTEXT_FELL_BACK, value) }
-
-    /** The Latin characters-per-token rate measured for one model; see `MeasuredTokenEstimator`. */
-    val tokenRates: TokenRateStore = object : TokenRateStore {
-        override fun load(modelKey: String): Double? =
-            prefs.getFloat(KEY_TOKEN_RATE, 0f).takeIf { it > 0f && prefs.getString(KEY_TOKEN_RATE_MODEL, null) == modelKey }
-                ?.toDouble()
-
-        override fun save(modelKey: String, latinCharsPerToken: Double) = prefs.edit {
-            putFloat(KEY_TOKEN_RATE, latinCharsPerToken.toFloat())
-            putString(KEY_TOKEN_RATE_MODEL, modelKey)
-        }
-    }
 
     /** Notifications are asked for once, the first time a timed reminder is made. */
     var askedForNotifications: Boolean
@@ -290,6 +272,29 @@ class SettingsStore(context: Context) {
         get() = prefs.getBoolean(KEY_LIVE_VOICE, BuildConfig.LIVE_SERVER_URL.isNotBlank())
         set(value) = prefs.edit { putBoolean(KEY_LIVE_VOICE, value) }
 
+    /** Luna says hello on WhatsApp to each number added, so her first message isn't from a stranger. */
+    /** The last family hub event the phone has dealt with ([com.local.assistant.live.FamilyAnswers]); -1 before the first look. */
+    var familyAnswersAfter: Long
+        get() = prefs.getLong(KEY_FAMILY_ANSWERS_AFTER, -1L)
+        set(value) = prefs.edit { putLong(KEY_FAMILY_ANSWERS_AFTER, value) }
+
+    var lunaSaysHello: Boolean
+        get() = prefs.getBoolean(KEY_LUNA_SAYS_HELLO, true)
+        set(value) = prefs.edit { putBoolean(KEY_LUNA_SAYS_HELLO, value) }
+
+    /** Replies are read aloud in Murf's voice, the calls' own, while Luna's server can be reached. */
+    var murfReplies: Boolean
+        get() = prefs.getBoolean(KEY_MURF_REPLIES, true)
+        set(value) = prefs.edit { putBoolean(KEY_MURF_REPLIES, value) }
+
+    /**
+     * The Gemma 4 E4B file an older build downloaded, read once and forgotten, so the app can delete
+     * it (3.66 GB): replies come from Luna's server now.
+     */
+    fun takeRetiredChatModel(): String? = prefs.getString(KEY_MODEL_PATH, null).also {
+        if (it != null || prefs.contains(KEY_MODEL_PATH)) prefs.edit { remove(KEY_MODEL_PATH) }
+    }
+
     /** The live voice server typed in Settings, over the build's own; null for the build's. */
     var liveServerUrl: String?
         get() = prefs.getString(KEY_LIVE_SERVER_URL, null)?.takeIf { it.isNotBlank() }
@@ -316,8 +321,6 @@ class SettingsStore(context: Context) {
 
     fun observeAwayIgnoredApps(): Flow<Set<String>> = observeKey(KEY_AWAY_IGNORED) { awayIgnoredApps }
 
-    fun observeModelPath(): Flow<String?> = observeKey(KEY_MODEL_PATH) { modelPath }
-
     fun observeMemoryPaused(): Flow<Boolean> = observeKey(KEY_MEMORY_PAUSED) { memoryPaused }
 
     fun observeHistoryRetentionDays(): Flow<Int> = observeKey(KEY_HISTORY_RETENTION) { historyRetentionDays }
@@ -339,8 +342,11 @@ class SettingsStore(context: Context) {
         private const val KEY_AWAY_IGNORED = "away_ignored_apps"
         private const val KEY_STEP_GOAL = "step_goal"
         private const val KEY_LIVE_VOICE = "live_voice"
+        private const val KEY_LUNA_SAYS_HELLO = "luna_says_hello"
+        private const val KEY_FAMILY_ANSWERS_AFTER = "family_answers_after"
         private const val KEY_LIVE_SERVER_URL = "live_server_url"
         private const val KEY_MURF_VOICE = "murf_voice"
+        private const val KEY_MURF_REPLIES = "murf_replies"
         private const val KEY_CHECK_IN_TIMES = "check_in_times"
         private const val KEY_LIVE_USER_ID = "live_user_id"
         private const val KEY_EMBEDDER_PATH = "embedder_path"

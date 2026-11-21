@@ -221,16 +221,14 @@ private val ACTION_ICON = 18.dp
 private val ACTION_INSET = (ACTION_SIZE - ACTION_ICON) / 2
 
 /**
- * The blinking dot while the reply hasn't started, with what is being done beside it: "Reading
- * the instructions…", a tool. [loading]: the model is still loading, so it says that and, from how
- * long the last load took, about how long is left. A wait past [SHOW_SECONDS_AFTER_MS] counts
- * its seconds, so a long one is seen to be going somewhere rather than stuck.
+ * The reply on its way: a pulsing dot and what is being done ("Thinking…", a tool). A wait past
+ * [SHOW_SECONDS_AFTER_MS] counts its seconds, so a long one is seen to be going somewhere rather
+ * than stuck.
  */
 @Composable
 fun ThinkingIndicator(
     modifier: Modifier = Modifier,
     label: String? = null,
-    loading: com.local.assistant.llm.LlmService.State.Loading? = null,
 ) {
     val transition = rememberInfiniteTransition(label = "thinking")
     val alpha by transition.animateFloat(
@@ -247,7 +245,7 @@ fun ThinkingIndicator(
             now = android.os.SystemClock.elapsedRealtime()
         }
     }
-    val text = waitingText(label, loading, shownAt, now)
+    val text = waitingText(label, shownAt, now)
     Row(
         modifier = modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -274,15 +272,7 @@ fun ThinkingIndicator(
 private const val SHOW_SECONDS_AFTER_MS = 3_000L
 
 /** What [ThinkingIndicator] says at [now]: never just a dot. */
-internal fun waitingText(label: String?, loading: com.local.assistant.llm.LlmService.State.Loading?, shownAt: Long, now: Long): String {
-    if (loading != null) {
-        val left = loading.expectedMs?.let { (loading.startedAt + it - now + 999) / 1000 }
-        return when {
-            left == null -> com.local.assistant.memory.tools.ToolSteps.LOADING_MODEL
-            left >= 1 -> "Loading the model · about $left s left"
-            else -> "Loading the model · nearly there"
-        }
-    }
+internal fun waitingText(label: String?, shownAt: Long, now: Long): String {
     val base = label ?: com.local.assistant.memory.tools.ToolSteps.THINKING
     val waited = now - shownAt
     return if (waited < SHOW_SECONDS_AFTER_MS) base else "${base.removeSuffix("…")} · ${waited / 1000} s"

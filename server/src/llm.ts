@@ -4,6 +4,7 @@ import OpenAI from 'openai'
 import type { Bridge } from './bridge.ts'
 import type { Config } from './config.ts'
 import type { Hub } from './hub.ts'
+import { ModelChoice, SlowModelError, isBusy } from './models.ts'
 import { buildSystemPrompt } from './prompt.ts'
 import type { Session, Sessions, ToolDeclaration } from './sessions.ts'
 import type { WhatsApp } from './whatsapp.ts'
@@ -39,10 +40,59 @@ export interface ToolCallDelta {
 /** Streams a completion for [params]; a fake in tests. */
 export type ChatFn = (params: Record<string, unknown>, signal: AbortSignal) => Promise<AsyncIterable<ChunkLike>>
 
-export function openAiChat(config: Config): ChatFn {
-  const client = new OpenAI({ apiKey: config.llm.apiKey || 'missing', baseURL: config.llm.baseUrl })
-  return async (params, signal) =>
-    (await client.chat.completions.create({ ...params, stream: true } as unknown as OpenAI.ChatCompletionCreateParamsStreaming, { signal })) as AsyncIterable<ChunkLike>
+/** How long the configured model has to start answering before the fallback is asked. */
+const FIRST_WORDS_MS = 8_000
+
+export function openAiChat(config: Config, models = new ModelChoice(config.llm.model, config.llm.fallbackModel), firstWordsMs = FIRST_WORDS_MS): ChatFn {
+  // No retries of its own: a call can't wait through them. A busy model hands over instead.
+  const client = new OpenAI({ apiKey: config.llm.apiKey || 'missing', baseURL: config.llm.baseUrl, maxRetries: 0 })
+  return async (params, signal) => {
+    const order = params.model === models.primary ? models.order() : [String(params.model)]
+    for (const [i, model] of order.entries()) {
+      const last = i === order.length - 1
+      try {
+        return await streamStarted(client, { ...params, model }, signal, last ? 30_000 : firstWordsMs)
+      } catch (e) {
+        if (signal.aborted || last || !isBusy(e)) throw e
+        models.busy(model)
+      }
+    }
+    throw new Error('No model to ask')
+  }
+}
+
+/** The stream, once its first chunk is in: a model that hangs without a word fails after [ms]. */
+async function streamStarted(client: OpenAI, params: Record<string, unknown>, signal: AbortSignal, ms: number): Promise<AsyncIterable<ChunkLike>> {
+  const controller = new AbortController()
+  const stop = () => controller.abort()
+  signal.addEventListener('abort', stop, { once: true })
+  let slow = false
+  const timer = setTimeout(() => {
+    slow = true
+    controller.abort()
+  }, ms)
+  try {
+    const stream = (await client.chat.completions.create(
+      { ...params, stream: true } as unknown as OpenAI.ChatCompletionCreateParamsStreaming,
+      { signal: controller.signal },
+    )) as AsyncIterable<ChunkLike>
+    const chunks = stream[Symbol.asyncIterator]()
+    const first = await chunks.next()
+    clearTimeout(timer)
+    return (async function* () {
+      try {
+        if (first.done) return
+        yield first.value
+        for (let next = await chunks.next(); !next.done; next = await chunks.next()) yield next.value
+      } finally {
+        signal.removeEventListener('abort', stop)
+      }
+    })()
+  } catch (e) {
+    clearTimeout(timer)
+    signal.removeEventListener('abort', stop)
+    throw slow && !signal.aborted ? new SlowModelError(String(params.model), ms) : e
+  }
 }
 
 export interface LlmDeps {
@@ -57,7 +107,8 @@ export interface LlmDeps {
 
 interface Message {
   role: 'system' | 'user' | 'assistant' | 'tool'
-  content: string | null
+  /** Parts only for a chat message with a photo (chat.ts). */
+  content: string | null | Array<Record<string, unknown>>
   tool_calls?: PendingCall[]
   tool_call_id?: string
 }
@@ -99,9 +150,11 @@ export async function runTurn(deps: LlmDeps, session: Session, incoming: Array<R
     { role: 'system', content: buildSystemPrompt(deps.hub, session, deps.clock()) },
     ...incoming
       .filter(m => m.role === 'user' || m.role === 'assistant')
-      .map(m => ({ role: m.role as 'user' | 'assistant', content: contentText(m.content) }))
+      .map(m => ({ role: m.role as 'user' | 'assistant', content: m.role === 'user' && hasImage(m.content) ? (m.content as Array<Record<string, unknown>>) : contentText(m.content) }))
       .filter(m => m.content),
   ]
+  // A typed chat shows every word: no "Okay." before a tool round, as a call says to fill the quiet.
+  const fills = session.context.purpose !== 'chat'
   const deviceTools = (session.context.device_tools ?? []).filter(t => t?.name && !isServerTool(t.name))
   const deviceNames = new Set(deviceTools.map(t => t.name))
   const tools = [...SERVER_TOOLS, ...deviceTools].map(asFunction)
@@ -134,7 +187,7 @@ export async function runTurn(deps: LlmDeps, session: Session, incoming: Array<R
       }
       const pending = calls.list()
       if (!pending.length) break
-      if (!spoke) {
+      if (!spoke && fills) {
         out.text(FILLERS[session.fillers++ % FILLERS.length])
         spoke = true
         firstWordMs ??= Date.now() - started
@@ -261,6 +314,11 @@ function contentText(content: unknown): string {
   if (typeof content === 'string') return content
   if (Array.isArray(content)) return content.map(p => (typeof p === 'string' ? p : (p as { text?: string })?.text ?? '')).join(' ').trim()
   return ''
+}
+
+/** OpenAI-style content parts with a picture in them. */
+function hasImage(content: unknown): boolean {
+  return Array.isArray(content) && content.some(p => (p as { type?: string })?.type === 'image_url')
 }
 
 function parseArgs(json: string): Record<string, unknown> {

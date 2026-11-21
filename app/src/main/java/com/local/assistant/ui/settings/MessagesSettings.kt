@@ -58,10 +58,9 @@ internal fun messagesSummary(settings: SettingsStore, smsSync: SmsSync, context:
 /**
  * Messages: keeping what arrives for check_inbox, the access it needs (notification access, and
  * the SMS inbox while the app is the assistant), which apps it keeps, and deleting what's kept.
- * [onToolsChanged] is called when check_inbox comes or goes, so the next chat is told.
  */
 @Composable
-internal fun MessagesSettings(settings: SettingsStore, inbox: Inbox, smsSync: SmsSync, onToolsChanged: () -> Unit) {
+internal fun MessagesSettings(settings: SettingsStore, inbox: Inbox, smsSync: SmsSync) {
     val context = LocalContext.current
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     val scope = rememberCoroutineScope()
@@ -82,7 +81,6 @@ internal fun MessagesSettings(settings: SettingsStore, inbox: Inbox, smsSync: Sm
             notifications = MessageListener.allowed(context)
             isAssistant = AssistantRole.isDefault(context)
             sms = smsGranted(context)
-            if (on) onToolsChanged()
             refreshed++
         }
     }
@@ -95,7 +93,6 @@ internal fun MessagesSettings(settings: SettingsStore, inbox: Inbox, smsSync: Sm
         sms = granted
         if (granted) {
             smsSync.syncSoon()
-            onToolsChanged()
         }
     }
 
@@ -114,7 +111,6 @@ internal fun MessagesSettings(settings: SettingsStore, inbox: Inbox, smsSync: Sm
             on = turnOn
             settings.keepMessages = turnOn
             if (turnOn) smsSync.syncSoon()
-            onToolsChanged()
         },
     )
 
@@ -129,7 +125,7 @@ internal fun MessagesSettings(settings: SettingsStore, inbox: Inbox, smsSync: Sm
             Text("Allow notification access", style = MaterialTheme.typography.titleSmall, color = AppColors.TextPrimary)
             Text(
                 "Messages from WhatsApp, Telegram, email and other apps are kept as their notifications arrive. Android asks you to " +
-                    "give this yourself. Tap below, then turn on Local Assistant.",
+                    "give this yourself. Tap below, then turn on Luna.",
                 style = MaterialTheme.typography.bodySmall,
                 color = AppColors.TextSecondary,
                 modifier = Modifier.padding(top = 4.dp),
@@ -152,8 +148,8 @@ internal fun MessagesSettings(settings: SettingsStore, inbox: Inbox, smsSync: Sm
                 when {
                     sms && isAssistant -> "Your SMS inbox is read too, including what came before."
                     isAssistant -> "Allow SMS to search the texts you got before, not only new ones."
-                    sms -> "SMS are read only while Local Assistant is the phone's digital assistant. New texts are still kept from their notifications."
-                    else -> "To search the texts you got before, make Local Assistant the phone's digital assistant; it then also opens with the power button. New texts are kept from their notifications."
+                    sms -> "SMS are read only while Luna is the phone's digital assistant. New texts are still kept from their notifications."
+                    else -> "To search the texts you got before, make Luna the phone's digital assistant; it then also opens with the power button. New texts are kept from their notifications."
                 },
                 style = MaterialTheme.typography.bodySmall,
                 color = AppColors.TextSecondary,

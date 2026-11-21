@@ -27,7 +27,7 @@ import java.io.File
  * touched.
  *
  *     adb shell am instrument -w -e class com.local.assistant.model.DownloadPauseTest \
- *         com.taslim.localassistant.dev.test/androidx.test.runner.AndroidJUnitRunner
+ *         com.taslim.luna.dev.test/androidx.test.runner.AndroidJUnitRunner
  */
 @RunWith(AndroidJUnit4::class)
 class DownloadPauseTest {

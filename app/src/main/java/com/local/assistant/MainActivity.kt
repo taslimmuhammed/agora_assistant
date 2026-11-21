@@ -35,13 +35,10 @@ import androidx.activity.compose.BackHandler
 import com.local.assistant.ui.chat.ChatViewModel
 import com.local.assistant.ui.settings.SettingsScreen
 import com.local.assistant.ui.settings.SettingsSection
-import com.local.assistant.ui.setup.ModelScreen
+import com.local.assistant.ui.setup.MemorySearchScreen
 import com.local.assistant.ui.setup.PermissionTour
 import com.local.assistant.ui.setup.SetupNote
 import com.local.assistant.ui.setup.SetupScreen
-import com.local.assistant.ui.setup.WelcomeTour
-import com.local.assistant.ui.web.WebSearchScreen
-import com.local.assistant.ui.web.WebSearchViewModel
 import com.local.assistant.ui.theme.LocalAssistantTheme
 import com.local.assistant.ui.theme.installGlassBackdrop
 
@@ -112,103 +109,52 @@ private fun AppRoot(
     settingsToOpen: Boolean,
     onSettingsOpened: () -> Unit,
 ) {
-    val installed by container.modelManager.installed.collectAsStateWithLifecycle()
     val context = androidx.compose.ui.platform.LocalContext.current
     var showSettings by remember { mutableStateOf(false) }
-    // The settings page open: kept here, so returning from the model, profile or web search
+    // The settings page open: kept here, so returning from the memory search, profile or web search
     // screen comes back to it.
     var settingsSection by rememberSaveable { mutableStateOf<SettingsSection?>(null) }
-    var showModelScreen by remember { mutableStateOf(false) }
+    var showMemorySearch by remember { mutableStateOf(false) }
     var showMemoryScreen by remember { mutableStateOf(false) }
     var showRemindersScreen by remember { mutableStateOf(false) }
     var showNotesScreen by remember { mutableStateOf(false) }
     var notesFromChat by remember { mutableStateOf(false) }
     var showProfileScreen by remember { mutableStateOf(false) }
-    var showWebSearchScreen by remember { mutableStateOf(false) }
     var showPhotosScreen by remember { mutableStateOf(false) }
-    var showTour by remember { mutableStateOf(false) }
     var showSetupScreen by remember { mutableStateOf(false) }
-    var tourSeen by remember { mutableStateOf(container.settings.tourSeen) }
     var profileAsked by remember { mutableStateOf(container.settings.profileAsked) }
-    var webSearchAsked by remember { mutableStateOf(container.settings.webSearchAsked || container.webSearch.enabled) }
     var accessAsked by remember { mutableStateOf(container.settings.accessAsked) }
-
-    // A model installed in this run (the first download, or an import) is loaded, and the first
-    // chat's prompt read, before the chat opens: otherwise the first message waits ~15 s. A model
-    // that was already there at launch loads in the background, as before.
-    var hadModel by rememberSaveable { mutableStateOf(installed != null) }
-    var preparing by rememberSaveable { mutableStateOf(false) }
-    // A first setup stays on its page, the rest going on, until the user moves on to the chat.
-    var setupDone by rememberSaveable { mutableStateOf(installed != null) }
-    LaunchedEffect(installed != null) {
-        if (installed != null && !hadModel) {
-            preparing = true
-            try {
-                container.prepareFirstChat()
-            } finally {
-                preparing = false
-            }
-        }
-        hadModel = installed != null
-    }
 
     // The overlay's "Open in app": to the chat, from whichever screen the app was left on.
     LaunchedEffect(chatToOpen) {
         if (chatToOpen == null) return@LaunchedEffect
         showSettings = false
-        showModelScreen = false
+        showMemorySearch = false
         showMemoryScreen = false
         showRemindersScreen = false
         showNotesScreen = false
         showProfileScreen = false
-        showWebSearchScreen = false
         showPhotosScreen = false
-        showTour = false
         showSetupScreen = false
     }
     // The lock-screen notice: straight to Settings, where talking on the lock screen is turned on.
     LaunchedEffect(settingsToOpen) {
         if (!settingsToOpen) return@LaunchedEffect
-        showModelScreen = false
+        showMemorySearch = false
         showMemoryScreen = false
         showRemindersScreen = false
         showNotesScreen = false
         showProfileScreen = false
-        showWebSearchScreen = false
         showPhotosScreen = false
-        showTour = false
         showSettings = true
         settingsSection = SettingsSection.CALLING
         onSettingsOpened()
     }
 
-    // First launch: what the app can do, before anything is asked. Skippable.
-    if (!tourSeen) {
-        WelcomeTour(firstRun = true, onDone = {
-            container.settings.tourSeen = true
-            tourSeen = true
-        })
-        return
-    }
-
-    // Then a few details about the user. Skippable.
+    // First launch: a few details about her, so Luna knows who she's talking to. Skippable.
     if (!profileAsked) {
         val profileViewModel: ProfileViewModel = viewModel(factory = ProfileViewModel.factory(container))
         ProfileScreen(viewModel = profileViewModel, onboarding = true, onDone = { profileAsked = true })
-        return
-    }
-
-    // Then web search, optional: a Tavily key, or skip. Asked once.
-    if (!webSearchAsked) {
-        val webViewModel: WebSearchViewModel = viewModel(key = "web-onboarding", factory = WebSearchViewModel.factory(container))
-        WebSearchScreen(
-            viewModel = webViewModel,
-            onboarding = true,
-            onBack = {
-                container.settings.webSearchAsked = true
-                webSearchAsked = true
-            },
-        )
         return
     }
 
@@ -218,28 +164,22 @@ private fun AppRoot(
         return
     }
 
-    // With no model there is nothing to chat with, so setup is the whole app: the download, the
-    // first load, and the indexing after, until "Start chatting".
-    if (installed == null || preparing || !setupDone) {
-        SetupScreen(container = container, preparing = preparing, onStart = { setupDone = true })
-        return
-    }
+    // Luna opens straight to the chat: typed messages, voice messages and calls all go to Luna's
+    // server. The one thing the phone downloads, photo and memory search's model, is optional.
 
     // Opened from the chat's setup note, while indexing or a download goes on.
     if (showSetupScreen) {
         BackHandler { showSetupScreen = false }
-        SetupScreen(container = container, preparing = false, onStart = {}, onBack = { showSetupScreen = false })
+        SetupScreen(container = container, onBack = { showSetupScreen = false })
         return
     }
 
-    // The model page from Settings; with none installed, setup above is shown instead.
-    if (showModelScreen) {
-        BackHandler { showModelScreen = false }
-        ModelScreen(
-            modelManager = container.modelManager,
-            llmService = container.llmService,
-            onBack = { showModelScreen = false },
+    // Photo and memory search's model, from Settings.
+    if (showMemorySearch) {
+        BackHandler { showMemorySearch = false }
+        MemorySearchScreen(
             memorySearch = remember(container) { container.memorySearchControls() },
+            onBack = { showMemorySearch = false },
         )
         return
     }
@@ -251,17 +191,6 @@ private fun AppRoot(
         ProfileScreen(viewModel = profileViewModel, onboarding = false, onDone = { showProfileScreen = false })
         return
     }
-    if (showWebSearchScreen) {
-        BackHandler { showWebSearchScreen = false }
-        val webViewModel: WebSearchViewModel = viewModel(factory = WebSearchViewModel.factory(container))
-        WebSearchScreen(viewModel = webViewModel, onBack = { showWebSearchScreen = false })
-        return
-    }
-    // The tour again, from Settings, and back to it.
-    if (showTour) {
-        WelcomeTour(firstRun = false, onDone = { showTour = false })
-        return
-    }
     if (showSettings) {
         BackHandler {
             showSettings = false
@@ -269,16 +198,13 @@ private fun AppRoot(
         }
         val memoryViewModel: MemoryViewModel = viewModel(factory = MemoryViewModel.factory(container))
         SettingsScreen(
-            llmService = container.llmService,
             settings = container.settings,
             speaker = container.speaker,
             voicePacks = container.voicePacks,
-            webSearchOn = container.webSearch.enabled,
             memory = memoryViewModel,
             awayBrief = container.awayBrief,
             inbox = container.inbox,
             smsSync = container.smsSync,
-            onToolsChanged = container.conversations::prefixMayHaveChanged,
             health = container.healthSource,
             secrets = container.secrets,
             liveCalls = container.liveCalls,
@@ -290,9 +216,7 @@ private fun AppRoot(
                 settingsSection = null
             },
             onOpenProfile = { showProfileScreen = true },
-            onOpenModel = { showModelScreen = true },
-            onOpenWebSearch = { showWebSearchScreen = true },
-            onOpenTour = { showTour = true },
+            onOpenMemorySearch = { showMemorySearch = true },
         )
         return
     }

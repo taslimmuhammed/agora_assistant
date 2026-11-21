@@ -21,6 +21,7 @@ test("Rahul's \"1\" is said in her call at once and shown on her phone", async (
   assert.deepEqual(f.agents.spoken, [{ agentId: 'agent-1', text: "Rahul said yes: take Amma to Dr. Rao's clinic, 4:30 PM today." }])
   assert.equal(phone.received.find(m => m.type === 'hub_update')?.kind, 'task_reply')
   assert.match(session.actions.at(-1)!, /Rahul said yes/)
+  assert.deepEqual(f.hub.answersAfter(0).map(e => e.told), [true], 'heard in the call: the phone needn\'t tell her again')
   const thanks = f.socket.sent[1]
   assert.equal(thanks.quoted, message.id)
   assert.match(thanks.text, /\*1\* {2}✅ Done/)
@@ -46,6 +47,7 @@ test("the shop's confirmation and note reach her; with no call they wait for the
   const news = f.hub.eventsSince(0).map(e => e.text)
   assert.ok(news.includes('Ramesh Stores confirmed: Milk, 2 kg atta.'))
   assert.ok(news.includes('Ramesh Stores says: Delivery by 11'))
+  assert.ok(f.hub.answersAfter(0).every(e => !e.told), 'no call: the phone tells her')
   assert.match(f.socket.sent.at(-1)!.text, /Luna will tell Lakshmi/)
 })
 

@@ -2,7 +2,7 @@ import agoraToken from 'agora-token'
 import type { Config } from './config.ts'
 
 // CommonJS: its exports aren't visible to ESM by name.
-const { RtcRole, RtcTokenBuilder } = agoraToken
+const { ConvoAITokenBuilder, RtcRole, RtcTokenBuilder } = agoraToken
 import type { Session } from './sessions.ts'
 
 /** A day: Agora's limit for a token, and longer than any call. */
@@ -25,6 +25,14 @@ export function rtcRtmToken(config: Config, channel: string, account: string | n
   )
 }
 
+/**
+ * The agent's own token: RTC and RTM to join the channel, and ConvoAI, which also signs the REST
+ * calls about it when there's no Customer ID and Secret.
+ */
+export function agentToken(config: Config, channel: string, agentUid: string | number): string {
+  return ConvoAITokenBuilder.buildToken(config.agora.appId, config.agora.appCertificate, channel, String(agentUid), TOKEN_SECONDS, TOKEN_SECONDS)
+}
+
 /** The Conversational AI Engine's REST calls the server makes; a fake in tests. */
 export interface AgentApi {
   join(body: unknown): Promise<{ agent_id: string; status: string }>
@@ -33,31 +41,46 @@ export interface AgentApi {
   speak(agentId: string, text: string): Promise<void>
 }
 
+/**
+ * Signed with the Customer ID and Secret when they're set (Basic), otherwise with each agent's own
+ * token (`agora token=…`), which needs only the App ID and App Certificate.
+ */
 export class AgoraAgents implements AgentApi {
   private readonly base: string
-  private readonly auth: string
+  private readonly basic: string | null
+  /** Each running agent's token, for its leave and speak calls. */
+  private readonly tokens = new Map<string, string>()
 
   constructor(config: Config) {
     this.base = `https://api.agora.io/api/conversational-ai-agent/v2/projects/${config.agora.appId}`
-    this.auth = 'Basic ' + Buffer.from(`${config.agora.customerId}:${config.agora.customerSecret}`).toString('base64')
+    this.basic = config.agora.customerId && config.agora.customerSecret
+      ? 'Basic ' + Buffer.from(`${config.agora.customerId}:${config.agora.customerSecret}`).toString('base64')
+      : null
   }
 
   async join(body: unknown) {
-    return (await this.post('/join', body)) as { agent_id: string; status: string }
+    const token = String((body as { properties?: { token?: string } }).properties?.token ?? '')
+    const joined = (await this.post('/join', body, token)) as { agent_id: string; status: string }
+    this.tokens.set(joined.agent_id, token)
+    return joined
   }
 
   async leave(agentId: string) {
-    await this.post(`/agents/${agentId}/leave`, {})
+    try {
+      await this.post(`/agents/${agentId}/leave`, {}, this.tokens.get(agentId) ?? '')
+    } finally {
+      this.tokens.delete(agentId)
+    }
   }
 
   async speak(agentId: string, text: string) {
-    await this.post(`/agents/${agentId}/speak`, { text: fitBytes(text, 512), priority: 'APPEND', interruptable: true })
+    await this.post(`/agents/${agentId}/speak`, { text: fitBytes(text, 512), priority: 'APPEND', interruptable: true }, this.tokens.get(agentId) ?? '')
   }
 
-  private async post(path: string, body: unknown): Promise<unknown> {
+  private async post(path: string, body: unknown, token: string): Promise<unknown> {
     const response = await fetch(this.base + path, {
       method: 'POST',
-      headers: { Authorization: this.auth, 'Content-Type': 'application/json' },
+      headers: { Authorization: this.basic ?? `agora token="${token}"`, 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(15_000),
     })
@@ -87,7 +110,7 @@ export function joinBody(config: Config, session: Session, prompt: string, greet
     name: `luna-${session.id}`,
     properties: {
       channel: session.channel,
-      token: rtcRtmToken(config, session.channel, session.agentUid),
+      token: agentToken(config, session.channel, session.agentUid),
       agent_rtc_uid: String(session.agentUid),
       remote_rtc_uids: [String(session.uid)],
       // A quiet minute ends the call: the free minutes go to rehearsals, not empty rooms.

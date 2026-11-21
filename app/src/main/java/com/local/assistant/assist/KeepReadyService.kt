@@ -196,10 +196,10 @@ class KeepReadyService : Service() {
         private val LOCATION = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION else 0
         private val MICROPHONE = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE else 0
 
-        /** The wake word is on, with a model to answer it and the microphone allowed. */
+        /** The wake word is on and the microphone allowed. */
         private fun listens(context: Context): Boolean {
             val settings = context.appContainer.settings
-            return settings.modelPath != null && settings.wakeWord != WakeWordMode.OFF &&
+            return settings.wakeWord != WakeWordMode.OFF &&
                 context.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
         }
 

@@ -16,7 +16,7 @@ export interface Config {
     /** The join request's whole asr block. */
     asr: Record<string, unknown>
   }
-  llm: { baseUrl: string; apiKey: string; model: string; reasoningEffort: string }
+  llm: { baseUrl: string; apiKey: string; model: string; reasoningEffort: string; fallbackModel: string }
   murf: { apiKey: string; voiceId: string; locale: string; model: string; rate: number; baseUrl: string }
   /** WhatsApp through Baileys: off with WHATSAPP=off; the signed-in session is kept in authDir. */
   whatsapp: { enabled: boolean; authDir: string }
@@ -46,8 +46,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       baseUrl: read('LLM_BASE_URL', 'https://generativelanguage.googleapis.com/v1beta/openai/'),
       // GEMINI_* as well: the names Google's own examples use.
       apiKey: read('LLM_API_KEY', read('GEMINI_API_KEY')),
-      model: read('LLM_MODEL', read('GEMINI_MODEL_ID', 'gemini-2.5-flash')),
+      model: read('LLM_MODEL', read('GEMINI_MODEL_ID', 'gemini-3.8-flash')),
       reasoningEffort: read('LLM_REASONING_EFFORT'),
+      // Answer, in turn, when the model above is busy or slow ("none": wait for it instead).
+      fallbackModel: read('LLM_FALLBACK_MODEL', /generativelanguage\.googleapis\.com/.test(read('LLM_BASE_URL', 'https://generativelanguage.googleapis.com/')) ? 'gemini-3.5-flash-lite,gemini-flash-lite-latest' : '').replace(/^none$/i, ''),
     },
     murf: {
       apiKey: read('MURF_API_KEY'),

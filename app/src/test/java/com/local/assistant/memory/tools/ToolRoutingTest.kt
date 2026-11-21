@@ -1,7 +1,6 @@
 package com.local.assistant.memory.tools
 
 import com.google.gson.Gson
-import com.local.assistant.llm.GenEvent
 import com.local.assistant.llm.ToolCall
 import com.local.assistant.memory.core.CoreMemoryRenderer
 import com.local.assistant.memory.db.EventEntity
@@ -15,7 +14,6 @@ import com.local.assistant.location.SavedPlaces
 import com.local.assistant.memory.db.PlaceDistance
 import com.local.assistant.memory.db.PlaceSpot
 import com.local.assistant.memory.db.TaskPlace
-import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -28,28 +26,48 @@ import java.time.ZoneId
 import java.time.ZonedDateTime
 
 /**
- * Test group 3: the model's tool calls, scripted, run through the real loop and executor against
- * in-memory fakes. Fixed clock: Monday 21 September 2026, 10:00, Asia/Kolkata.
+ * Test group 3: tool calls as Luna's server asks for them, scripted, run through the real executor
+ * against in-memory fakes. Fixed clock: Monday 21 September 2026, 10:00, Asia/Kolkata.
  */
 class ToolRoutingTest {
 
     private val zone = ZoneId.of("Asia/Kolkata")
+
     private var now = ZonedDateTime.of(2026, 9, 21, 10, 0, 0, 0, zone)
+
     private val store = FakeMemoryStore { now.toInstant().toEpochMilli() }
+
     private val reminders = FakeReminders()
+
     private val log = FakeToolLog()
+
     private val clock = FakeSystemAlarms()
+
     private val images = FakeImageNotes()
+
     private var paused = false
+
     private val phone = FakePhone()
+
     private var contacts: List<Contact>? = listOf(
         Contact("Amma", listOf(ContactPhone("+91 98450 11111"))),
         Contact("Priya Sharma", listOf(ContactPhone("98450 22222")), listOf("priya@example.com")),
         Contact("Priya Nair", listOf(ContactPhone("98450 33333"))),
         Contact("Dr Rao Clinic", listOf(ContactPhone("080 4444 5555"))),
     )
+
     private val people = mutableMapOf<String, PersonHints>()
-    private val device = DeviceTools(phone, { contacts }, { who -> people[who] ?: PersonHints.NONE }, clock, now = { now })
+
+    /** The family hub on Luna's server: who her WhatsApp reaches, by the name asked for. */
+    private val hub = mutableMapOf<String, String>()
+
+    private val sentByLuna = mutableListOf<String>()
+
+    private val device = DeviceTools(
+        phone, { contacts }, { who -> people[who] ?: PersonHints.NONE }, clock, now = { now },
+        family = { to, text -> hub[to.lowercase()]?.also { sentByLuna += "$it: $text" } },
+    )
+
     private val web = object : WebSearch {
         var searched = mutableListOf<Pair<String, Boolean>>()
         var failure: String? = null
@@ -63,20 +81,19 @@ class ToolRoutingTest {
             )
         }
     }
+
     private val placeSearch = FakePlaceSearch().apply { places["dmart"] = FakePlaceSearch.DMARTS }
+
     private val location = FakeLocation()
+
     private val appState = mutableMapOf<String, String>()
+
     private val placeFinder = PlaceFinder(placeSearch, { TEST_TOWNS }, location, SavedPlaces(store, { appState[it] }, { key, value -> appState[key] = value }))
+
     private val executor = ToolExecutor(
         store, reminders, clock, log, now = { now }, memoryPaused = { paused }, images = images, device = device, web = WebTools(web), places = placeFinder,
     )
-    private val loop = ToolLoop(
-        executor,
-        maxRounds = 3,
-        isOverflow = { "too long" in it.message.orEmpty() },
-        isUnreadable = { "Failed to parse tool calls" in it.message.orEmpty() },
-        repair = com.local.assistant.llm.ToolCallRepair(ToolCatalog.declarations(web = true))::repair,
-    )
+
     private val context = ToolContext(chatId = 1, userMessageId = 10)
 
     private fun call(name: String, vararg args: Pair<String, Any?>) = ToolCall(name, mapOf(*args))
@@ -84,67 +101,14 @@ class ToolRoutingTest {
     private fun at(month: Int, day: Int, hour: Int, minute: Int = 0) =
         ZonedDateTime.of(LocalDateTime.of(2026, month, day, hour, minute), zone).toInstant().toEpochMilli()
 
-    /** Runs one turn in which the model makes [calls] and then says [reply]. */
-    private fun turn(vararg calls: ToolCall, reply: String = "Done."): Pair<ScriptedSession, List<LoopEvent>> {
-        val session = ScriptedSession(ArrayDeque(listOf(ScriptedSession.calls(*calls), ScriptedSession.says(reply))))
-        val events = runBlocking { loop.run(session, "envelope", emptyList(), context).toList() }
-        return session to events
-    }
+    /** Runs one message in which Luna's model makes [calls] and then says [reply]. */
+    private fun turn(vararg calls: ToolCall, reply: String = "Done."): Pair<ToolTurn, List<ToolEvent>> =
+        executor.play(calls.toList(), context, reply)
 
-    private fun result(session: ScriptedSession, index: Int = 0): Map<*, *> =
+    private fun result(session: ToolTurn, index: Int = 0): Map<*, *> =
         Gson().fromJson(session.sentResults.first()[index].json, Map::class.java)
 
-    /** As [turn], asked on the lock screen. */
-    private fun lockedTurn(vararg calls: ToolCall, reply: String = "Done."): Pair<ScriptedSession, List<LoopEvent>> {
-        val session = ScriptedSession(ArrayDeque(listOf(ScriptedSession.calls(*calls), ScriptedSession.says(reply))))
-        val events = runBlocking { loop.run(session, "envelope", emptyList(), context.copy(locked = true)).toList() }
-        return session to events
-    }
-
-    // ---- The lock screen ----
-
-    @Test
-    fun `on the lock screen a reminder is set as usual`() {
-        val (session, events) = lockedTurn(call("add_task", "title" to "Call the CA", "when" to "tomorrow at 11"))
-
-        assertEquals(at(9, 22, 11), store.tasks.values.single().dueAt)
-        assertEquals(true, result(session)["ok"])
-        assertTrue(events.none { it == LoopEvent.NeedsUnlock })
-        assertEquals("Done.", events.filterIsInstance<LoopEvent.Text>().single().delta)
-        assertTrue(LoopEvent.Confirm in events)
-    }
-
-    @Test
-    fun `on the lock screen remembering something asks for an unlock and saves nothing`() {
-        val (session, events) = lockedTurn(call("save_fact", "attribute" to "dentist", "value" to "Dr. Rao"))
-
-        assertTrue(store.facts.isEmpty())
-        assertTrue(session.sentResults.isEmpty())
-        assertTrue(log.records.isEmpty())
-        assertEquals(LoopEvent.NeedsUnlock, events[events.size - 2])
-        assertTrue((events.last() as LoopEvent.Done).staleConversation)
-    }
-
-    @Test
-    fun `on the lock screen memory, photos, calls and messages ask for an unlock`() {
-        for (name in listOf("search_memory", "get_upcoming", "find_photos", "phone_call", "send_message", "open_app", "forget", "update_task")) {
-            val (_, events) = lockedTurn(call(name, "query" to "x"))
-            assertTrue(name, LoopEvent.NeedsUnlock in events)
-        }
-        assertTrue(log.records.isEmpty())
-        assertTrue(phone.done.isEmpty())
-    }
-
-    @Test
-    fun `on the lock screen one call it can't make stops the others too`() {
-        val (_, events) = lockedTurn(
-            call("add_task", "title" to "Buy milk", "when" to "tomorrow at 9"),
-            call("save_fact", "attribute" to "milk brand", "value" to "Milma"),
-        )
-
-        assertTrue(store.tasks.isEmpty())
-        assertTrue(LoopEvent.NeedsUnlock in events)
-    }
+    private fun error(session: ToolTurn) = result(session)["error"].toString()
 
     // ---- The brief's three cases ----
 
@@ -153,55 +117,10 @@ class ToolRoutingTest {
         // "Set alarm at 4:30" as the recogniser wrote it: no command in the words, but the turn
         // acted, so no related-photos card goes under it (TurnRunner).
         val (_, events) = turn(call("set_alarm", "when" to "6am"))
-        val memory = events.filterIsInstance<LoopEvent.Memory>().single()
+        val memory = events.filterIsInstance<ToolEvent.Memory>().single()
         assertEquals("set_alarm", memory.tool)
         assertTrue(memory.tool in ToolCatalog.ACTS)
         assertFalse(ToolCatalog.FIND_PHOTOS in ToolCatalog.ACTS || ToolCatalog.WEB_SEARCH in ToolCatalog.ACTS || ToolCatalog.SEARCH_MEMORY in ToolCatalog.ACTS)
-    }
-
-    @Test
-    fun `remind me to call the CA tomorrow at 11`() {
-        val (session, events) = turn(call("add_task", "title" to "Call the CA", "when" to "tomorrow at 11"))
-
-        val task = store.tasks.values.single()
-        assertEquals("Call the CA", task.title)
-        assertEquals(at(9, 22, 11), task.dueAt)
-        assertEquals(mapOf(task.id to at(9, 22, 11)), reminders.scheduled)
-
-        assertEquals(true, result(session)["ok"])
-        assertEquals("Tue 22 Sep 11:00", result(session)["due"])
-        val chip = events.filterIsInstance<LoopEvent.Memory>().single().chip
-        assertEquals(MemoryChip(MemoryChip.Kind.TASK, "Reminder", "Call the CA", at(9, 22, 11), editable = true), chip)
-        assertEquals("Done.", events.filterIsInstance<LoopEvent.Text>().single().delta)
-        assertTrue(LoopEvent.Confirm in events)
-        assertTrue(events.last() is LoopEvent.Done)
-    }
-
-    @Test
-    fun `my dentist is Dr Rao`() {
-        val (_, events) = turn(call("save_fact", "subject" to "user", "attribute" to "dentist", "value" to "Dr. Rao", "core" to false))
-
-        val fact = store.facts.values.single()
-        assertEquals(Triple("user", "dentist", "Dr. Rao"), Triple(fact.subject, fact.attribute, fact.value))
-        assertFalse(fact.core)
-        assertEquals(FactCategory.PEOPLE, fact.category)
-        val chip = events.filterIsInstance<LoopEvent.Memory>().single().chip
-        assertEquals("Saved", chip.label)
-        assertEquals("Dentist: Dr. Rao", chip.detail)
-        assertFalse((events.last() as LoopEvent.Done).changedPrefix)
-    }
-
-    @Test
-    fun `reply in short answers becomes core and re-renders the prefix`() {
-        val (_, events) = turn(call("save_fact", "subject" to "user", "attribute" to "pref.reply_style", "value" to "short answers", "core" to true))
-
-        val fact = store.facts.values.single()
-        assertEquals("pref.reply_style", fact.attribute)
-        assertTrue(fact.core)
-        assertEquals(FactCategory.PREFERENCE, fact.category)
-        val core = CoreMemoryRenderer(HeuristicTokenEstimator).render(runBlocking { store.coreFacts() }, 1_200)
-        assertTrue(core.text, "Preferences: reply style: short answers" in core.text)
-        assertTrue("prefix marked dirty", (events.last() as LoopEvent.Done).changedPrefix)
     }
 
     // ---- Beyond the three ----
@@ -217,7 +136,7 @@ class ToolRoutingTest {
         val (_, events) = turn(call("add_task", "title" to "renew the passport"))
         assertNull(store.tasks.values.single().dueAt)
         assertTrue(reminders.scheduled.isEmpty())
-        assertEquals("To-do", events.filterIsInstance<LoopEvent.Memory>().single().chip.label)
+        assertEquals("To-do", events.filterIsInstance<ToolEvent.Memory>().single().chip.label)
     }
 
     @Test
@@ -226,7 +145,7 @@ class ToolRoutingTest {
         assertEquals(false, result(session)["ok"])
         assertTrue(result(session)["error"].toString().contains("someday"))
         assertTrue(store.tasks.isEmpty())
-        assertTrue(events.none { it is LoopEvent.Memory })
+        assertTrue(events.none { it is ToolEvent.Memory })
 
         val (past, _) = turn(call("add_task", "title" to "call the CA", "when" to "today at 9"))
         assertTrue(result(past)["error"].toString().contains("passed"))
@@ -251,7 +170,7 @@ class ToolRoutingTest {
         val (second, events) = turn(add)
         assertEquals(1, store.tasks.size)
         assertEquals(result(first)["id"], result(second)["id"])
-        assertTrue("no second chip", events.none { it is LoopEvent.Memory })
+        assertTrue("no second chip", events.none { it is ToolEvent.Memory })
 
         now = now.plusMinutes(2)
         turn(add)
@@ -261,7 +180,7 @@ class ToolRoutingTest {
     @Test
     fun `undo takes a reminder back, alarm and all, exactly once`() {
         val (_, events) = turn(call("add_task", "title" to "Call the CA", "when" to "tomorrow at 11"))
-        val recordId = events.filterIsInstance<LoopEvent.Memory>().single().recordId
+        val recordId = events.filterIsInstance<ToolEvent.Memory>().single().recordId
 
         assertEquals(ToolExecutor.UndoResult.UNDONE, runBlocking { executor.undo(recordId) })
         assertTrue(store.tasks.isEmpty())
@@ -275,9 +194,9 @@ class ToolRoutingTest {
         turn(call("save_fact", "subject" to "user", "attribute" to "dentist", "value" to "Dr. Rao"))
         now = now.plusMinutes(5)
         val (_, events) = turn(call("save_fact", "subject" to "user", "attribute" to "dentist", "value" to "Dr. Mehta"))
-        assertEquals("Updated", events.filterIsInstance<LoopEvent.Memory>().single().chip.label)
+        assertEquals("Updated", events.filterIsInstance<ToolEvent.Memory>().single().chip.label)
 
-        runBlocking { executor.undo(events.filterIsInstance<LoopEvent.Memory>().single().recordId) }
+        runBlocking { executor.undo(events.filterIsInstance<ToolEvent.Memory>().single().recordId) }
         assertEquals("Dr. Rao", store.facts.values.single().value)
     }
 
@@ -286,7 +205,7 @@ class ToolRoutingTest {
         val (_, events) = turn(call("save_fact", "subject" to "user", "attribute" to "dentist", "value" to "Dr. Rao"))
         now = now.plusMinutes(5)
         turn(call("save_fact", "subject" to "user", "attribute" to "dentist", "value" to "Dr. Mehta"))
-        val first = events.filterIsInstance<LoopEvent.Memory>().single().recordId
+        val first = events.filterIsInstance<ToolEvent.Memory>().single().recordId
         assertEquals(ToolExecutor.UndoResult.CHANGED_SINCE, runBlocking { executor.undo(first) })
         assertEquals("Dr. Mehta", store.facts.values.single().value)
     }
@@ -298,7 +217,7 @@ class ToolRoutingTest {
         val task = store.tasks.values.single()
         assertEquals(at(9, 22, 15), task.dueAt)
         assertEquals(at(9, 22, 15), reminders.scheduled[task.id])
-        assertEquals("Moved", events.filterIsInstance<LoopEvent.Memory>().single().chip.label)
+        assertEquals("Moved", events.filterIsInstance<ToolEvent.Memory>().single().chip.label)
         assertEquals("Tue 22 Sep 15:00", result(session)["due"])
     }
 
@@ -309,7 +228,7 @@ class ToolRoutingTest {
         val task = store.tasks.values.single()
         assertEquals(TaskStatus.OPEN, task.status)
         assertEquals(at(10, 5, 9), task.dueAt)
-        assertEquals("Done, next one set", events.filterIsInstance<LoopEvent.Memory>().single().chip.label)
+        assertEquals("Done, next one set", events.filterIsInstance<ToolEvent.Memory>().single().chip.label)
     }
 
     @Test
@@ -339,9 +258,9 @@ class ToolRoutingTest {
         val (session, events) = turn(call("forget", "subject" to "dentist"))
         assertEquals(1.0, result(session)["removed"])
         assertTrue(store.facts.isEmpty())
-        assertEquals("Forgot", events.filterIsInstance<LoopEvent.Memory>().single().chip.label)
+        assertEquals("Forgot", events.filterIsInstance<ToolEvent.Memory>().single().chip.label)
 
-        runBlocking { executor.undo(events.filterIsInstance<LoopEvent.Memory>().single().recordId) }
+        runBlocking { executor.undo(events.filterIsInstance<ToolEvent.Memory>().single().recordId) }
         assertEquals("Dr. Rao", store.facts.values.single().value)
         assertTrue("tombstone lifted", store.tombstones.isEmpty())
     }
@@ -390,7 +309,7 @@ class ToolRoutingTest {
         val (session, events) = turn(call("set_alarm", "when" to "6am", "label" to "wake up"))
         assertEquals(listOf(FakeSystemAlarms.Set(6, 0, emptySet(), "Wake up")), clock.set)
         assertEquals("Tue 22 Sep 06:00", result(session)["alarm"])
-        val chip = events.filterIsInstance<LoopEvent.Memory>().single().chip
+        val chip = events.filterIsInstance<ToolEvent.Memory>().single().chip
         assertEquals(MemoryChip.Kind.ALARM, chip.kind)
         assertEquals(at(9, 22, 6), chip.at)
         assertNull("the clock app owns it; no undo from here", log.records.values.single().undo)
@@ -415,11 +334,8 @@ class ToolRoutingTest {
     }
 
     /** As [turn], for a message the user said: [text]. */
-    private fun said(text: String, vararg calls: ToolCall): Pair<ScriptedSession, List<LoopEvent>> {
-        val session = ScriptedSession(ArrayDeque(listOf(ScriptedSession.calls(*calls), ScriptedSession.says("Done."))))
-        val events = runBlocking { loop.run(session, "envelope", emptyList(), context.copy(userText = text)).toList() }
-        return session to events
-    }
+    private fun said(text: String, vararg calls: ToolCall): Pair<ToolTurn, List<ToolEvent>> =
+        executor.play(calls.toList(), context.copy(userText = text))
 
     @Test
     fun `an alarm's name is one the user said`() {
@@ -449,7 +365,7 @@ class ToolRoutingTest {
         val days = java.time.DayOfWeek.entries.take(5).toSet()
         assertEquals(listOf(FakeSystemAlarms.Set(7, 0, days, null)), clock.set)
         assertEquals("Mon, Tue, Wed, Thu, Fri", result(session)["repeats"])
-        assertEquals(at(9, 22, 7), events.filterIsInstance<LoopEvent.Memory>().single().chip.at)
+        assertEquals(at(9, 22, 7), events.filterIsInstance<ToolEvent.Memory>().single().chip.at)
     }
 
     @Test
@@ -496,65 +412,16 @@ class ToolRoutingTest {
     }
 
     @Test
-    fun `a model that will not stop calling tools is cut off after three rounds`() {
-        val looping = call("get_upcoming")
-        val session = ScriptedSession(ArrayDeque(List(6) { ScriptedSession.calls(looping) }))
-        val events = runBlocking { loop.run(session, "envelope", emptyList(), context).toList() }
-        assertEquals(4, session.sentResults.size)
-        assertEquals(ToolLoop.LIMIT_REACHED, session.sentResults.last().single().json)
-        assertEquals(4, (events.last() as LoopEvent.Done).toolRounds)
-    }
-
-    @Test
-    fun `a first send refused as too long is reported, not thrown`() {
-        val session = ScriptedSession(ArrayDeque(listOf(listOf(GenEvent.Error(IllegalStateException("Input token ids are too long"))))))
-        val events = runBlocking { loop.run(session, "envelope", emptyList(), context).toList() }
-        assertEquals(listOf(LoopEvent.Overflow), events)
-    }
-
-    @Test
-    fun `an unreadable first tool call is reported for a retry, one after a tool round is not`() {
-        val unreadable = listOf(GenEvent.Error(IllegalStateException("Status Code: 3. Message: Failed to parse tool calls")))
-        val first = ScriptedSession(ArrayDeque(listOf(unreadable)))
-        assertEquals(listOf(LoopEvent.Unreadable), runBlocking { loop.run(first, "envelope", emptyList(), context).toList() })
-
-        // The first round already ran a tool: trying the whole turn again would run it twice.
-        val later = ScriptedSession(ArrayDeque(listOf(ScriptedSession.calls(call("get_upcoming", "days" to 7)), unreadable)))
-        val thrown = runCatching { runBlocking { loop.run(later, "envelope", emptyList(), context).toList() } }.exceptionOrNull()
-        assertTrue(thrown?.message.orEmpty().contains("Failed to parse"))
-    }
-
-    @Test
-    fun `a call that only slipped in its format is carried out and confirmed, and the conversation rebuilt`() {
-        val slipped = listOf(GenEvent.Error(IllegalStateException("Failed to parse tool calls from code block: call:add_task{title:<|\"|>Renew passport<|\"|>, next month<|\"|>}")))
-        val events = runBlocking { loop.run(ScriptedSession(ArrayDeque(listOf(slipped))), "envelope", emptyList(), context).toList() }
-        val task = store.tasks.values.single()
-        assertEquals("Renew passport", task.title)
-        assertEquals(LoopEvent.Text("Done."), events.filterIsInstance<LoopEvent.Text>().single())
-        assertTrue(events.last().let { it is LoopEvent.Done && it.staleConversation })
-        assertEquals(MemoryChip.Kind.TASK, events.filterIsInstance<LoopEvent.Memory>().single().chip.kind)
-    }
-
-    @Test
-    fun `a slipped call that only looks something up, or that fails, is retried instead`() {
-        val lookup = listOf(GenEvent.Error(IllegalStateException("Failed to parse tool calls from code block: call:calculate{<|\"|>2+2<|\"|>}")))
-        assertEquals(listOf(LoopEvent.Unreadable), runBlocking { loop.run(ScriptedSession(ArrayDeque(listOf(lookup))), "envelope", emptyList(), context).toList() })
-        val badTime = listOf(GenEvent.Error(IllegalStateException("Failed to parse tool calls from code block: call:add_task{title:<|\"|>Call mom<|\"|>, more often}")))
-        assertEquals(listOf(LoopEvent.Unreadable), runBlocking { loop.run(ScriptedSession(ArrayDeque(listOf(badTime))), "envelope", emptyList(), context).toList() })
-        assertTrue(store.tasks.isEmpty())
-    }
-
-    @Test
     fun `without exact alarms the chip says it may be late`() {
         reminders.exact = false
         val (_, events) = turn(call("add_task", "title" to "Call the CA", "when" to "tomorrow at 11"))
-        assertEquals("may be a few minutes late", events.filterIsInstance<LoopEvent.Memory>().single().chip.note)
+        assertEquals("may be a few minutes late", events.filterIsInstance<ToolEvent.Memory>().single().chip.note)
     }
 
     @Test
     fun `editing a chip's time moves the reminder and its alarm`() {
         val (_, events) = turn(call("add_task", "title" to "Call the CA", "when" to "tomorrow at 11"))
-        val recordId = events.filterIsInstance<LoopEvent.Memory>().single().recordId
+        val recordId = events.filterIsInstance<ToolEvent.Memory>().single().recordId
         assertTrue(runBlocking { executor.editTime(recordId, at(9, 23, 16)) })
         val task = store.tasks.values.single()
         assertEquals(at(9, 23, 16), task.dueAt)
@@ -575,7 +442,7 @@ class ToolRoutingTest {
         assertTrue("kochi2026" in details)
         assertEquals("the newest image up to this message", 9L, image.messageId)
         assertEquals(true, result(session)["ok"])
-        val chip = events.filterIsInstance<LoopEvent.Memory>().single().chip
+        val chip = events.filterIsInstance<ToolEvent.Memory>().single().chip
         assertEquals(MemoryChip.Kind.IMAGE, chip.kind)
         assertEquals("Saved image", chip.label)
     }
@@ -585,14 +452,14 @@ class ToolRoutingTest {
         val (session, events) = turn(call("remember_image", "title" to "receipt", "details" to "Total 450"))
         assertEquals(false, result(session)["ok"])
         assertTrue(images.saved.isEmpty())
-        assertTrue(events.none { it is LoopEvent.Memory })
+        assertTrue(events.none { it is ToolEvent.Memory })
     }
 
     @Test
     fun `undo of a saved image deletes it`() {
         images.sent[1] = mutableMapOf(10L to "/a/receipt.jpg")
         val (_, events) = turn(call("remember_image", "title" to "receipt", "details" to "Total 450"))
-        assertEquals(ToolExecutor.UndoResult.UNDONE, runBlocking { executor.undo(events.filterIsInstance<LoopEvent.Memory>().single().recordId) })
+        assertEquals(ToolExecutor.UndoResult.UNDONE, runBlocking { executor.undo(events.filterIsInstance<ToolEvent.Memory>().single().recordId) })
         assertTrue(images.saved.isEmpty())
     }
 
@@ -607,13 +474,11 @@ class ToolRoutingTest {
 
     // ---- Everyday tools ----
 
-    private fun error(session: ScriptedSession) = result(session)["error"].toString()
-
     @Test
     fun `call amma opens the dialer with her number, and nothing is placed`() {
         val (_, events) = turn(call("phone_call", "who" to "amma"))
         assertEquals(listOf("dial +91 98450 11111"), phone.done)
-        val chip = events.filterIsInstance<LoopEvent.Memory>().single().chip
+        val chip = events.filterIsInstance<ToolEvent.Memory>().single().chip
         assertEquals(MemoryChip.Kind.CALL, chip.kind)
         assertEquals("Amma · +91 98450 11111", chip.detail)
     }
@@ -624,38 +489,6 @@ class ToolRoutingTest {
         contacts = null
         turn(call("phone_call", "who" to "mom"))
         assertEquals(listOf("dial 98470 12345"), phone.done)
-    }
-
-    /** As on 4 Nov 2026: typed "Send to umma" after the recogniser's "Uma", the model still wrote "Uma". */
-    @Test
-    fun `the person messaged is the one the user spelled, not the model`() {
-        contacts = contacts.orEmpty() + listOf(Contact("Uma", listOf(ContactPhone("98450 44444"))), Contact("Umma", listOf(ContactPhone("98450 55555"))))
-        val session = ScriptedSession(
-            ArrayDeque(listOf(ScriptedSession.calls(call("send_message", "to" to "Uma", "text" to "Reached", "app" to "whatsapp")), ScriptedSession.says("Done."))),
-        )
-        runBlocking { loop.run(session, "envelope", emptyList(), ToolContext(1, 13, "Send to umma and turn on flashlight")).toList() }
-        assertTrue(phone.done.single(), phone.done.single().contains("98450 55555"))
-    }
-
-    /**
-     * The model heard the recording; the words are the recogniser's, which wrote "Umma" as "Uma"
-     * and "two thousand four hundred and fifty" as "200450". Its own reading is kept.
-     */
-    @Test
-    fun `a voice message the model heard is not corrected to the recogniser's words`() {
-        contacts = contacts.orEmpty() + listOf(Contact("Uma", listOf(ContactPhone("98450 44444"))), Contact("Umma", listOf(ContactPhone("98450 55555"))))
-        val message = ScriptedSession(
-            ArrayDeque(listOf(ScriptedSession.calls(call("send_message", "to" to "Umma", "text" to "Reached", "app" to "whatsapp")), ScriptedSession.says("Done."))),
-        )
-        runBlocking { loop.run(message, "envelope", emptyList(), ToolContext(1, 13, "Send to Uma reached", heard = true)).toList() }
-        assertTrue(phone.done.single(), phone.done.single().contains("98450 55555"))
-
-        val sum = { ScriptedSession(ArrayDeque(listOf(ScriptedSession.calls(call("calculate", "expression" to "18% of 2450"))))) }
-        val heard = runBlocking { loop.run(sum(), "envelope", emptyList(), ToolContext(1, 14, "what is 18% of 200450", heard = true)).toList() }
-        assertEquals(LoopEvent.Text("18% of 2450 = 441"), heard.filterIsInstance<LoopEvent.Text>().single())
-        // Typed, the user's own digits win, as before.
-        val typed = runBlocking { loop.run(sum(), "envelope", emptyList(), ToolContext(1, 15, "what is 18% of 200450")).toList() }
-        assertTrue(typed.filterIsInstance<LoopEvent.Text>().single().delta.contains("200450"))
     }
 
     @Test
@@ -700,12 +533,31 @@ class ToolRoutingTest {
     }
 
     @Test
+    fun `a message to someone in the family hub goes from Luna's WhatsApp, so the answer comes back`() {
+        hub["filu"] = "Filu"
+        hub["amma"] = "Amma"
+        val (session, events) = turn(call("send_message", "to" to "Filu", "text" to "Can you bring my BP tablets?"), reply = "I've sent your message to Filu.")
+        assertEquals(listOf("Filu: Can you bring my BP tablets?"), sentByLuna)
+        assertTrue("nothing to tap", phone.done.isEmpty())
+        assertTrue(result(session)["sent"].toString().startsWith("on WhatsApp to Filu"))
+        assertEquals("Filu: Can you bring my BP tablets?", events.filterIsInstance<ToolEvent.Memory>().single().chip.detail)
+
+        // An SMS asked for, or someone not in the hub: the phone's own app, ready to send, as before.
+        now = now.plusMinutes(1)
+        turn(call("send_message", "to" to "amma", "text" to "Reached home", "app" to "sms"))
+        now = now.plusMinutes(1)
+        turn(call("send_message", "to" to "Priya Sharma", "text" to "Running late", "app" to "whatsapp"))
+        assertEquals(listOf("SMS +91 98450 11111: Reached home", "WHATSAPP 98450 22222: Running late"), phone.done)
+        assertEquals(1, sentByLuna.size)
+    }
+
+    @Test
     fun `timers go to the clock app from the user's own words`() {
         val (session, events) = turn(call("set_timer", "duration" to "10 minutes", "label" to "pasta"))
         assertEquals(listOf(600 to "Pasta"), clock.timers)
         assertEquals("10 min", result(session)["timer"])
         assertEquals("10:10", result(session)["ends"])
-        assertEquals("10 min · Pasta", events.filterIsInstance<LoopEvent.Memory>().single().chip.detail)
+        assertEquals("10 min · Pasta", events.filterIsInstance<ToolEvent.Memory>().single().chip.detail)
         now = now.plusMinutes(1)
         val (tooLong, _) = turn(call("set_timer", "duration" to "30 hours"))
         assertTrue(error(tooLong).contains("24 hours"))
@@ -746,33 +598,6 @@ class ToolRoutingTest {
     }
 
     @Test
-    fun `calculate answers with the sum itself, without asking the model to restate it`() {
-        val (session, events) = turn(call("calculate", "expression" to "18% of 2450"))
-        assertEquals(listOf(LoopEvent.Text("18% of 2450 = 441")), events.filterIsInstance<LoopEvent.Text>())
-        assertTrue("the model is not asked to restate it", session.sentResults.isEmpty())
-        assertTrue((events.last() as LoopEvent.Done).staleConversation)
-        assertTrue("no chip for arithmetic", events.none { it is LoopEvent.Memory })
-    }
-
-    /** What the phone's GPU does past token 2,048: digits dropped in copying. */
-    @Test
-    fun `numbers the model mis-copied are taken from the user's own words`() {
-        val said = ToolContext(chatId = 1, userMessageId = 10, userText = "what is 25+25")
-        val sum = ScriptedSession(ArrayDeque(listOf(ScriptedSession.calls(call("calculate", "expression" to "5+5+2")))))
-        val events = runBlocking { loop.run(sum, "envelope", emptyList(), said).toList() }
-        assertEquals(LoopEvent.Text("25 + 25 = 50"), events.filterIsInstance<LoopEvent.Text>().single())
-
-        val alarm = ScriptedSession(ArrayDeque(listOf(ScriptedSession.calls(call("set_alarm", "when" to "6:5")), ScriptedSession.says("Done."))))
-        runBlocking { loop.run(alarm, "envelope", emptyList(), ToolContext(1, 11, "set an alarm for 6:35")).toList() }
-        // 6:35 said at 10:00 is this evening's; what matters is the 35 the model dropped.
-        assertEquals(FakeSystemAlarms.Set(18, 35, emptySet(), null), clock.set.single())
-
-        val dial = ScriptedSession(ArrayDeque(listOf(ScriptedSession.calls(call("phone_call", "who" to "94501235")), ScriptedSession.says("Opening."))))
-        runBlocking { loop.run(dial, "envelope", emptyList(), ToolContext(1, 12, "call 98450 12345")).toList() }
-        assertEquals(listOf("dial 98450 12345"), phone.done)
-    }
-
-    @Test
     fun `with the app in the background nothing opens and the model is told why`() {
         phone.foreground = false
         val (session, _) = turn(call("phone_call", "who" to "amma"))
@@ -801,7 +626,7 @@ class ToolRoutingTest {
         val sources = result(session)["sources"] as List<*>
         assertEquals(3, sources.size)
         assertEquals("site0.com", (sources[0] as Map<*, *>)["site"])
-        val chip = events.filterIsInstance<LoopEvent.Memory>().single().chip
+        val chip = events.filterIsInstance<ToolEvent.Memory>().single().chip
         assertEquals(MemoryChip.Kind.WEB, chip.kind)
         assertEquals("https://www.site0.com/page", chip.link)
     }
@@ -833,326 +658,12 @@ class ToolRoutingTest {
         assertFalse("{photos}" in ToolCatalog.rules(web = true, photos = false))
     }
 
-    // ---- Saying it did what no tool did ----
-
-    private fun replies(vararg script: List<GenEvent>): Pair<ScriptedSession, List<LoopEvent>> {
-        val session = ScriptedSession(ArrayDeque(script.toList()))
-        return session to runBlocking { loop.run(session, "envelope", emptyList(), context).toList() }
-    }
-
-    /** What the chat ends up showing: provisional text stands once confirmed and goes when retracted, as in [com.local.assistant.chat.ChatSender]. */
-    private fun shown(events: List<LoopEvent>): String {
-        val text = StringBuilder()
-        var standing = 0
-        for (event in events) when (event) {
-            is LoopEvent.Text -> {
-                text.append(event.delta)
-                if (!event.provisional) standing = text.length
-            }
-            LoopEvent.Confirm -> standing = text.length
-            LoopEvent.Retract -> text.setLength(standing)
-            else -> Unit
-        }
-        return text.toString()
-    }
-
-    /** Text that stood (and so could be read aloud) before the first retraction: none, for a false claim. */
-    private fun stoodBeforeRetract(events: List<LoopEvent>): Boolean =
-        events.takeWhile { it != LoopEvent.Retract }.any { it == LoopEvent.Confirm || (it is LoopEvent.Text && !it.provisional) }
-
     // ---- Token soup ----
 
     /** Made up in the style of what the phone gave on 14 Nov 2026. */
     private val soup = listOf("\"840tsetUauthorx205619i ", "aponitimiCrap.M WMWWCOMXIai ", "/isdevincr 링Tı ", "Microsoft Sound***passou ", "setzuL6yCblue ", "and more")
 
-    @Test
-    fun `token soup is taken back before it stands, the model stopped, and the turn ends for another go`() {
-        val (session, events) = replies(soup.map { GenEvent.TextDelta(it) } + GenEvent.Done(null))
-        assertEquals(LoopEvent.Garbled(), events.last())
-        assertEquals("", shown(events))
-        assertFalse(stoodBeforeRetract(events))
-        assertEquals(1, session.cancelled)
-        // Stopped by its sixth word: what came after was never shown.
-        assertFalse(events.filterIsInstance<LoopEvent.Text>().any { "and more" in it.delta })
-        assertEquals(listOf("envelope"), session.sentEnvelopes)
-    }
-
-    @Test
-    fun `soup after a tool's result goes too, and what stood before it stays for the turn to clear`() {
-        val (_, events) = replies(
-            listOf(GenEvent.TextDelta("Let me check your calendar. "), GenEvent.ToolCalls(listOf(call("get_upcoming", "days" to 7))), GenEvent.Done(null)),
-            soup.map { GenEvent.TextDelta(it) } + GenEvent.Done(null),
-        )
-        assertEquals(LoopEvent.Garbled(), events.last())
-        assertEquals("Let me check your calendar. ", shown(events))
-    }
-
-    @Test
-    fun `soup after a tool acted says so, so the turn isn't asked again and done twice`() {
-        val (_, events) = replies(
-            ScriptedSession.calls(call("add_task", "title" to "Call the CA", "when" to "tomorrow at 11")),
-            soup.map { GenEvent.TextDelta(it) } + GenEvent.Done(null),
-        )
-        assertEquals(LoopEvent.Garbled(afterActing = true), events.last())
-        assertEquals(1, store.tasks.size)
-    }
-
-    @Test
-    fun `a short soup reply is caught when it ends`() {
-        val (_, events) = replies(ScriptedSession.says("840tsetUauthorx205619i aponitimiCrap.M"))
-        assertEquals(LoopEvent.Garbled(), events.last())
-        assertEquals("", shown(events))
-    }
-
-    @Test
-    fun `a reply after a tool's result stands once its first words are words`() {
-        val (_, events) = replies(
-            ScriptedSession.calls(call("get_upcoming", "days" to 7)),
-            listOf("You have ", "nothing due ", "this week, ", "so the weekend ", "is free.").map { GenEvent.TextDelta(it) } + GenEvent.Done(null),
-        )
-        assertEquals("You have nothing due this week, so the weekend is free.", shown(events))
-        val beforeConfirm = events.takeWhile { it != LoopEvent.Confirm }.filterIsInstance<LoopEvent.Text>()
-        assertTrue(beforeConfirm.isNotEmpty() && beforeConfirm.all { it.provisional })
-        assertFalse(events.any { it is LoopEvent.Garbled })
-    }
-
     // ---- Nothing written after a lookup's result ----
-
-    @Test
-    fun `nothing written after a lookup's result, so the model is asked once more and that answer is the reply`() {
-        val (session, events) = replies(
-            ScriptedSession.calls(call("get_upcoming", "days" to 7)),
-            ScriptedSession.says("\n"),
-            ScriptedSession.says("Nothing is due this week."),
-        )
-        assertEquals(listOf("envelope", ToolLoop.EMPTY_REPLY), session.sentEnvelopes)
-        assertEquals("Nothing is due this week.", shown(events).trim())
-        // The live conversation holds the empty turn and the check, which aren't stored.
-        assertTrue((events.last() as LoopEvent.Done).staleConversation)
-    }
-
-    @Test
-    fun `still nothing when asked again, so a plain line goes out instead of an empty reply`() {
-        val (session, events) = replies(
-            ScriptedSession.calls(call("search_memory", "query" to "CA")),
-            listOf(GenEvent.Done(null)),
-            listOf(GenEvent.Done(null)),
-        )
-        assertEquals(listOf("envelope", ToolLoop.EMPTY_REPLY), session.sentEnvelopes)
-        assertEquals(ToolLoop.NO_REPLY, shown(events))
-    }
-
-    @Test
-    fun `a lookup's answer written at once is not asked for again`() {
-        val (session, events) = replies(
-            ScriptedSession.calls(call("get_upcoming", "days" to 7)),
-            ScriptedSession.says("Nothing is due this week."),
-        )
-        assertEquals(listOf("envelope"), session.sentEnvelopes)
-        assertEquals("Nothing is due this week.", shown(events))
-        assertEquals(false, (events.last() as LoopEvent.Done).staleConversation)
-    }
-
-    @Test
-    fun `nothing written after an alarm was set is not asked for again, and what was done is said`() {
-        val (session, events) = replies(
-            ScriptedSession.calls(call("set_alarm", "when" to "6:30 am")),
-            listOf(GenEvent.Done(null)),
-        )
-        assertEquals(listOf("envelope"), session.sentEnvelopes)
-        assertTrue(shown(events).isNotBlank())
-        assertTrue(ToolLoop.NO_REPLY !in shown(events))
-    }
-
-    /** As it went in the user's chat on 10 Oct 2026: "yes send it", and no call. */
-    @Test
-    fun `a reply that says it sent something when no tool ran is taken back unspoken, and the model is asked again`() {
-        val (session, events) = replies(
-            ScriptedSession.says("I've sent the email to Hitesh at google.com with \"Hi\" in it."),
-            ScriptedSession.says("I can't send emails myself. I can open your email app with it written; what's his full address?"),
-        )
-        assertEquals("I can't send emails myself. I can open your email app with it written; what's his full address?", shown(events))
-        // It streamed provisionally and was retracted before anything of it stood, so it was never read aloud.
-        assertTrue(LoopEvent.Retract in events)
-        assertFalse(stoodBeforeRetract(events))
-        assertEquals(listOf("envelope", ToolLoop.UNBACKED_CLAIM), session.sentEnvelopes)
-        // The live conversation holds the reply nobody saw.
-        assertTrue((events.last() as LoopEvent.Done).staleConversation)
-    }
-
-    private val photoLoop = ToolLoop(
-        executor,
-        maxRounds = 3,
-        isOverflow = { "too long" in it.message.orEmpty() },
-        photosAvailable = { true },
-    )
-
-    private fun askedForPhotos(text: String, vararg script: List<GenEvent>): Pair<ScriptedSession, List<LoopEvent>> {
-        val session = ScriptedSession(ArrayDeque(script.toList()))
-        return session to runBlocking { photoLoop.run(session, "envelope", emptyList(), context.copy(userText = text)).toList() }
-    }
-
-    /** As it went in the user's chat on 1 Nov 2026: a second request for the same photos, answered without searching. */
-    @Test
-    fun `asked to see photos and answered with no search, the model is asked to search`() {
-        val (session, events) = askedForPhotos(
-            "Could you show all the photos of wedding",
-            ScriptedSession.says("I'm sorry, I don't have any photos of you attending a wedding."),
-            ScriptedSession.calls(ToolCall("find_photos", mapOf("query" to "wedding"))),
-            ScriptedSession.says("Here they are."),
-        )
-        assertEquals(listOf("envelope", ToolLoop.PHOTO_CHECK), session.sentEnvelopes)
-        assertEquals("find_photos", session.sentResults.single().single().name)
-        // The reply nobody saw stays out; the live conversation holds it, so it's rebuilt.
-        assertFalse("don't have any photos" in shown(events))
-        assertTrue((events.last() as LoopEvent.Done).staleConversation)
-    }
-
-    @Test
-    fun `in a conversation carried on, an unsearched photo request asks for a rebuilt one instead`() {
-        val session = ScriptedSession(ArrayDeque(listOf(ScriptedSession.says("I found 3 photos of you attending a wedding."))))
-        val events = runBlocking {
-            photoLoop.run(session, "envelope", emptyList(), context.copy(userText = "Could you show all the photos of wedding"), canRebuild = true).toList()
-        }
-        assertEquals(LoopEvent.Rebuild, events.last())
-        assertEquals("", shown(events))
-        assertFalse(stoodBeforeRetract(events))
-        assertEquals(listOf("envelope"), session.sentEnvelopes)
-    }
-
-    @Test
-    fun `each tool call is announced before it runs`() {
-        val (_, events) = askedForPhotos(
-            "show me my beach photos",
-            ScriptedSession.calls(ToolCall("find_photos", mapOf("query" to "beach"))),
-            ScriptedSession.says("Here they are."),
-        )
-        // Announced as it runs, then the wait for the model's reply is named (no photo index here,
-        // so the search failed and nothing is claimed to be done).
-        assertEquals(listOf(LoopEvent.Step("Searching your photos…"), LoopEvent.Step("Writing the reply…")), events.filterIsInstance<LoopEvent.Step>())
-        assertTrue(events.indexOfFirst { it is LoopEvent.Step } < events.indexOfFirst { it is LoopEvent.Text })
-        assertEquals("Searching your memories…", ToolSteps.of(ToolCall("search_memory", emptyMap()), "what did I say about Goa"))
-        assertEquals("Searching your photos and reading one…", ToolSteps.of(ToolCall("find_photos", mapOf("query" to "PAN card")), "fetch my pan number"))
-        assertEquals("Working on it…", ToolSteps.of(ToolCall("something_new", emptyMap()), ""))
-        assertEquals("Reminder set · writing the reply…", ToolSteps.done(listOf(ToolCall("add_task", emptyMap())), listOf(true)))
-        assertEquals("Writing the reply…", ToolSteps.done(listOf(ToolCall("add_task", emptyMap())), listOf(false)))
-        assertEquals("All done · writing the reply…", ToolSteps.done(listOf(ToolCall("set_alarm", emptyMap()), ToolCall("add_task", emptyMap())), listOf(true, true)))
-    }
-
-    @Test
-    fun `still no search, a claim to have found photos gives way to the truth`() {
-        val (_, events) = askedForPhotos(
-            "show me the photos of me attending wedding",
-            ScriptedSession.says("I found 0 photos of you attending a wedding."),
-            ScriptedSession.says("I found 0 photos of you attending a wedding."),
-        )
-        assertEquals(ToolLoop.NOT_SEARCHED, shown(events))
-    }
-
-    @Test
-    fun `a question back after the check is shown, and other messages aren't held to a search`() {
-        val (_, asked) = askedForPhotos(
-            "show me photos from the trip",
-            ScriptedSession.says("Sure."),
-            ScriptedSession.says("Which trip do you mean, Goa or Munnar?"),
-        )
-        assertEquals("Which trip do you mean, Goa or Munnar?", shown(asked))
-        val (session, events) = askedForPhotos("what's the capital of Kerala?", ScriptedSession.says("Thiruvananthapuram."))
-        assertEquals(listOf("envelope"), session.sentEnvelopes)
-        assertEquals("Thiruvananthapuram.", shown(events))
-    }
-
-    /** As it went in the user's chat on 1 Nov 2026: a follow-up answered with the last search's count, and no search. */
-    @Test
-    fun `saying photos were found with no search and no photo sent is asked again`() {
-        val (session, events) = replies(
-            ScriptedSession.says("I found 3 photos of your B.Tech certificate."),
-            ScriptedSession.says("Let me look."),
-        )
-        assertEquals(listOf("envelope", ToolLoop.UNBACKED_CLAIM), session.sentEnvelopes)
-        assertEquals("Let me look.", shown(events))
-    }
-
-    @Test
-    fun `with a recalled photo sent along, saying it was found is no claim`() {
-        val session = ScriptedSession(ArrayDeque(listOf(ScriptedSession.says("I found a photo of your certificate: it was issued in 2019."))))
-        val photo = com.local.assistant.llm.PromptAttachment("/tmp/recalled-photo-0.jpg", com.local.assistant.data.db.AttachmentKind.IMAGE)
-        val events = runBlocking { loop.run(session, "envelope", listOf(photo), context).toList() }
-        assertEquals(listOf("envelope"), session.sentEnvelopes)
-        assertEquals("I found a photo of your certificate: it was issued in 2019.", shown(events))
-    }
-
-    @Test
-    fun `asked again, the model can call the tool it should have, and that is what happens`() {
-        val (_, events) = replies(
-            ScriptedSession.says("Sure! I've sent it to Priya."),
-            ScriptedSession.calls(call("send_message", "to" to "Priya Sharma", "text" to "Notes attached", "app" to "email")),
-            ScriptedSession.says("Your email app is open with it written; tap send."),
-        )
-        assertEquals(listOf("EMAIL priya@example.com: Notes attached"), phone.done)
-        assertEquals("Your email app is open with it written; tap send.", shown(events))
-        val done = events.last() as LoopEvent.Done
-        assertEquals(1, done.toolRounds)
-        assertTrue(done.staleConversation)
-    }
-
-    /** As in the power-button panel on 27 Oct 2026: a draft nobody wrote, then "Sent." */
-    @Test
-    fun `a draft that isn't shown, and a bare Sent, are taken back too`() {
-        val (session, events) = replies(
-            ScriptedSession.says("I've drafted the email for you. Would you like me to send it now?"),
-            ScriptedSession.calls(call("send_message", "to" to "priya@example.com", "text" to "Good morning", "app" to "email")),
-            ScriptedSession.says("Your email app is open with it written; tap send."),
-        )
-        assertEquals("Your email app is open with it written; tap send.", shown(events))
-        assertEquals(listOf("envelope", ToolLoop.UNBACKED_CLAIM), session.sentEnvelopes)
-        assertEquals("Sorry, I haven't sent anything.", shown(replies(ScriptedSession.says("Sent."), ScriptedSession.says("Sorry, I haven't sent anything.")).second))
-        // A draft that is shown streams on once its text appears.
-        val draft = "I've drafted an email for you. Here it is:\n\nSubject: Leave on Friday\n\nHi, could I take Friday off?"
-        val (shownDraft, drafted) = replies(ScriptedSession.says(draft))
-        assertEquals(draft, shown(drafted))
-        assertEquals(listOf("envelope"), shownDraft.sentEnvelopes)
-    }
-
-    @Test
-    fun `asked once, a model that still says it did it is taken back, and what is true is shown`() {
-        val (session, events) = replies(ScriptedSession.says("I've set an alarm for 7."), ScriptedSession.says("I've sent the email."))
-        assertEquals(ToolLoop.NOT_DONE, shown(events))
-        assertEquals(2, session.sentEnvelopes.size)
-        assertTrue((events.last() as LoopEvent.Done).staleConversation)
-    }
-
-    @Test
-    fun `an ordinary reply streams from its first word, stands once its first sentence claims nothing, and the conversation kept`() {
-        val pieces = listOf("Here is ", "a short haiku about the rain", ". ", "Drops on the tin roof,\n", "the street ", "goes quiet.")
-        val (session, events) = replies(pieces.map { GenEvent.TextDelta(it) } + GenEvent.Done(null))
-        assertEquals(pieces.joinToString(""), shown(events))
-        // Shown from the first piece, provisionally, and confirmed once the first sentence was known
-        // to claim nothing and its first ten words to be words (GarbledText).
-        assertEquals(LoopEvent.Text("Here is ", provisional = true), events.first { it is LoopEvent.Text })
-        val beforeConfirm = events.takeWhile { it != LoopEvent.Confirm }.filterIsInstance<LoopEvent.Text>()
-        assertEquals("Here is a short haiku about the rain. Drops on the tin roof,\n", beforeConfirm.joinToString("") { it.delta })
-        assertTrue(beforeConfirm.all { it.provisional })
-        assertEquals(1, events.count { it == LoopEvent.Confirm })
-        assertFalse(LoopEvent.Retract in events)
-        assertEquals(listOf("envelope"), session.sentEnvelopes)
-        assertFalse((events.last() as LoopEvent.Done).staleConversation)
-        // A short one that never finishes its first sentence is shown at the end.
-        assertEquals("Hello!", shown(replies(ScriptedSession.says("Hello!")).second))
-    }
-
-    @Test
-    fun `after a tool ran, saying it was done is the confirmation`() {
-        val (session, events) = turn(call("set_timer", "duration" to "10 minutes"), reply = "I've set a timer for 10 minutes.")
-        assertEquals("I've set a timer for 10 minutes.", shown(events))
-        assertEquals(listOf("envelope"), session.sentEnvelopes)
-        // Words said before the call, claim or not, go out with it.
-        val (_, before) = replies(
-            listOf(GenEvent.TextDelta("I've set an alarm for 6. "), GenEvent.ToolCalls(listOf(call("set_alarm", "when" to "6am"))), GenEvent.Done(null)),
-            ScriptedSession.says("It will ring at 6."),
-        )
-        assertEquals("I've set an alarm for 6. It will ring at 6.", shown(before))
-    }
 
     @Test
     fun `calls and messages say they are not done yet`() {
@@ -1163,113 +674,12 @@ class ToolRoutingTest {
         assertTrue(result(text)["ready"].toString().contains("not sent yet"))
     }
 
-    // ---- Several things in one message ----
-
-    @Test
-    fun `an alarm asked for beside a message is set before WhatsApp opens`() {
-        // Once WhatsApp is in front, this app is in the background and the clock app can't be opened.
-        phone.onHandoff = { clock.reachable = false }
-        val (session, _) = replies(
-            ScriptedSession.calls(call("send_message", "to" to "amma", "text" to "Reached home", "app" to "whatsapp"), call("set_alarm", "when" to "6:30am")),
-            ScriptedSession.says("Done."),
-        )
-        assertEquals(1, clock.set.size)
-        assertTrue(phone.done.single().startsWith("WHATSAPP"))
-        // Answered in the order asked.
-        assertEquals(listOf("send_message", "set_alarm"), session.sentResults.single().map { it.name })
-        assertTrue(session.sentResults.single().all { Gson().fromJson(it.json, Map::class.java)["ok"] == true })
-    }
-
-    @Test
-    fun `a reminder asked for beside a sum waits for its answer`() {
-        val (session, _) = replies(
-            ScriptedSession.calls(
-                call("calculate", "expression" to "2450*18%"),
-                call("add_task", "title" to "Pay that much to Ravi", "when" to "Friday"),
-            ),
-            ScriptedSession.calls(call("add_task", "title" to "Pay 441 to Ravi", "when" to "Friday")),
-            ScriptedSession.says("Done."),
-        )
-        val held = Gson().fromJson(session.sentResults.first()[1].json, Map::class.java)
-        assertEquals(false, held["ok"])
-        assertTrue(held["error"].toString().contains("calculate"))
-        assertEquals("Pay 441 to Ravi", store.tasks.values.single().title)
-    }
-
-    @Test
-    fun `a reminder held for a sum and not asked for again is set as first asked`() {
-        val (_, events) = replies(
-            ScriptedSession.calls(
-                call("calculate", "expression" to "2450*18%"),
-                call("add_task", "title" to "Pay Ravi", "when" to "Friday"),
-            ),
-            ScriptedSession.says("It's 441, and I'll remind you on Friday."),
-        )
-        assertEquals("Pay Ravi", store.tasks.values.single().title)
-        assertTrue((events.last() as LoopEvent.Done).staleConversation)
-    }
-
-    @Test
-    fun `things asked for together with no sum among them all run at once`() {
-        val (session, _) = replies(
-            ScriptedSession.calls(call("set_alarm", "when" to "6:30am"), call("add_task", "title" to "Pay rent", "when" to "tomorrow at 9")),
-            ScriptedSession.says("Done."),
-        )
-        assertEquals(1, session.sentResults.size)
-        assertEquals(1, clock.set.size)
-        assertEquals(1, store.tasks.size)
-    }
-
-    @Test
-    fun `a reply saying the message was sent says what is really open instead`() {
-        val (_, events) = replies(
-            ScriptedSession.calls(call("send_message", "to" to "amma", "text" to "Reached home", "app" to "whatsapp"), call("set_alarm", "when" to "6:30am")),
-            ScriptedSession.says("I have sent the message to Amma on WhatsApp and set an alarm for 6:30 a.m."),
-        )
-        assertEquals("WhatsApp is open with your message to Amma; tap send. I've also set an alarm for 6:30 a.m.", shown(events))
-    }
-
-    @Test
-    fun `a reply that already says the message is ready is left alone`() {
-        val (_, events) = replies(
-            ScriptedSession.calls(call("send_message", "to" to "amma", "text" to "Reached home", "app" to "whatsapp")),
-            ScriptedSession.says("The message is ready in WhatsApp; tap send."),
-        )
-        assertEquals("The message is ready in WhatsApp; tap send.", shown(events))
-    }
-
-    @Test
-    fun `an alarm set and nothing said about it is confirmed all the same`() {
-        val (_, events) = replies(ScriptedSession.calls(call("set_alarm", "when" to "6:30am")), ScriptedSession.says(""))
-        assertEquals(ToolLoop.REPAIRED_REPLY, shown(events))
-    }
-
-    @Test
-    fun `a message got ready and nothing said about it says what is open`() {
-        val (_, events) = replies(
-            ScriptedSession.calls(call("send_message", "to" to "amma", "text" to "Reached home", "app" to "whatsapp")),
-            ScriptedSession.says(""),
-        )
-        assertEquals("WhatsApp is open with your message to Amma; tap send.", shown(events))
-    }
-
-    @Test
-    fun `nothing said after a call that failed is not made into done`() {
-        val (session, events) = replies(ScriptedSession.calls(call("take_screenshot")), ScriptedSession.says(""))
-        // Asked once more to answer from the failed result; still nothing, so a plain line, never "Done."
-        assertEquals(listOf("envelope", ToolLoop.EMPTY_REPLY), session.sentEnvelopes)
-        assertEquals(ToolLoop.NO_REPLY, shown(events))
-    }
-
     // ---- Screenshots ----
 
     private fun screenshotFile() = java.io.File.createTempFile("screen", ".png").apply { writeText("png"); deleteOnExit() }
 
-    private fun withScreen(screen: String?, vararg calls: ToolCall): Pair<ScriptedSession, List<LoopEvent>> {
-        val session = ScriptedSession(ArrayDeque(listOf(ScriptedSession.calls(*calls), ScriptedSession.says("Done."))))
-        val events = runBlocking { loop.run(session, "envelope", emptyList(), context.copy(screen = screen)).toList() }
-        return session to events
-    }
+    private fun withScreen(screen: String?, vararg calls: ToolCall): Pair<ToolTurn, List<ToolEvent>> =
+        executor.play(calls.toList(), context.copy(screen = screen))
 
     @Test
     fun `take_screenshot saves the screen the assistant was opened over`() {
@@ -1277,7 +687,7 @@ class ToolRoutingTest {
         val (session, events) = withScreen(screen.path, call("take_screenshot"))
         assertEquals(true, result(session)["ok"])
         assertEquals(listOf("saved ${screen.name}"), phone.done)
-        assertEquals(MemoryChip.Kind.SCREENSHOT, events.filterIsInstance<LoopEvent.Memory>().single().chip.kind)
+        assertEquals(MemoryChip.Kind.SCREENSHOT, events.filterIsInstance<ToolEvent.Memory>().single().chip.kind)
     }
 
     @Test
@@ -1320,37 +730,10 @@ class ToolRoutingTest {
      * As [turn], with what the user said (or, [locked], said on the lock screen), and [earlier]
      * what they said just before.
      */
-    private fun said(text: String, vararg calls: ToolCall, locked: Boolean = false, earlier: String = ""): Pair<ScriptedSession, List<LoopEvent>> {
-        val session = ScriptedSession(ArrayDeque(listOf(ScriptedSession.calls(*calls), ScriptedSession.says("Done."))))
-        val events = runBlocking { loop.run(session, "envelope", emptyList(), context.copy(userText = text, locked = locked, earlierText = earlier)).toList() }
-        return session to events
-    }
+    private fun said(text: String, vararg calls: ToolCall, locked: Boolean = false, earlier: String = ""): Pair<ToolTurn, List<ToolEvent>> =
+        executor.play(calls.toList(), context.copy(userText = text, locked = locked, earlierText = earlier))
 
     private fun buyMilk() = said("remind me to buy milk near DMart", call("add_task", "title" to "Buy milk", "place" to "DMart"))
-
-    @Test
-    fun `remind me to buy milk near DMart`() {
-        val (session, events) = buyMilk()
-
-        val task = store.tasks.values.single()
-        assertEquals("Buy milk", task.title)
-        assertNull(task.dueAt)
-        val place = task.place!!
-        assertEquals("DMart", place.name)
-        assertEquals("Hoodi Main Road", place.spots.first().label)
-        assertEquals(5, place.spots.size)
-        // Watched, not timed.
-        assertEquals(mapOf(task.id to place), reminders.places)
-        assertTrue(reminders.scheduled.isEmpty())
-
-        assertEquals(true, result(session)["ok"])
-        assertEquals("when the user gets near DMart (any of the 5 nearest)", result(session)["rings"])
-        assertEquals("750 m", result(session)["nearest"])
-        assertNull(result(session)["note"])
-        val chip = events.filterIsInstance<LoopEvent.Memory>().single().chip
-        assertEquals(MemoryChip(MemoryChip.Kind.TASK, "Reminder", "Buy milk", note = "Any of the 5 nearest, closest 750 m", place = "near DMart"), chip)
-        assertTrue("agenda re-rendered", (events.last() as LoopEvent.Done).changedPrefix)
-    }
 
     @Test
     fun `when I reach office remind me to call Priya`() {
@@ -1412,7 +795,7 @@ class ToolRoutingTest {
         assertEquals(7000, place.spots.single().radiusM)
         assertEquals(mapOf(task.id to place), reminders.places)
         assertEquals("when the user is 5 km away from reaching Munnar", result(session)["rings"])
-        val chip = events.filterIsInstance<LoopEvent.Memory>().single().chip
+        val chip = events.filterIsInstance<ToolEvent.Memory>().single().chip
         assertEquals("Almost at Munnar" to "5 km before Munnar", chip.detail to chip.place)
     }
 
@@ -1433,16 +816,7 @@ class ToolRoutingTest {
 
         assertEquals(true, result(session)["ok"])
         assertTrue(result(session)["note"].toString().contains("rings the next time they arrive"))
-        assertEquals("You're already there: rings the next time you arrive", events.filterIsInstance<LoopEvent.Memory>().single().chip.note)
-    }
-
-    @Test
-    fun `a voice message's distance is the model's, not the recogniser's`() {
-        val heard = context.copy(userText = "remind me 50 km before Munnar", heard = true)
-        val session = ScriptedSession(ArrayDeque(listOf(ScriptedSession.calls(call("add_task", "title" to "Reminder 5 km before", "place" to "Munnar")), ScriptedSession.says("Done."))))
-        runBlocking { loop.run(session, "envelope", emptyList(), heard).toList() }
-
-        assertEquals(PlaceDistance(5000, beforeArriving = true), store.tasks.values.single().place!!.distance)
+        assertEquals("You're already there: rings the next time you arrive", events.filterIsInstance<ToolEvent.Memory>().single().chip.note)
     }
 
     @Test
@@ -1474,19 +848,6 @@ class ToolRoutingTest {
     }
 
     @Test
-    fun `cancelling a place reminder stops watching it`() {
-        buyMilk()
-        val (session, events) = turn(call("update_task", "task" to "milk", "status" to "cancelled"))
-
-        assertEquals(TaskStatus.CANCELLED, store.tasks.values.single().status)
-        assertTrue(reminders.places.isEmpty())
-        assertEquals(true, result(session)["ok"])
-        val chip = events.filterIsInstance<LoopEvent.Memory>().single().chip
-        assertEquals("Cancelled", chip.label)
-        assertNull(chip.place)
-    }
-
-    @Test
     fun `a place reminder given a time rings at the time instead`() {
         buyMilk()
         turn(call("update_task", "task" to "milk", "when" to "tomorrow at 6pm"))
@@ -1501,7 +862,7 @@ class ToolRoutingTest {
     fun `undoing a place reminder takes it down`() {
         val (_, events) = buyMilk()
 
-        assertEquals(ToolExecutor.UndoResult.UNDONE, runBlocking { executor.undo(events.filterIsInstance<LoopEvent.Memory>().single().recordId) })
+        assertEquals(ToolExecutor.UndoResult.UNDONE, runBlocking { executor.undo(events.filterIsInstance<ToolEvent.Memory>().single().recordId) })
         assertTrue(store.tasks.isEmpty())
         assertTrue(reminders.places.isEmpty())
     }
@@ -1528,7 +889,7 @@ class ToolRoutingTest {
         assertTrue(result(session)["error"].toString().contains("Ask the user for its address or the area"))
         assertTrue(store.tasks.isEmpty())
         assertTrue(reminders.places.isEmpty())
-        assertTrue(events.none { it is LoopEvent.Memory })
+        assertTrue(events.none { it is ToolEvent.Memory })
     }
 
     @Test
@@ -1540,25 +901,9 @@ class ToolRoutingTest {
         assertEquals(listOf("watch"), location.asked)
         assertEquals(true, result(session)["ok"])
         assertTrue(result(session)["note"].toString().contains("'All the time'"))
-        assertEquals("Rings once location is allowed all the time", events.filterIsInstance<LoopEvent.Memory>().single().chip.note)
+        assertEquals("Rings once location is allowed all the time", events.filterIsInstance<ToolEvent.Memory>().single().chip.note)
         // Kept, so it starts once location is allowed (watched again whenever the app opens).
         assertEquals(1, reminders.places.size)
-    }
-
-    @Test
-    fun `on the lock screen a place reminder without location asks for an unlock`() {
-        location.locate = false
-        val (session, events) = said(
-            "remind me to buy milk near DMart",
-            call("add_task", "title" to "Buy milk", "place" to "DMart"),
-            locked = true,
-        )
-
-        assertEquals(false, result(session)["ok"])
-        assertTrue(result(session)["error"].toString().contains("unlock"))
-        assertTrue(location.asked.isEmpty())
-        assertTrue(store.tasks.isEmpty())
-        assertTrue(events.none { it == LoopEvent.NeedsUnlock })
     }
 
     @Test
@@ -1588,7 +933,7 @@ class ToolRoutingTest {
         // Not the clock app's: it only knows times.
         assertTrue(clock.set.isEmpty())
         assertEquals(true, result(session)["ok"])
-        val chip = events.filterIsInstance<LoopEvent.Memory>().single().chip
+        val chip = events.filterIsInstance<ToolEvent.Memory>().single().chip
         assertEquals(Triple("Alarm", "", "near Munnar"), Triple(chip.label, chip.detail, chip.place))
         assertNotNull("undone like a reminder", log.records.values.single().undo)
     }
@@ -1600,7 +945,7 @@ class ToolRoutingTest {
 
         assertEquals("Alarm", store.tasks.values.single().title)
         assertEquals(true, result(session)["ok"])
-        assertEquals("Alarm", events.filterIsInstance<LoopEvent.Memory>().single().chip.label)
+        assertEquals("Alarm", events.filterIsInstance<ToolEvent.Memory>().single().chip.label)
     }
 
     @Test
@@ -1631,7 +976,7 @@ class ToolRoutingTest {
         val (_, events) = said("remind me when I reach Munnar", call("add_task", "title" to "remind me to buy milk", "place" to "Munnar"))
 
         assertEquals("Reminder", store.tasks.values.last().title)
-        val chip = events.filterIsInstance<LoopEvent.Memory>().single().chip
+        val chip = events.filterIsInstance<ToolEvent.Memory>().single().chip
         assertEquals("Reminder" to "", chip.label to chip.detail)
 
         said("remind me at 6pm", call("add_task", "title" to "Buy milk", "when" to "6pm"))
@@ -1662,5 +1007,139 @@ class ToolRoutingTest {
             assertTrue(json, parsed.get("name").asString.isNotBlank())
             assertTrue(json, parsed.get("description").asString.isNotBlank())
         }
+    }
+
+    // ---- What the executor does with a call ----
+
+    @Test
+    fun `remind me to call the CA tomorrow at 11`() {
+        val (session, events) = turn(call("add_task", "title" to "Call the CA", "when" to "tomorrow at 11"))
+
+        val task = store.tasks.values.single()
+        assertEquals("Call the CA", task.title)
+        assertEquals(at(9, 22, 11), task.dueAt)
+        assertEquals(mapOf(task.id to at(9, 22, 11)), reminders.scheduled)
+
+        assertEquals(true, result(session)["ok"])
+        assertEquals("Tue 22 Sep 11:00", result(session)["due"])
+        val chip = events.filterIsInstance<ToolEvent.Memory>().single().chip
+        assertEquals(MemoryChip(MemoryChip.Kind.TASK, "Reminder", "Call the CA", at(9, 22, 11), editable = true), chip)
+        assertEquals("Done.", events.filterIsInstance<ToolEvent.Text>().single().delta)
+    }
+
+    @Test
+    fun `my dentist is Dr Rao`() {
+        val (_, events) = turn(call("save_fact", "subject" to "user", "attribute" to "dentist", "value" to "Dr. Rao", "core" to false))
+
+        val fact = store.facts.values.single()
+        assertEquals(Triple("user", "dentist", "Dr. Rao"), Triple(fact.subject, fact.attribute, fact.value))
+        assertFalse(fact.core)
+        assertEquals(FactCategory.PEOPLE, fact.category)
+        val chip = events.filterIsInstance<ToolEvent.Memory>().single().chip
+        assertEquals("Saved", chip.label)
+        assertEquals("Dentist: Dr. Rao", chip.detail)
+    }
+
+    @Test
+    fun `reply in short answers becomes core`() {
+        turn(call("save_fact", "subject" to "user", "attribute" to "pref.reply_style", "value" to "short answers", "core" to true))
+
+        val fact = store.facts.values.single()
+        assertEquals("pref.reply_style", fact.attribute)
+        assertTrue(fact.core)
+        assertEquals(FactCategory.PREFERENCE, fact.category)
+        val core = CoreMemoryRenderer(HeuristicTokenEstimator).render(runBlocking { store.coreFacts() }, 1_200)
+        assertTrue(core.text, "Preferences: reply style: short answers" in core.text)
+    }
+
+    @Test
+    fun `the person messaged is the one the user spelled, not the model`() {
+        contacts = contacts.orEmpty() + listOf(Contact("Uma", listOf(ContactPhone("98450 44444"))), Contact("Umma", listOf(ContactPhone("98450 55555"))))
+        executor.play(listOf(call("send_message", "to" to "Uma", "text" to "Reached", "app" to "whatsapp")), ToolContext(1, 13, "Send to umma and turn on flashlight"))
+        assertTrue(phone.done.single(), phone.done.single().contains("98450 55555"))
+    }
+
+    /**
+     * The model heard the recording; the words are the recogniser's, which wrote "Umma" as "Uma"
+     * and "two thousand four hundred and fifty" as "200450". Its own reading is kept.
+     */
+    @Test
+    fun `a voice message the model heard is not corrected to the recogniser's words`() {
+        contacts = contacts.orEmpty() + listOf(Contact("Uma", listOf(ContactPhone("98450 44444"))), Contact("Umma", listOf(ContactPhone("98450 55555"))))
+        executor.play(listOf(call("send_message", "to" to "Umma", "text" to "Reached", "app" to "whatsapp")), ToolContext(1, 13, "Send to Uma reached", heard = true))
+        assertTrue(phone.done.single(), phone.done.single().contains("98450 55555"))
+
+        val sum = listOf(call("calculate", "expression" to "18% of 2450"))
+        val (heard, _) = executor.play(sum, ToolContext(1, 14, "what is 18% of 200450", heard = true))
+        assertEquals("18% of 2450", result(heard)["expression"])
+        // Typed, the user's own digits win, as before.
+        val (typed, _) = executor.play(sum, ToolContext(1, 15, "what is 18% of 200450"))
+        assertTrue(result(typed)["expression"].toString().contains("200450"))
+    }
+
+    @Test
+    fun `calculate gives Luna's model the sum worked out`() {
+        val (session, events) = turn(call("calculate", "expression" to "18% of 2450"))
+        assertEquals(true, result(session)["ok"])
+        assertEquals("441", result(session)["result"].toString().removeSuffix(".0"))
+        assertTrue("no chip for arithmetic", events.none { it is ToolEvent.Memory })
+    }
+
+    /** Digits dropped in copying: the user's own are used. */
+    @Test
+    fun `numbers the model mis-copied are taken from the user's own words`() {
+        val (sum, _) = executor.play(listOf(call("calculate", "expression" to "5+5+2")), ToolContext(chatId = 1, userMessageId = 10, userText = "what is 25+25"))
+        assertEquals("50", result(sum)["result"].toString().removeSuffix(".0"))
+
+        executor.play(listOf(call("set_alarm", "when" to "6:5")), ToolContext(1, 11, "set an alarm for 6:35"))
+        // 6:35 said at 10:00 is this evening's; what matters is the 35 the model dropped.
+        assertEquals(FakeSystemAlarms.Set(18, 35, emptySet(), null), clock.set.single())
+
+        executor.play(listOf(call("phone_call", "who" to "94501235")), ToolContext(1, 12, "call 98450 12345"), "Opening.")
+        assertEquals(listOf("dial 98450 12345"), phone.done)
+    }
+
+    @Test
+    fun `remind me to buy milk near DMart`() {
+        val (session, events) = buyMilk()
+
+        val task = store.tasks.values.single()
+        assertEquals("Buy milk", task.title)
+        assertNull(task.dueAt)
+        val place = task.place!!
+        assertEquals("DMart", place.name)
+        assertEquals("Hoodi Main Road", place.spots.first().label)
+        assertEquals(5, place.spots.size)
+        // Watched, not timed.
+        assertEquals(mapOf(task.id to place), reminders.places)
+        assertTrue(reminders.scheduled.isEmpty())
+
+        assertEquals(true, result(session)["ok"])
+        assertEquals("when the user gets near DMart (any of the 5 nearest)", result(session)["rings"])
+        assertEquals("750 m", result(session)["nearest"])
+        assertNull(result(session)["note"])
+        val chip = events.filterIsInstance<ToolEvent.Memory>().single().chip
+        assertEquals(MemoryChip(MemoryChip.Kind.TASK, "Reminder", "Buy milk", note = "Any of the 5 nearest, closest 750 m", place = "near DMart"), chip)
+    }
+
+    @Test
+    fun `a voice message's distance is the model's, not the recogniser's`() {
+        val heard = context.copy(userText = "remind me 50 km before Munnar", heard = true)
+        executor.play(listOf(call("add_task", "title" to "Reminder 5 km before", "place" to "Munnar")), heard)
+
+        assertEquals(PlaceDistance(5000, beforeArriving = true), store.tasks.values.single().place!!.distance)
+    }
+
+    @Test
+    fun `cancelling a place reminder stops watching it`() {
+        buyMilk()
+        val (session, events) = turn(call("update_task", "task" to "milk", "status" to "cancelled"))
+
+        assertEquals(TaskStatus.CANCELLED, store.tasks.values.single().status)
+        assertTrue(reminders.places.isEmpty())
+        assertEquals(true, result(session)["ok"])
+        val chip = events.filterIsInstance<ToolEvent.Memory>().single().chip
+        assertEquals("Cancelled", chip.label)
+        assertNull(chip.place)
     }
 }
