@@ -12,8 +12,9 @@ import { runFollowUps } from './followups.ts'
 import type { Hub, Member } from './hub.ts'
 import { type ChatFn, chatCompletions, sameSecret } from './llm.ts'
 import { chatRoutes } from './chat.ts'
+import type { WebLookup } from './websearch.ts'
 import { buildSystemPrompt, greetingFor } from './prompt.ts'
-import { isServerTool, runServerTool } from './tools.ts'
+import { isServerTool, runServerTool, whatsappSomeone } from './tools.ts'
 import { type Speak, type WriteBriefing, plainBriefing, updatesFor } from './briefing.ts'
 import type { LiveContext, Session, Sessions } from './sessions.ts'
 import { type WhatsApp, chatOf } from './whatsapp.ts'
@@ -29,6 +30,8 @@ export interface AppDeps {
   bridge: Bridge
   agents: AgentApi
   chat: ChatFn
+  /** Google Search for calls and chats (websearch.ts); without it, only a phone with its own web_lookup looks things up. */
+  webLookup?: WebLookup
   whatsapp: WhatsApp | null
   clock: () => Date
 }
@@ -59,7 +62,7 @@ export function createApp(deps: AppDeps) {
     const elder = hub.elder()
     res.json({
       elder: { id: elder.id, name: elder.name, phone: elder.phone },
-      members: hub.members().filter(m => m.role !== 'elder').map(personJson),
+      members: hub.members().filter(m => m.role !== 'elder' && m.role !== 'contact').map(personJson),
       doses: hub.doseStates(now).map(d => ({ ...d.dose, state: d.state })),
     })
   })
@@ -143,6 +146,14 @@ export function createApp(deps: AppDeps) {
     } finally {
       sessions.end(session.id)
     }
+  })
+
+  // "WhatsApp Ravi …" from the phone's send_message: someone in the hub by name, or the number
+  // her phone found in her contacts. 404 when it's no one in the hub and came without a number.
+  app.post('/family/whatsapp', requireKey, async (req, res) => {
+    if (!whatsapp?.connected) return void res.status(503).json({ error: "WhatsApp isn't signed in on the server: open /whatsapp/qr and scan the code." })
+    const outcome = await whatsappSomeone(req.body ?? {}, { hub, whatsapp, now: clock() })
+    res.status(outcome.result.unknown ? 404 : outcome.result.ok === false ? 400 : 200).json({ ...outcome.result, card: outcome.card })
   })
 
   app.delete('/family/members/:id', requireKey, (req, res) => {

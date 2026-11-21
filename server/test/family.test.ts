@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { runFollowUps } from '../src/followups.ts'
+import { whatsappSomeone } from '../src/tools.ts'
 import { RAHUL, at, family, incoming, liveCall } from './helpers.ts'
 
 // The family's side, over WhatsApp: what Luna sends them, and what their answers do.
@@ -107,4 +108,48 @@ test('an unanswered task is asked again under the first message, then the family
   assert.equal(nudge.quoted, f.socket.sent[0].id)
   assert.match((await runFollowUps(f.hub, f.whatsapp, at(10, 22)))[0], /told the family/)
   assert.equal(f.socket.sent.at(-1)!.jid, '919000000003@s.whatsapp.net', 'Priya')
+})
+
+test('a WhatsApp to someone from her contacts goes from Luna, and their answer is said in her call', async () => {
+  const f = family()
+  const { session, phone } = liveCall(f)
+  const send = (args: Record<string, unknown>) => whatsappSomeone(args, { hub: f.hub, whatsapp: f.whatsapp, now: f.now })
+
+  const unknown = await send({ to: 'Ravi', text: 'Are you coming for tea at 5?' })
+  assert.equal(unknown.result.unknown, true, 'not in the hub: the phone looks in her contacts')
+  assert.equal(f.socket.sent.length, 0)
+
+  const sent = await send({ to: 'Ravi', name: 'Ravi Menon', phone: '+91 98444 55566', text: 'Are you coming for tea at 5?' })
+  assert.equal(sent.result.ok, true)
+  assert.equal(sent.result.sent_to, 'Ravi Menon')
+  const ravi = f.hub.findMember('Ravi')!
+  assert.equal(ravi.role, 'contact')
+  const message = f.socket.sent[0]
+  assert.equal(message.jid, '919844455566@s.whatsapp.net')
+  assert.match(message.text, /^💬 \*Lakshmi\*, through Luna:\n\nAre you coming for tea at 5\?\n\n_Reply here and Luna will tell Lakshmi\._$/)
+  assert.equal(f.hub.awaitingAnswers(f.now.getTime()), true, 'the phone keeps looking for the answer')
+
+  // Asked again by name: found in the hub now, and the same number is never added twice.
+  assert.equal((await send({ to: 'ravi', text: 'Bring the photos too.' })).result.sent_to, 'Ravi Menon')
+  assert.equal((await send({ to: 'Ravi M', phone: '098444 55566', text: 'See you.' })).result.sent_to, 'Ravi Menon')
+  assert.equal(f.hub.members().filter(m => m.role === 'contact').length, 1)
+  assert.ok(!f.socket.sent[1].text.includes('🙏'), 'a plain message, nothing to choose')
+
+  await f.whatsapp.receive(incoming(f.hub, ravi.id, "Yes, I'll be there by 5!"))
+  assert.deepEqual(f.agents.spoken, [{ agentId: 'agent-1', text: "Ravi Menon says: Yes, I'll be there by 5!" }])
+  assert.equal(phone.received.find(m => m.type === 'hub_update')?.kind, 'reply')
+  assert.match(session.actions.at(-1)!, /Ravi Menon says/)
+  assert.deepEqual(f.hub.answersAfter(0).map(e => e.told), [true])
+})
+
+test("a WhatsApp to someone without WhatsApp, or with no words, isn't sent", async () => {
+  const f = family()
+  const send = (args: Record<string, unknown>) => whatsappSomeone(args, { hub: f.hub, whatsapp: f.whatsapp, now: f.now })
+  f.socket.missing.add('919844455577@s.whatsapp.net')
+  const missing = await send({ to: 'Sita', phone: '+91 98444 55577', text: 'Hello' })
+  assert.match(String(missing.result.error), /Sita isn't on WhatsApp/)
+  assert.equal(f.hub.findMember('Sita', ['contact']), null, 'not added')
+  assert.match(String((await send({ to: 'Rahul', text: ' ' })).result.error), /Say what the message is/)
+  assert.match(String((await send({ to: 'Sita', phone: '12', text: 'Hi' })).result.error), /isn't a number WhatsApp can reach/)
+  assert.equal(f.socket.sent.length, 0)
 })

@@ -86,13 +86,11 @@ class LiveContextTest {
     }
 
     @Test
-    fun `pinned lists go in full, other notes don't`() {
-        val lists = LiveContext.pinnedLists(listOf(shopping, unpinned, note))
+    fun `every list goes in full, pinned first, and other notes don't`() {
+        val lists = LiveContext.lists(listOf(unpinned, note, shopping))
 
-        assertEquals(
-            listOf(LiveContext.ListContent("Shopping list", listOf(LiveContext.ListContent.Item("Milk", false), LiveContext.ListContent.Item("Curd", true)))),
-            lists,
-        )
+        val items = listOf(LiveContext.ListContent.Item("Milk", false), LiveContext.ListContent.Item("Curd", true))
+        assertEquals(listOf(LiveContext.ListContent("Shopping list", items), LiveContext.ListContent("Packing", items)), lists)
     }
 
     @Test
@@ -102,7 +100,7 @@ class LiveContextTest {
         assertEquals("Lakshmi", context.userName)
         assertEquals("Core facts: the user's son is Rahul.", context.memory)
         assertEquals(42L, memoryAskedFor)
-        assertEquals("Shopping list", context.lists.single().title)
+        assertEquals(listOf("Shopping list", "Packing"), context.lists.map { it.title })
         assertEquals("Steps today: 3120", context.health)
         assertEquals("2026-11-21T09:00:30+05:30", context.now)
         assertEquals("Asia/Kolkata", context.timeZone)

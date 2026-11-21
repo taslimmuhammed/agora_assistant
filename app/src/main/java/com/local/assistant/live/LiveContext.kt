@@ -28,7 +28,7 @@ data class LiveContext(
     val locked: Boolean,
     /** The prompt prefix the phone's own model would have: core facts, last summary, agenda, notes index. */
     val memory: String,
-    /** Pinned lists in full, so "what's on my shopping list?" needs no tool call. */
+    /** Her lists in full ([lists]), so "what's on my shopping list?" needs no tool call. */
     val lists: List<ListContent>,
     /** Today's steps and last night's sleep, when the user has allowed them; null otherwise. */
     val health: String?,
@@ -73,10 +73,18 @@ data class LiveContext(
         fun toolRules(rules: String, excluded: Set<String> = EXCLUDED): String =
             rules.lines().filterNot { line -> excluded.any { it in line } }.joinToString("\n")
 
-        /** The pinned lists, in full: what's in a list is otherwise only read when asked about. */
-        fun pinnedLists(notes: List<UserNoteEntity>): List<ListContent> =
-            notes.filter { it.pinned && it.kind == NoteKind.LIST }
-                .map { note -> ListContent(note.title, note.items.map { ListContent.Item(it.text, it.done) }) }
+        /**
+         * Her lists, in full: pinned ones first, then as [notes] has them, up to [MAX_LISTS] of
+         * [MAX_ITEMS] items each. Notes that aren't lists are only read when asked about.
+         */
+        fun lists(notes: List<UserNoteEntity>): List<ListContent> =
+            notes.filter { it.kind == NoteKind.LIST }
+                .sortedByDescending { it.pinned }
+                .take(MAX_LISTS)
+                .map { note -> ListContent(note.title, note.items.take(MAX_ITEMS).map { ListContent.Item(it.text, it.done) }) }
+
+        const val MAX_LISTS = 12
+        const val MAX_ITEMS = 60
     }
 }
 
@@ -117,11 +125,14 @@ class LiveContextBuilder(
             doseId = doseId,
             locked = locked,
             memory = if (locked) "" else memory(chatId),
-            lists = if (locked) emptyList() else LiveContext.pinnedLists(notes()),
+            lists = if (locked) emptyList() else lists(),
             health = if (locked) null else health(),
             toolRules = LiveContext.toolRules(rules(), excluded),
             deviceTools = LiveContext.deviceTools(declarations(), locked, excluded),
             murfVoice = murfVoice()?.takeIf { it.isNotBlank() },
         )
     }
+
+    /** Her lists as they are now: sent again after a call's tool changes one ([LiveToolBridge]). */
+    suspend fun lists(): List<LiveContext.ListContent> = LiveContext.lists(notes())
 }

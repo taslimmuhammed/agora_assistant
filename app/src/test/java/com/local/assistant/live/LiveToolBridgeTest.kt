@@ -8,6 +8,7 @@ import com.local.assistant.memory.tools.FakeMemoryStore
 import com.local.assistant.memory.tools.FakeReminders
 import com.local.assistant.memory.tools.FakeSystemAlarms
 import com.local.assistant.memory.tools.FakeToolLog
+import com.local.assistant.memory.tools.ToolCatalog
 import com.local.assistant.memory.tools.ToolContext
 import com.local.assistant.memory.tools.ToolExecutor
 import kotlinx.coroutines.CoroutineStart
@@ -34,7 +35,11 @@ class LiveToolBridgeTest {
     private val chat = FakeCallChat()
     private val ran = mutableListOf<Pair<ToolCall, ToolContext>>()
 
-    private fun bridge(locked: Boolean = false, execute: suspend (ToolCall, ToolContext) -> ToolExecutor.Outcome = executor::execute) =
+    private fun bridge(
+        locked: Boolean = false,
+        lists: (suspend () -> List<LiveContext.ListContent>)? = null,
+        execute: suspend (ToolCall, ToolContext) -> ToolExecutor.Outcome = executor::execute,
+    ) =
         LiveToolBridge(
             execute = { call, context ->
                 ran += call to context
@@ -42,6 +47,7 @@ class LiveToolBridgeTest {
             },
             transcript = chat.log(),
             locked = locked,
+            lists = lists,
             zone = { zone },
         )
 
@@ -156,5 +162,18 @@ class LiveToolBridgeTest {
         assertNull(bridge.handle("""{"type":"ping"}"""))
         assertNull(bridge.handle("""{"type":"tool_call","name":"add_task"}"""))
         assertTrue(ran.isEmpty())
+    }
+
+    @Test
+    fun `a list tool's result brings her lists as they are now, and other tools' don't`() = runBlocking {
+        val shopping = listOf(LiveContext.ListContent("Shopping list", listOf(LiveContext.ListContent.Item("Milk", false))))
+        val done = ToolExecutor.Outcome("""{"ok":true}""", ok = true, recordId = null, chip = null, changedPrefix = false)
+        val bridge = bridge(lists = { shopping }) { _, _ -> done }
+
+        val edited = json(bridge.handle(toolCall(ToolCatalog.EDIT_NOTE, """{"note":"Shopping list","add":["Milk"]}""")))
+        val other = json(bridge.handle(toolCall(ToolCatalog.SET_TIMER, """{"minutes":5}""")))
+
+        assertEquals("Milk", edited["lists"].asJsonArray[0].asJsonObject["items"].asJsonArray[0].asJsonObject["text"].asString)
+        assertNull(other["lists"])
     }
 }

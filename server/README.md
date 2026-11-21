@@ -162,6 +162,7 @@ SMS asked for, opens WhatsApp or SMS on the phone ready to send, as before.
 | `POST /family/briefing` | `{after, up_to?, greet?, audio?}`: `{text, up_to, audio}`, what Luna says as she opens the app, in one message (Gemini), with Murf's MP3 of it (base64) unless `audio` is false |
 | `POST /family/speech` | `{text}`: `{audio}`, Murf's MP3 of it, in her calls' voice; null when Murf can't |
 | `POST /family/tool` | `{"name": "message_family", "args": {"to": "Filu", "text": "…"}}`: one of Luna's family tools without a call; a name not in the family is a 400 |
+| `POST /family/whatsapp` | `{"to": "Ravi", "text": "…", "name"?, "phone"?}`: the phone's `send_message` WhatsApp, from Luna's number, to anyone. Someone in the hub by name; else 404 `{unknown: true}`, and the phone asks again with the number from her contacts, who joins the hub as a `contact` so their answer is told to her (mid-call, or when she opens the app) |
 
 ## For the demo
 

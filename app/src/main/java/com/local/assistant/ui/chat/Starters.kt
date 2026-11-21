@@ -29,6 +29,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowForward
 import androidx.compose.material.icons.outlined.Calculate
+import androidx.compose.material.icons.outlined.Call
 import androidx.compose.material.icons.outlined.Checklist
 import androidx.compose.material.icons.outlined.DoneAll
 import androidx.compose.material.icons.outlined.Edit
@@ -80,12 +81,17 @@ import com.local.assistant.ui.theme.AppColors
 import com.local.assistant.ui.theme.Glass
 import com.local.assistant.ui.theme.GlassRoundButton
 import com.local.assistant.ui.theme.fadingEdges
+import com.local.assistant.ui.theme.LunaOrb
+import com.local.assistant.ui.theme.LunaOrbMode
 import com.local.assistant.ui.theme.liquidGlass
+import com.local.assistant.wake.WakeWord
 import kotlinx.coroutines.delay
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
 import java.util.Locale
 import kotlin.random.Random
+
+private const val NAME = WakeWord.NAME
 
 /** A first message to tap on a blank chat: one of the things the assistant can do. */
 data class Starter(val text: String, val kind: Kind, val needs: Needs = Needs.NOTHING) {
@@ -94,10 +100,12 @@ data class Starter(val text: String, val kind: Kind, val needs: Needs = Needs.NO
         GREETING, REMINDER, TIMER, AGENDA, MEMORY, PHOTOS, WEB, MATHS, PHONE,
         WRITING(true), IDEAS(true), FOOD(true), LANGUAGE(true), TRAVEL(true),
         PLACE, NOTES, HEALTH, SEVERAL,
+        /** Something to say in a call with Luna: the tile starts the call, she says it herself. */
+        CALL,
     }
 
     /** What must be set up first: a suggestion the assistant can't do yet isn't offered. */
-    enum class Needs { NOTHING, WEB, PHOTOS, HEALTH }
+    enum class Needs { NOTHING, WEB, PHOTOS, HEALTH, CALLS }
 }
 
 object Starters {
@@ -145,7 +153,18 @@ object Starters {
         Starter("A quick 15-minute dinner recipe", Starter.Kind.FOOD),
         Starter("How do I say “where is the station?” in Hindi?", Starter.Kind.LANGUAGE),
         Starter("Plan a 3-day trip to Munnar", Starter.Kind.TRAVEL),
+        // Ideas for a call: the tile only rings Luna, so nothing is sent until she says it herself.
+        Starter("Say “WhatsApp my son that I've reached home”", Starter.Kind.CALL, Starter.Needs.CALLS),
+        Starter("Say “Ask my daughter if she can come for tea at five”", Starter.Kind.CALL, Starter.Needs.CALLS),
+        Starter("Say “Add milk and eggs to my shopping list”", Starter.Kind.CALL, Starter.Needs.CALLS),
+        Starter("Ask “What's on my shopping list?”", Starter.Kind.CALL, Starter.Needs.CALLS),
+        Starter("Say “Remind me to take my tablets at 9 pm”", Starter.Kind.CALL, Starter.Needs.CALLS),
+        Starter("Ask “What's on my schedule today?”", Starter.Kind.CALL, Starter.Needs.CALLS),
+        Starter("Chat about your day, or anything at all", Starter.Kind.CALL, Starter.Needs.CALLS),
     )
+
+    /** How many of the tiles are call ideas, when calls can be made. */
+    const val CALL_TILES = 2
 
     /** A hello for the time of day: the first suggestion, always. */
     fun greeting(hour: Int): Starter = Starter(
@@ -162,18 +181,23 @@ object Starters {
      * The greeting and [count] others at random, no two of a kind, only ones that are set up. At
      * most one is [plain chat][Starter.Kind.plainChat]: the rest show what only this assistant does.
      */
-    fun pick(random: Random, hour: Int, web: Boolean, photos: Boolean, health: Boolean = false, count: Int = 3): List<Starter> {
+    fun pick(random: Random, hour: Int, web: Boolean, photos: Boolean, health: Boolean = false, count: Int = 3, calls: Boolean = false): List<Starter> {
         val possible = ALL.filter {
             when (it.needs) {
                 Starter.Needs.NOTHING -> true
                 Starter.Needs.WEB -> web
                 Starter.Needs.PHOTOS -> photos
                 Starter.Needs.HEALTH -> health
+                Starter.Needs.CALLS -> false
             }
         }
+        // With calls, [CALL_TILES] of them are things to say to Luna in one.
+        val ringing = if (calls) ALL.filter { it.kind == Starter.Kind.CALL }.shuffled(random).take(minOf(CALL_TILES, count)) else emptyList()
+        val rest = count - ringing.size
         val (chat, own) = possible.shuffled(random).distinctBy { it.kind }.partition { it.kind.plainChat }
-        val shown = (own.take(count - 1) + chat.take(1) + own.drop(count - 1)).take(count)
-        return listOf(greeting(hour)) + shown.shuffled(random)
+        val shown = (own.take(rest - 1) + chat.take(1) + own.drop(rest - 1)).take(rest)
+        // The call ideas lead, in the first row under the hello, where they're seen without scrolling.
+        return listOf(greeting(hour)) + ringing + shown.shuffled(random)
     }
 }
 
@@ -209,10 +233,14 @@ fun StarterPanel(
      * tap aimed at one landed on another.
      */
     status: String? = null,
+    /** Rings Luna for a live call; null while calls are off. Then the call card leads, and call ideas join the tiles. */
+    onCall: (() -> Unit)? = null,
 ) {
     val now = remember(chatKey) { LocalDateTime.now() }
     var shuffles by rememberSaveable(chatKey) { mutableIntStateOf(0) }
-    val starters = remember(chatKey, shuffles, web, photos, health) { Starters.pick(Random.Default, now.hour, web, photos, health, count = 4) }
+    val calls = onCall != null
+    val starters = remember(chatKey, shuffles, web, photos, health, calls) { Starters.pick(Random.Default, now.hour, web, photos, health, count = 4, calls = calls) }
+    val tap: (Starter) -> Unit = { starter -> if (starter.kind == Starter.Kind.CALL) onCall?.invoke() else onPick(starter.text) }
 
     Column(
         modifier
@@ -234,10 +262,14 @@ fun StarterPanel(
             color = AppColors.TextPrimary,
         )
         NameReveal(name ?: "what shall we do?", key = chatKey)
-        Spacer(Modifier.height(6.dp))
+        onCall?.let { call ->
+            Spacer(Modifier.height(16.dp))
+            CallCard(onClick = call)
+        }
+        Spacer(Modifier.height(if (calls) 16.dp else 6.dp))
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(
-                status ?: "Tap one to start, or ask anything",
+                status ?: if (calls) "Or tap one to start, or type to $NAME" else "Tap one to start, or ask anything",
                 style = MaterialTheme.typography.bodyLarge,
                 color = AppColors.TextSecondary,
                 modifier = Modifier.weight(1f),
@@ -250,7 +282,7 @@ fun StarterPanel(
         key(starters) {
             val greeting = starters.first()
             val others = starters.drop(1)
-            StarterTile(greeting, index = 0, wide = true, enabled = enabled, onClick = { onPick(greeting.text) })
+            StarterTile(greeting, index = 0, wide = true, enabled = enabled, onClick = { tap(greeting) })
             others.chunked(2).forEachIndexed { row, pair ->
                 Spacer(Modifier.height(TILE_GAP))
                 Row(Modifier.height(IntrinsicSize.Min), horizontalArrangement = Arrangement.spacedBy(TILE_GAP)) {
@@ -259,14 +291,70 @@ fun StarterPanel(
                             starter,
                             index = 1 + row * 2 + column,
                             wide = false,
-                            enabled = enabled,
-                            onClick = { onPick(starter.text) },
+                            // A call rings even while an answer is being written.
+                            enabled = enabled || starter.kind == Starter.Kind.CALL,
+                            onClick = { tap(starter) },
                             modifier = Modifier.weight(1f).fillMaxHeight(),
                         )
                     }
                     if (pair.size == 1) Spacer(Modifier.weight(1f))
                 }
             }
+        }
+    }
+}
+
+/**
+ * Luna's call, first on a blank chat: her orb rippling, and what a call can do. Talking is the
+ * easiest way in for someone who'd rather not type; the whole card rings her.
+ */
+@Composable
+private fun CallCard(onClick: () -> Unit) {
+    val arrive = remember { Animatable(0f) }
+    LaunchedEffect(Unit) { arrive.animateTo(1f, spring(dampingRatio = 0.7f, stiffness = Spring.StiffnessMediumLow)) }
+    val press = remember { MutableInteractionSource() }
+    val pressed by press.collectIsPressedAsState()
+    val squeeze by animateFloatAsState(if (pressed) 0.97f else 1f, spring(dampingRatio = 0.5f, stiffness = Spring.StiffnessMedium), label = "press")
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .graphicsLayer {
+                alpha = arrive.value.coerceIn(0f, 1f)
+                translationY = (1f - arrive.value) * 24.dp.toPx()
+                scaleX = squeeze
+                scaleY = squeeze
+            }
+            .liquidGlass(CallShape, Glass.Pane, sheen = 0.45f)
+            .clickable(interactionSource = press, indication = null, role = Role.Button, onClickLabel = "Call $NAME", onClick = onClick)
+            .padding(start = 8.dp, end = 18.dp, top = 8.dp, bottom = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        LunaOrb(
+            mode = LunaOrbMode.IDLE,
+            level = 0f,
+            icon = Icons.Outlined.Call,
+            label = "Call $NAME",
+            onClick = onClick,
+            core = 72.dp,
+            area = 116.dp,
+            iconSize = 30.dp,
+            ripples = true,
+        )
+        Spacer(Modifier.width(6.dp))
+        Column(Modifier.weight(1f)) {
+            Text(
+                "LIVE VOICE",
+                style = MaterialTheme.typography.labelSmall.copy(letterSpacing = 1.1.sp, fontWeight = FontWeight.SemiBold),
+                color = AppColors.Accent,
+            )
+            Spacer(Modifier.height(2.dp))
+            Text("Call $NAME", style = TextStyle(fontSize = 24.sp, lineHeight = 30.sp, fontWeight = FontWeight.SemiBold), color = AppColors.TextPrimary)
+            Spacer(Modifier.height(4.dp))
+            Text(
+                "Just talk. She'll WhatsApp anyone for you, keep your lists and reminders, and tell you the moment they reply.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = AppColors.TextSecondary,
+            )
         }
     }
 }
@@ -372,6 +460,7 @@ private fun icon(kind: Starter.Kind): ImageVector = when (kind) {
     Starter.Kind.NOTES -> Icons.Outlined.Checklist
     Starter.Kind.HEALTH -> Icons.Outlined.MonitorHeart
     Starter.Kind.SEVERAL -> Icons.Outlined.DoneAll
+    Starter.Kind.CALL -> Icons.Outlined.Call
 }
 
 private fun label(kind: Starter.Kind): String = when (kind) {
@@ -393,6 +482,7 @@ private fun label(kind: Starter.Kind): String = when (kind) {
     Starter.Kind.NOTES -> "Notes and lists"
     Starter.Kind.HEALTH -> "Health"
     Starter.Kind.SEVERAL -> "Two at once"
+    Starter.Kind.CALL -> "Call $NAME"
 }
 
 /** Each kind keeps its colour, so a reminder always looks like a reminder. */
@@ -450,4 +540,5 @@ private fun NameReveal(text: String, key: Any?) {
 private const val LETTER_BEAT = 45L
 private val HelloStyle = TextStyle(fontSize = 32.sp, lineHeight = 38.sp, fontWeight = FontWeight.SemiBold, letterSpacing = (-0.6).sp)
 private val TileShape = RoundedCornerShape(24.dp)
+private val CallShape = RoundedCornerShape(32.dp)
 private val TILE_GAP = 10.dp

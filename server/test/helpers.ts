@@ -149,9 +149,12 @@ export class FakePhone implements BridgeSocket {
   private onMessage: (data: unknown) => void = () => {}
   private onClose: () => void = () => {}
   private readonly answer: (call: Record<string, unknown>) => unknown
+  /** More of the tool_result than its result: the lists a list tool sends back. */
+  private readonly extra: (call: Record<string, unknown>) => Record<string, unknown>
 
-  constructor(answer: (call: Record<string, unknown>) => unknown = () => ({ ok: true })) {
+  constructor(answer: (call: Record<string, unknown>) => unknown = () => ({ ok: true }), extra: (call: Record<string, unknown>) => Record<string, unknown> = () => ({})) {
     this.answer = answer
+    this.extra = extra
   }
 
   send(data: string) {
@@ -160,7 +163,7 @@ export class FakePhone implements BridgeSocket {
     if (message.type !== 'tool_call') return
     const result = this.answer(message)
     if (result === null) return
-    setImmediate(() => this.onMessage(JSON.stringify({ type: 'tool_result', call_id: message.call_id, result: JSON.stringify(result), chip: null })))
+    setImmediate(() => this.onMessage(JSON.stringify({ type: 'tool_result', call_id: message.call_id, result: JSON.stringify(result), chip: null, ...this.extra(message) })))
   }
 
   close() {

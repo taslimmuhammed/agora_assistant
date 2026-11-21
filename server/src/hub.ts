@@ -10,7 +10,8 @@ import { atClock, dayKey } from './when.ts'
  * people see or answer. One SQLite file (Node's built-in sqlite), seeded from seed/family.json.
  */
 
-export type Role = 'elder' | 'caregiver' | 'family' | 'provider'
+/** contact: someone from her phone's contacts she has WhatsApped through Luna, not family: their answers come back to her too. */
+export type Role = 'elder' | 'caregiver' | 'family' | 'provider' | 'contact'
 
 export interface Member {
   id: string
@@ -89,6 +90,48 @@ export interface HubEvent {
   told?: boolean
 }
 
+/** One thing she said to Luna, in a call or the chat: what notices.ts looks over each evening. */
+export interface Said {
+  id: number
+  at: number
+  day: string
+  /** "call", "checkin call" or "chat". */
+  source: string
+  text: string
+  /** She asked for it to stay between her and Luna ("don't tell Rahul"). */
+  private: boolean
+}
+
+/**
+ * What Luna suggests her family do about something she keeps mentioning: a booking or an order
+ * sent to one of her providers (request_service), something someone in her family does (a task
+ * they've taken on), or nothing but knowing.
+ */
+export type NoticeAction =
+  | { kind: 'book' | 'order'; provider: string; what: string; when: string }
+  | { kind: 'family'; what: string; when: string }
+  | { kind: 'none' }
+
+/** sent: waiting for her family; acted: someone said yes; dismissed: "not now". */
+export type NoticeStatus = 'sent' | 'acted' | 'dismissed'
+
+export interface Notice {
+  id: number
+  at: number
+  day: string
+  /** "knee pain", "skipping lunch". */
+  topic: string
+  /** For her family: what she said, and how often. */
+  observation: string
+  /** For her, after "I let Rahul know ": "your knee has been bothering you this week". */
+  forHer: string
+  action: NoticeAction
+  status: NoticeStatus
+  /** The member who said yes or "not now". */
+  settledBy: string | null
+  settledAt: number | null
+}
+
 /** What Luna tells her when it comes: the family's answers, and the shops'. */
 export const ANSWER_KINDS = ['reply', 'task_reply', 'request_reply']
 
@@ -150,7 +193,7 @@ export class Hub {
     return this.member(id)
   }
 
-  /** Someone new, picked from her contacts in the app: family, a caregiver, or a shop or service. */
+  /** Someone new, picked from her contacts in the app (family, a caregiver, a shop or service), or messaged through Luna (contact). */
   addMember(person: { name: string; relation: string; role: Exclude<Role, 'elder'>; phone: string }): Member {
     const base = person.name.toLowerCase().normalize('NFKD').replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'someone'
     let id = base
@@ -350,6 +393,71 @@ export class Hub {
     this.db.prepare('DELETE FROM dose_alerts WHERE dose_id = ? AND day = ?').run(doseId, day)
   }
 
+  checkinsSince(since: number): Checkin[] {
+    return this.db.prepare('SELECT * FROM checkins WHERE at > ? ORDER BY at').all(since).map(toCheckin)
+  }
+
+  /** The doses her caregiver was told about, from [day] ("2026-11-15") on. */
+  doseAlertsSince(day: string): Array<{ doseId: string; day: string }> {
+    return this.db.prepare('SELECT dose_id, day FROM dose_alerts WHERE day >= ? ORDER BY day').all(day)
+      .map(r => ({ doseId: String(r.dose_id), day: String(r.day) }))
+  }
+
+  // What she said to Luna, kept a fortnight, for noticing what keeps coming up (notices.ts)
+
+  /**
+   * Keeps one thing she said in [session]; false when it's there already: Agora sends a turn
+   * again when she talks over the reply. Anything older than [SAID_KEPT_MS] goes as this comes.
+   */
+  addSaid(said: Omit<Said, 'id'> & { session: string; turn?: string }): boolean {
+    const again = said.turn
+      ? this.db.prepare('SELECT 1 FROM said WHERE session = ? AND turn = ?').get(said.session, said.turn)
+      : this.db.prepare('SELECT 1 FROM said WHERE session = ? AND text = ?').get(said.session, said.text)
+    if (again) return false
+    this.db.prepare('DELETE FROM said WHERE at < ?').run(said.at - SAID_KEPT_MS)
+    this.db.prepare('INSERT INTO said (at, day, source, text, private, session, turn) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run(said.at, said.day, said.source, said.text, Number(said.private), said.session, said.turn ?? null)
+    return true
+  }
+
+  saidSince(since: number): Said[] {
+    return this.db.prepare('SELECT * FROM said WHERE at > ? ORDER BY at, id').all(since).map(toSaid)
+  }
+
+  // What Luna noticed and suggested to her family
+
+  addNotice(notice: Pick<Notice, 'topic' | 'observation' | 'forHer' | 'action'>, now: number): Notice {
+    const info = this.db
+      .prepare(`INSERT INTO notices (at, day, topic, observation, for_her, action, status) VALUES (?, ?, ?, ?, ?, ?, 'sent')`)
+      .run(now, dayKey(new Date(now)), notice.topic, notice.observation, notice.forHer, JSON.stringify(notice.action))
+    return this.notice(Number(info.lastInsertRowid))!
+  }
+
+  notice(id: number): Notice | null {
+    const row = this.db.prepare('SELECT * FROM notices WHERE id = ?').get(id)
+    return row ? toNotice(row) : null
+  }
+
+  noticesSince(since: number): Notice[] {
+    return this.db.prepare('SELECT * FROM notices WHERE at > ? ORDER BY id').all(since).map(toNotice)
+  }
+
+  /** Settles a notice still waiting; false when someone already answered it. */
+  settleNotice(id: number, status: Exclude<NoticeStatus, 'sent'>, by: string | null, now: number): boolean {
+    return Number(this.db.prepare(`UPDATE notices SET status = ?, settled_by = ?, settled_at = ? WHERE id = ? AND status = 'sent'`)
+      .run(status, by, now, id).changes) > 0
+  }
+
+  /** Back to waiting: what a yes was to start couldn't be sent. */
+  reopenNotice(id: number) {
+    this.db.prepare(`UPDATE notices SET status = 'sent', settled_by = NULL, settled_at = NULL WHERE id = ?`).run(id)
+  }
+
+  /** For a notice that never reached anyone. */
+  removeNotice(id: number) {
+    this.db.prepare('DELETE FROM notices WHERE id = ?').run(id)
+  }
+
   // What happened, for the elder's next call, the digest and the dashboard
 
   addEvent(kind: string, text: string, item: unknown, now: number): HubEvent {
@@ -390,8 +498,8 @@ export class Hub {
 
   /** Back to the seed, keeping the family group: between rehearsals. */
   reset() {
-    this.db.exec('DELETE FROM tasks; DELETE FROM requests; DELETE FROM checkins; DELETE FROM dose_alerts; DELETE FROM events;')
-    this.db.prepare("DELETE FROM meta WHERE key LIKE 'last_call_end:%' OR key = 'digest_day' OR key LIKE 'wa:%'").run()
+    this.db.exec('DELETE FROM tasks; DELETE FROM requests; DELETE FROM checkins; DELETE FROM dose_alerts; DELETE FROM events; DELETE FROM said; DELETE FROM notices;')
+    this.db.prepare("DELETE FROM meta WHERE key LIKE 'last_call_end:%' OR key = 'digest_day' OR key = 'notice_day' OR key LIKE 'health:%' OR key LIKE 'wa:%'").run()
   }
 
   /** Everything the dashboard shows. */
@@ -405,6 +513,7 @@ export class Hub {
       tasks: this.tasks(),
       requests: this.requests(),
       checkins: this.checkinsOn(dayKey(now)),
+      notices: this.noticesSince(now.getTime() - 7 * 24 * 60 * 60_000),
       events: this.eventsSince(now.getTime() - 24 * 60 * 60_000).reverse().slice(0, 50),
     }
   }
@@ -435,9 +544,47 @@ CREATE TABLE IF NOT EXISTS dose_alerts (dose_id TEXT NOT NULL, day TEXT NOT NULL
 CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, kind TEXT NOT NULL, text TEXT NOT NULL, item TEXT
 );
+CREATE TABLE IF NOT EXISTS said (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, day TEXT NOT NULL, source TEXT NOT NULL,
+  text TEXT NOT NULL, private INTEGER NOT NULL DEFAULT 0, session TEXT, turn TEXT
+);
+CREATE TABLE IF NOT EXISTS notices (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, day TEXT NOT NULL, topic TEXT NOT NULL,
+  observation TEXT NOT NULL, for_her TEXT NOT NULL DEFAULT '', action TEXT NOT NULL, status TEXT NOT NULL,
+  settled_by TEXT, settled_at INTEGER
+);
 `
 
+/** How long what she said is kept on the server: two weeks, for a week's look back and what came before. */
+export const SAID_KEPT_MS = 14 * 24 * 60 * 60_000
+
 type Row = Record<string, unknown>
+
+function toSaid(row: Row): Said {
+  return {
+    id: Number(row.id),
+    at: Number(row.at),
+    day: String(row.day),
+    source: String(row.source),
+    text: String(row.text),
+    private: Number(row.private) === 1,
+  }
+}
+
+function toNotice(row: Row): Notice {
+  return {
+    id: Number(row.id),
+    at: Number(row.at),
+    day: String(row.day),
+    topic: String(row.topic),
+    observation: String(row.observation),
+    forHer: String(row.for_her ?? ''),
+    action: JSON.parse(String(row.action ?? '{"kind":"none"}')) as NoticeAction,
+    status: row.status as NoticeStatus,
+    settledBy: (row.settled_by as string | null) ?? null,
+    settledAt: row.settled_at == null ? null : Number(row.settled_at),
+  }
+}
 
 function toMember(row: Row): Member {
   return {

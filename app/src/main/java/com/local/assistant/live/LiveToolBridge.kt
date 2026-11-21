@@ -40,6 +40,8 @@ class LiveToolBridge(
     private val transcript: LiveTranscriptLog,
     /** On the lock screen: only [ToolCatalog.LOCKED] tools run, as on the phone's own model. */
     private val locked: Boolean,
+    /** Her lists as they are now, sent back with a list tool's result so the call's prompt keeps up; null on the lock screen. */
+    private val lists: (suspend () -> List<LiveContext.ListContent>)? = null,
     private val zone: () -> ZoneId = ZoneId::systemDefault,
 ) {
 
@@ -107,16 +109,26 @@ class LiveToolBridge(
         }
         val recordId = outcome.recordId
         if (outcome.chip != null && recordId != null) _events.emit(Event.Chip(recordId, outcome.chip))
-        return reply(callId, outcome.result, outcome.chip)
+        val fresh = lists?.takeIf { name == ToolCatalog.EDIT_NOTE }?.let { read ->
+            try {
+                read()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "Reading the lists again failed", e)
+                null
+            }
+        }
+        return reply(callId, outcome.result, outcome.chip, fresh)
     }
 
-    private fun reply(callId: String, result: String, chip: MemoryChip?): String = gson.toJson(
-        linkedMapOf(
+    private fun reply(callId: String, result: String, chip: MemoryChip?, lists: List<LiveContext.ListContent>? = null): String = gson.toJson(
+        linkedMapOf<String, Any?>(
             "type" to TOOL_RESULT,
             "call_id" to callId,
             "result" to result,
             "chip" to chip?.let { linkedMapOf("title" to it.label, "detail" to chipDetail(it, zone())) },
-        ),
+        ).apply { if (lists != null) put("lists", lists) },
     )
 
     /**

@@ -63,9 +63,23 @@ class ToolRoutingTest {
 
     private val sentByLuna = mutableListOf<String>()
 
+    /** Whether Luna's server can send now (live voice on); off, the phone's own apps open. */
+    private var lunaOn = false
+
     private val device = DeviceTools(
         phone, { contacts }, { who -> people[who] ?: PersonHints.NONE }, clock, now = { now },
-        family = { to, text -> hub[to.lowercase()]?.also { sentByLuna += "$it: $text" } },
+        family = { to, text, contact ->
+            when {
+                !lunaOn -> LunaSent.Off
+                contact == null -> hub[to.lowercase()]?.let { sentByLuna += "$it: $text"; LunaSent.To(it) } ?: LunaSent.Unknown
+                contact.number.endsWith("33333") -> LunaSent.Refused("${contact.name} isn't on WhatsApp, so nothing was sent. Offer an SMS instead.")
+                else -> {
+                    hub[to.lowercase()] = contact.name
+                    sentByLuna += "${contact.name} (${contact.number}): $text"
+                    LunaSent.To(contact.name)
+                }
+            }
+        },
     )
 
     private val web = object : WebSearch {
@@ -533,22 +547,43 @@ class ToolRoutingTest {
     }
 
     @Test
-    fun `a message to someone in the family hub goes from Luna's WhatsApp, so the answer comes back`() {
+    fun `with live voice, a WhatsApp to anyone goes from Luna's number, so the answer comes back`() {
+        lunaOn = true
         hub["filu"] = "Filu"
-        hub["amma"] = "Amma"
         val (session, events) = turn(call("send_message", "to" to "Filu", "text" to "Can you bring my BP tablets?"), reply = "I've sent your message to Filu.")
         assertEquals(listOf("Filu: Can you bring my BP tablets?"), sentByLuna)
         assertTrue("nothing to tap", phone.done.isEmpty())
         assertTrue(result(session)["sent"].toString().startsWith("on WhatsApp to Filu"))
         assertEquals("Filu: Can you bring my BP tablets?", events.filterIsInstance<ToolEvent.Memory>().single().chip.detail)
 
-        // An SMS asked for, or someone not in the hub: the phone's own app, ready to send, as before.
+        // Not in the hub: the number from her contacts, sent from Luna's WhatsApp too.
+        now = now.plusMinutes(1)
+        val (contact, _) = turn(call("send_message", "to" to "Priya Sharma", "text" to "Running late", "app" to "whatsapp"))
+        assertTrue(result(contact)["sent"].toString().startsWith("on WhatsApp to Priya Sharma"))
+        assertEquals("Priya Sharma (98450 22222): Running late", sentByLuna.last())
+
+        // Not on WhatsApp, or several people fit: said so, and nothing is opened or sent.
+        now = now.plusMinutes(1)
+        val (refused, _) = turn(call("send_message", "to" to "Priya Nair", "text" to "Hello"))
+        assertTrue(error(refused), error(refused).contains("isn't on WhatsApp"))
+        now = now.plusMinutes(1)
+        val (several, _) = turn(call("send_message", "to" to "Priya", "text" to "Hi"))
+        assertTrue(error(several), error(several).contains("Several contacts match"))
+
+        // An SMS asked for: the phone's own app, ready to send, as before.
         now = now.plusMinutes(1)
         turn(call("send_message", "to" to "amma", "text" to "Reached home", "app" to "sms"))
-        now = now.plusMinutes(1)
-        turn(call("send_message", "to" to "Priya Sharma", "text" to "Running late", "app" to "whatsapp"))
-        assertEquals(listOf("SMS +91 98450 11111: Reached home", "WHATSAPP 98450 22222: Running late"), phone.done)
-        assertEquals(1, sentByLuna.size)
+        assertEquals(listOf("SMS +91 98450 11111: Reached home"), phone.done)
+        assertEquals(2, sentByLuna.size)
+    }
+
+    @Test
+    fun `with live voice the model is told WhatsApp goes from Luna, and SMS still opens the app`() {
+        val luna = ToolCatalog.declarations(web = false, luna = true).single { "\"name\":\"send_message\"" in it }
+        assertTrue(luna, "sent at once from Luna's WhatsApp to anyone" in luna)
+        assertTrue(ToolCatalog.declarations(web = false).single { "\"name\":\"send_message\"" in it }.contains("the user taps send"))
+        assertTrue("say it was sent only when the result says sent" in ToolCatalog.rules(web = false, luna = true))
+        assertTrue("never that it was sent." in ToolCatalog.rules(web = false))
     }
 
     @Test

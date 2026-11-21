@@ -423,7 +423,7 @@ class AppContainer(context: Context) {
         people = memoryRepository,
         alarms = clockAlarms,
         now = ZonedDateTime::now,
-        family = { to, text -> sendThroughLuna(to, text) },
+        family = { to, text, contact -> sendThroughLuna(to, text, contact) },
     )
 
     /** Files on the phone by name: read_file, declared once All files access is given. */
@@ -536,10 +536,10 @@ class AppContainer(context: Context) {
 
     /** The phone's tools as a call or chat message is given them: those set up now. */
     private fun liveDeclarations() =
-        ToolCatalog.declarations(web = webSearch.enabled, photos = photoSearchReady(), health = healthTools.available(), files = fileSearchReady(), inbox = inboxReady())
+        ToolCatalog.declarations(web = webSearch.enabled, photos = photoSearchReady(), health = healthTools.available(), files = fileSearchReady(), inbox = inboxReady(), luna = true)
 
     private fun liveRules() =
-        ToolCatalog.rules(web = webSearch.enabled, photos = photoSearchReady(), health = healthTools.available(), files = fileSearchReady(), inbox = inboxReady())
+        ToolCatalog.rules(web = webSearch.enabled, photos = photoSearchReady(), health = healthTools.available(), files = fileSearchReady(), inbox = inboxReady(), luna = true)
 
     /** What the phone shares with Luna's server for one call or chat message. */
     private val liveContexts = com.local.assistant.live.LiveContextBuilder(
@@ -605,13 +605,21 @@ class AppContainer(context: Context) {
      * so the answer comes back; null (WhatsApp opens on the phone instead) when they aren't in it,
      * or live voice is off or offline.
      */
-    private suspend fun sendThroughLuna(to: String, text: String): String? {
-        if (!liveCalls.available()) return null
+    private suspend fun sendThroughLuna(
+        to: String,
+        text: String,
+        contact: com.local.assistant.memory.tools.FamilyMessenger.Contact?,
+    ): com.local.assistant.memory.tools.LunaSent {
+        if (!liveCalls.available()) return com.local.assistant.memory.tools.LunaSent.Off
         return try {
-            liveApi.messageFamily(to, text).sentTo?.also { familyAnswers.expect() }
+            val sent = liveApi.whatsapp(to, text, contact?.name, contact?.number) ?: return com.local.assistant.memory.tools.LunaSent.Unknown
+            familyAnswers.expect()
+            com.local.assistant.memory.tools.LunaSent.To(sent.sentTo ?: contact?.name ?: to)
         } catch (e: com.local.assistant.live.LiveError) {
+            // 400: the server says why (no number, not on WhatsApp). Otherwise it's offline or signed out of WhatsApp.
+            if (e.code == 400) return com.local.assistant.memory.tools.LunaSent.Refused(e.message.orEmpty())
             Log.i("AppContainer", "Not sent from Luna's WhatsApp, so WhatsApp opens instead: ${e.message}")
-            null
+            com.local.assistant.memory.tools.LunaSent.Off
         }
     }
 

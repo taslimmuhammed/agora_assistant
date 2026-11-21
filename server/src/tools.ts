@@ -105,7 +105,7 @@ async function messageFamily(args: Record<string, unknown>, { hub, whatsapp, now
   const to = text(args.to)
   const everyone = !to || /\b(every|everyone|everybody|all|family|sab|sabko)\b/i.test(to)
   const group = hub.familyGroupChat()
-  const people = everyone ? familyRecipients(hub) : [hub.findMember(to, ['caregiver', 'family', 'provider'])].filter((m): m is Member => !!m)
+  const people = everyone ? familyRecipients(hub) : [hub.findMember(to, ['caregiver', 'family', 'provider', 'contact'])].filter((m): m is Member => !!m)
   if (!(everyone && group !== null) && !people.length) {
     throw new ToolError(everyone ? 'No one in her family has a WhatsApp number saved yet.' : `No one called "${to}". Her family: ${familyList(hub)}.`)
   }
@@ -137,6 +137,51 @@ async function messageFamily(args: Record<string, unknown>, { hub, whatsapp, now
     result: { ok: true, sent_to: names, urgent: urgent || undefined },
     card: { title: urgent ? `Urgent message to ${names}` : `Told ${names}`, detail: body },
     action: `message_family: ${urgent ? 'urgent ' : ''}message to ${names}: "${body}"`,
+  }
+}
+
+/** What the phone sends for "WhatsApp Ravi …": who, by name, and their number when it found one in her contacts. */
+export interface WhatsAppArgs { to?: unknown; text?: unknown; name?: unknown; phone?: unknown }
+
+/**
+ * A WhatsApp message of hers to anyone, from Luna's WhatsApp, so the answer comes back to her:
+ * someone in the hub by [to], or whoever has [phone] (her phone found it in her contacts). Someone
+ * new is added to the hub as a contact, which is what lets their answer through (whatsapp.ts
+ * listens only to the hub's people). `unknown: true` when there's no [phone] and no one in the hub
+ * is called [to]: the phone then looks in her contacts and asks again with the number.
+ */
+export async function whatsappSomeone(args: WhatsAppArgs, { hub, whatsapp, now }: Pick<ToolDeps, 'hub' | 'whatsapp' | 'now'>): Promise<ToolOutcome> {
+  try {
+    const body = text(args.text)
+    if (!body) throw new ToolError('Say what the message is.')
+    const to = text(args.to)
+    const phone = text(args.phone)
+    let member: Member | null
+    if (phone) {
+      const chat = chatOf({ phone })
+      if (!chat) throw new ToolError(`${phone} isn't a number WhatsApp can reach.`)
+      member = hub.members().find(m => m.role !== 'elder' && chatOf(m) === chat) ?? null
+      if (!member) {
+        const name = text(args.name) || to || phone
+        if ((await whatsapp?.hasWhatsApp(phone)) === false) throw new ToolError(`${name} isn't on WhatsApp, so nothing was sent. Offer an SMS instead.`)
+        member = hub.addMember({ name, relation: 'contact', role: 'contact', phone })
+      }
+    } else {
+      member = to ? hub.findMember(to, ['caregiver', 'family', 'provider', 'contact']) : null
+      if (!member) return { result: { ok: false, unknown: true, error: `No one called "${to}" in the hub: look in her contacts for the number.` } }
+    }
+    const elder = hub.elder()
+    const message = `💬 *${elder.name}*, through Luna:\n\n${body}${member.role === 'contact' ? `\n\n_Reply here and Luna will tell ${elder.name}._` : ''}`
+    await deliver(hub, whatsapp, member, message, [], true)
+    hub.addEvent('message', `Message to ${member.name}: ${body}`, { to: member.id }, now.getTime())
+    return {
+      result: { ok: true, sent_to: member.name, on: 'WhatsApp', next: `${member.name} answers on WhatsApp; she'll be told when they do.` },
+      card: { title: `WhatsApp to ${member.name}`, detail: body },
+      action: `send_message: WhatsApp to ${member.name}: "${body}", waiting for an answer`,
+    }
+  } catch (e) {
+    if (!(e instanceof ToolError)) console.warn('[tools] WhatsApp to someone failed:', e)
+    return { result: { ok: false, error: e instanceof ToolError ? e.message : 'it went wrong on the server; try once more' } }
   }
 }
 

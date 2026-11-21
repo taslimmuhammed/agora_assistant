@@ -1,6 +1,7 @@
 package com.local.assistant.ui.live
 
 import android.Manifest
+import android.app.KeyguardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -8,16 +9,23 @@ import android.graphics.Color as AndroidColor
 import android.os.Build
 import android.os.Bundle
 import android.view.WindowManager
-import androidx.activity.ComponentActivity
+import androidx.fragment.app.FragmentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.mutableStateOf
 import androidx.core.content.ContextCompat
 import com.local.assistant.appContainer
 import com.local.assistant.live.LiveContext
+import com.local.assistant.ui.gallery.LocalPhotoAccess
+import com.local.assistant.ui.gallery.PhotoAccess
+import com.local.assistant.ui.memory.MemoryViewModel
+import com.local.assistant.ui.notes.NotesViewModel
+import com.local.assistant.ui.privacy.LocalSensitive
+import com.local.assistant.ui.privacy.SensitiveAccess
 import com.local.assistant.ui.theme.LocalAssistantTheme
 
 /**
@@ -28,9 +36,13 @@ import com.local.assistant.ui.theme.LocalAssistantTheme
  * app ([com.local.assistant.live.LiveCalls]): leaving this screen doesn't end it, and its
  * notification comes back here.
  */
-class LiveCallActivity : ComponentActivity() {
+class LiveCallActivity : FragmentActivity() {
 
     private val viewModel: LiveCallViewModel by viewModels { LiveCallViewModel.factory(appContainer) }
+
+    /** For the cards: a place reminder's map and editor, a list's preview and the Notes screen, as in the chat. */
+    private val reminders: MemoryViewModel by viewModels { MemoryViewModel.factory(appContainer) }
+    private val notes: NotesViewModel by viewModels { NotesViewModel.factory(appContainer) }
 
     /** Android's microphone dialog was answered no: the call can't be made. */
     private val micRefused = mutableStateOf(false)
@@ -47,14 +59,22 @@ class LiveCallActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         showOverLockScreen(intent)
+        // Photos found in a call: shown as in the chat, but hidden while the phone is locked
+        // (a call begun on the lock screen), until it is unlocked.
+        val photos = PhotoAccess(appContainer.photoThumbnails, hidden = ::isLocked, onUnlock = ::unlock)
+        val sensitive = SensitiveAccess(appContainer.sensitiveLock, this)
         setContent {
             LocalAssistantTheme {
-                LiveCallScreen(
-                    viewModel = viewModel,
-                    micRefused = micRefused.value,
-                    onRetry = ::retry,
-                    onClose = ::finish,
-                )
+                CompositionLocalProvider(LocalPhotoAccess provides photos, LocalSensitive provides sensitive) {
+                    LiveCallScreen(
+                        viewModel = viewModel,
+                        micRefused = micRefused.value,
+                        onRetry = ::retry,
+                        onClose = ::finish,
+                        reminders = reminders,
+                        notes = notes,
+                    )
+                }
             }
         }
         // Recreated (turned, or back from the notification): the call is already on.
@@ -76,6 +96,12 @@ class LiveCallActivity : ComponentActivity() {
     override fun onStop() {
         super.onStop()
         inView = false
+    }
+
+    private fun isLocked(): Boolean = getSystemService(KeyguardManager::class.java)?.isKeyguardLocked == true
+
+    private fun unlock() {
+        getSystemService(KeyguardManager::class.java)?.requestDismissKeyguard(this, null)
     }
 
     private fun askOrStart(intent: Intent) {

@@ -1,14 +1,7 @@
 package com.local.assistant.ui.live
 
-import androidx.compose.animation.core.LinearEasing
-import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.animateFloat
-import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
-import androidx.compose.animation.core.tween
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -25,7 +18,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -39,6 +32,7 @@ import androidx.compose.material.icons.filled.CallEnd
 import androidx.compose.material.icons.filled.Keyboard
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MicOff
+import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.outlined.CheckCircle
 import androidx.compose.material.icons.outlined.ErrorOutline
 import androidx.compose.material.icons.outlined.People
@@ -49,36 +43,39 @@ import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
-import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.rotate
-import androidx.compose.ui.draw.scale
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
-import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.local.assistant.memory.db.TaskEntity
 import com.local.assistant.live.LiveContext
 import com.local.assistant.live.LiveSession
+import com.local.assistant.memory.db.UserNoteEntity
 import com.local.assistant.ui.chat.MemoryChips
 import com.local.assistant.ui.chat.ToolPermissionRequests
-import com.local.assistant.ui.theme.Glass
+import com.local.assistant.ui.memory.ConfirmDelete
+import com.local.assistant.ui.memory.MemoryViewModel
+import com.local.assistant.ui.memory.ReminderEditor
+import com.local.assistant.ui.notes.NotesScreen
+import com.local.assistant.ui.notes.NotesViewModel
+import com.local.assistant.ui.theme.LunaOrb
+import com.local.assistant.ui.theme.LunaOrbMode
 import com.local.assistant.wake.WakeWord
 import kotlinx.coroutines.delay
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.setValue
 
 /**
  * The call: Luna's orb, what is being said in large type, what was done as cards, and three big
@@ -91,6 +88,10 @@ fun LiveCallScreen(
     micRefused: Boolean,
     onRetry: () -> Unit,
     onClose: () -> Unit,
+    /** Reminders as the Reminders screen has them: a place reminder's map opens its editor over the call. */
+    reminders: MemoryViewModel? = null,
+    /** Her notes: a list made or changed in the call shows under its card, and opens on the Notes screen. */
+    notes: NotesViewModel? = null,
 ) {
     val call by viewModel.session.collectAsState()
     val chips by viewModel.chips.collectAsState()
@@ -98,6 +99,45 @@ fun LiveCallScreen(
     val note by viewModel.error.collectAsState()
     val uriHandler = LocalUriHandler.current
     ToolPermissionRequests(viewModel.permissionRequests)
+
+    // Nothing of hers over the lock screen: no maps, lists or editors there.
+    val unlocked = call?.locked == false
+    val memory = reminders?.takeIf { unlocked }
+    val noteBook = notes?.takeIf { unlocked }
+    var showingNote by remember { mutableStateOf(false) }
+    if (showingNote && noteBook != null) {
+        // The call goes on behind it; Back comes back to the call.
+        BackHandler {
+            noteBook.close()
+            showingNote = false
+        }
+        NotesScreen(viewModel = noteBook, onBack = { showingNote = false }, backToChat = true)
+        return
+    }
+    val cards = CallCards(
+        placeReminders = memory?.let { vm ->
+            val tasks by vm.tasks.collectAsState()
+            remember(tasks) { tasks.filter { it.place != null }.associateBy { it.id } }
+        }.orEmpty(),
+        notes = noteBook?.let { vm ->
+            val all by vm.all.collectAsState()
+            remember(all) { all.associateBy { it.id } }
+        }.orEmpty(),
+        // Each list under the latest card that made or changed it, as in the chat.
+        notePreviews = remember(chips) {
+            chips.filter { it.chip.noteId != null && !it.undone }
+                .groupBy { it.chip.noteId }.values.mapTo(HashSet()) { items -> items.maxOf { it.recordId } }
+        },
+        onOpenNote = noteBook?.let { vm ->
+            { opened: UserNoteEntity ->
+                vm.open(opened)
+                showingNote = true
+            }
+        },
+        onToggleNoteItem = { id, index -> noteBook?.toggle(id, index) },
+    )
+    var editingReminder by remember { mutableStateOf<TaskEntity?>(null) }
+    var deletingReminder by remember { mutableStateOf<TaskEntity?>(null) }
 
     Box(Modifier.fillMaxSize().background(Night)) {
         val session = call
@@ -115,13 +155,30 @@ fun LiveCallScreen(
                 serverCards = serverCards,
                 note = note,
                 viewModel = viewModel,
+                cards = cards.copy(onOpenReminder = memory?.let { { task: TaskEntity -> editingReminder = task } }),
                 openLink = { url -> if (url.startsWith("https://") || url.startsWith("http://")) runCatching { uriHandler.openUri(url) } },
                 onRetry = onRetry,
                 onClose = onClose,
             )
         }
     }
+    memory?.let { vm ->
+        editingReminder?.let { task ->
+            ReminderEditor(task, vm, onDelete = { deletingReminder = task }, onDone = { editingReminder = null })
+        }
+        deletingReminder?.let { task -> ConfirmDelete(task, vm, onDone = { deletingReminder = null }) }
+    }
 }
+
+/** What the call's cards need beyond the chips: the same maps, lists and editors the chat gives them. */
+private data class CallCards(
+    val placeReminders: Map<Long, TaskEntity> = emptyMap(),
+    val onOpenReminder: ((TaskEntity) -> Unit)? = null,
+    val notes: Map<Long, UserNoteEntity> = emptyMap(),
+    val notePreviews: Set<Long> = emptySet(),
+    val onOpenNote: ((UserNoteEntity) -> Unit)? = null,
+    val onToggleNoteItem: (Long, Int) -> Unit = { _, _ -> },
+)
 
 @Composable
 private fun Call(
@@ -130,6 +187,7 @@ private fun Call(
     serverCards: List<LiveCallViewModel.ServerCard>,
     note: String?,
     viewModel: LiveCallViewModel,
+    cards: CallCards,
     openLink: (String) -> Unit,
     onRetry: () -> Unit,
     onClose: () -> Unit,
@@ -138,7 +196,6 @@ private fun Call(
     val error by session.error.collectAsState()
     val captions by session.transcripts.collectAsState()
     val muted by session.muted.collectAsState()
-    val level by session.level.collectAsState()
     var typing by remember { mutableStateOf(false) }
 
     when (state) {
@@ -180,7 +237,6 @@ private fun Call(
         Spacer(Modifier.height(18.dp))
         Orb(
             state = state,
-            level = level,
             // Tapping the orb while she talks stops her, as saying something would.
             onTap = { if (state == LiveSession.State.SPEAKING) session.interrupt() },
         )
@@ -201,6 +257,12 @@ private fun Call(
                     onEditTime = viewModel::editTime,
                     onOpenClock = viewModel::openClock,
                     onOpenLink = openLink,
+                    placeReminders = cards.placeReminders,
+                    onOpenReminder = cards.onOpenReminder,
+                    notes = cards.notes,
+                    notePreviews = cards.notePreviews,
+                    onOpenNote = cards.onOpenNote,
+                    onToggleNoteItem = cards.onToggleNoteItem,
                 )
                 note?.let { Text(it, style = TextStyle(fontSize = 15.sp), color = Dim) }
             }
@@ -247,59 +309,46 @@ private fun statusOf(state: LiveSession.State, muted: Boolean): String = when (s
 }
 
 /**
- * Luna, as the assistant's light: grey and slow while the call connects, breathing while she
- * listens, turning while she thinks, and swelling with her voice while she speaks.
+ * Luna, as the overlay shows her, larger: the spinning light while the call connects and while
+ * she thinks or speaks (tap to stop her), rings and the mic while she listens.
  */
 @Composable
-private fun Orb(state: LiveSession.State, level: Float, onTap: () -> Unit) {
-    val motion = rememberInfiniteTransition(label = "orb")
-    val breath by motion.animateFloat(0.94f, 1.04f, infiniteRepeatable(tween(1600), RepeatMode.Reverse), label = "breath")
-    val turn by motion.animateFloat(0f, 360f, infiniteRepeatable(tween(2400, easing = LinearEasing), RepeatMode.Restart), label = "turn")
-    val voice by animateFloatAsState(if (state == LiveSession.State.SPEAKING) 1f + level.coerceIn(0f, 1f) * 0.22f else 1f, tween(120), label = "voice")
-    val scale = when (state) {
-        LiveSession.State.LISTENING -> breath
-        LiveSession.State.SPEAKING -> voice
-        else -> 1f
+private fun Orb(state: LiveSession.State, onTap: () -> Unit) {
+    val mode = when (state) {
+        LiveSession.State.LISTENING -> LunaOrbMode.LISTENING
+        LiveSession.State.CONNECTING, LiveSession.State.THINKING, LiveSession.State.SPEAKING -> LunaOrbMode.BUSY
+        LiveSession.State.ENDED, LiveSession.State.FAILED -> LunaOrbMode.IDLE
     }
-    val colors = if (state == LiveSession.State.CONNECTING) listOf(Dim, Raised, Dim) else Glass.Iris
-    Box(
-        Modifier
-            .size(ORB)
-            .semantics { contentDescription = if (state == LiveSession.State.SPEAKING) "Stop ${WakeWord.NAME} talking" else "${WakeWord.NAME}" }
-            .clickable(role = Role.Button, onClick = onTap),
-        contentAlignment = Alignment.Center,
-    ) {
-        Box(
-            Modifier
-                .size(ORB)
-                .scale(scale * 1.08f)
-                .graphicsLayer { alpha = if (state == LiveSession.State.CONNECTING) 0.25f else 0.35f }
-                .clip(CircleShape)
-                .background(Brush.radialGradient(listOf(colors[1], Color.Transparent))),
-        )
-        Box(
-            Modifier
-                .size(ORB * 0.78f)
-                .scale(scale)
-                .rotate(if (state == LiveSession.State.THINKING || state == LiveSession.State.CONNECTING) turn else 0f)
-                .clip(CircleShape)
-                .background(Brush.sweepGradient(colors))
-                .border(2.dp, Color.White.copy(alpha = 0.35f), CircleShape),
-        )
+    val icon = when (state) {
+        LiveSession.State.LISTENING -> Icons.Filled.Mic
+        LiveSession.State.SPEAKING -> Icons.Filled.Stop
+        else -> null
     }
+    LunaOrb(
+        mode = mode,
+        level = 0f,
+        icon = icon,
+        label = if (state == LiveSession.State.SPEAKING) "Stop ${WakeWord.NAME} talking" else WakeWord.NAME,
+        onClick = onTap,
+        core = ORB_CORE,
+        area = ORB_AREA,
+        iconSize = 44.dp,
+    )
 }
 
 /** What has been said, newest at the bottom and largest: Luna's in white, the user's in grey. */
 @Composable
 private fun Captions(captions: List<LiveSession.Caption>, modifier: Modifier) {
     val list = rememberLazyListState()
-    val shown = captions.takeLast(SHOWN_CAPTIONS)
-    LaunchedEffect(shown.size, shown.lastOrNull()?.text) {
-        if (shown.isNotEmpty()) list.animateScrollToItem(shown.lastIndex)
+    // Newest first, laid out from the bottom: the reply growing as she speaks stays pinned above
+    // the cards, its latest line in view, rather than running on below the fold.
+    val shown = captions.takeLast(SHOWN_CAPTIONS).asReversed()
+    LaunchedEffect(shown.size, shown.firstOrNull()?.text) {
+        if (shown.isNotEmpty()) list.scrollToItem(0)
     }
-    LazyColumn(modifier, state = list, verticalArrangement = Arrangement.spacedBy(14.dp, Alignment.Bottom)) {
-        items(shown) { caption ->
-            val latest = caption === shown.last()
+    LazyColumn(modifier, state = list, reverseLayout = true, verticalArrangement = Arrangement.spacedBy(14.dp, Alignment.Bottom)) {
+        itemsIndexed(shown) { index, caption ->
+            val latest = index == 0
             Text(
                 caption.text,
                 modifier = Modifier.fillMaxWidth(),
@@ -450,7 +499,8 @@ private val Raised = Color(0xFF26262D)
 private val Bright = Color(0xFFFAFAFA)
 private val Dim = Color(0xFFB8B8C2)
 private val EndRed = Color(0xFFE5484D)
-private val ORB = 168.dp
-private val CARDS_MAX = 240.dp
+private val ORB_CORE = 120.dp
+private val ORB_AREA = 220.dp
+private val CARDS_MAX = 300.dp
 private const val SHOWN_CAPTIONS = 8
 private const val ENDED_LINGER_MS = 1_200L

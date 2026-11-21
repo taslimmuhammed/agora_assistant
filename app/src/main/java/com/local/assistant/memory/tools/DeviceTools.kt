@@ -11,8 +11,9 @@ import java.util.Locale
  * Nothing here calls or sends on its own. `call` opens the dialer with the number and
  * `send_message` opens the messaging app with the text written; the user presses the button. A
  * 4B model does misroute now and then, and a call placed to the wrong person cannot be undone.
- * The one exception is the family hub ([family]): with live voice on, a message to someone in it
- * goes from Luna's WhatsApp at once, as it does in a call, so their answer comes back to her.
+ * The one exception is WhatsApp ([family]): with live voice on, a WhatsApp message to anyone, in
+ * the family hub or her contacts, goes from Luna's WhatsApp at once, so their answer comes back to
+ * her. SMS, email and screenshots still open the app.
  *
  * People are found memory first — a number saved for "amma", or the name the user's dentist goes
  * by — then in the phone's contacts, which are asked for the first time they are needed.
@@ -49,14 +50,8 @@ class DeviceTools(
         }
         val image = if (args.bool("screenshot") == true) screenshot(screen) else null
         val asked = args.text("app")?.lowercase(Locale.ROOT)?.replace(Regex("[^a-z]"), "")
-        if (app != MessageApp.EMAIL && asked != "sms" && image == null && text != null) {
-            family?.send(to, text)?.let { sentTo ->
-                return ActionResult(
-                    ok("sent" to "on WhatsApp to $sentTo from Luna's number, already; their answer will be told to the user when it comes"),
-                    MemoryChip(MemoryChip.Kind.MESSAGE, "WhatsApp", "$sentTo: ${text.take(CHIP_TEXT)}", note = "Sent by Luna · you'll hear the answer"),
-                    ready = "Sent to $sentTo on WhatsApp. I'll tell you when they answer.",
-                )
-            }
+        if (family != null && app != MessageApp.EMAIL && asked != "sms" && image == null && text != null) {
+            sendByLuna(family, to, text)?.let { return it }
         }
         val person = find(to, if (app == MessageApp.EMAIL) Need.EMAIL else Need.PHONE)
         val appName = APP_NAMES.getValue(app)
@@ -75,6 +70,29 @@ class DeviceTools(
                 note = "Tap send in $appName",
             ),
             ready = "$appName is open with ${if (image != null && text == null) "the screenshot" else if (image != null) "the screenshot and your message" else "your message"} to ${person.name}; tap send.",
+        )
+    }
+
+    /**
+     * [text] to [to] from Luna's WhatsApp: someone in the family hub by that name, else the number
+     * found for them in memory or her contacts. Null when Luna's server can't send now, so the
+     * phone's own WhatsApp opens instead.
+     */
+    private suspend fun sendByLuna(family: FamilyMessenger, to: String, text: String): ActionResult? {
+        var sent = family.send(to, text, null)
+        if (sent == LunaSent.Unknown) {
+            val person = find(to, Need.PHONE)
+            sent = family.send(to, text, FamilyMessenger.Contact(person.name, person.address))
+        }
+        val name = when (sent) {
+            is LunaSent.To -> sent.name
+            is LunaSent.Refused -> throw ToolError(sent.why)
+            LunaSent.Unknown, LunaSent.Off -> return null
+        }
+        return ActionResult(
+            ok("sent" to "on WhatsApp to $name from Luna's number, already; their answer will be told to the user when it comes"),
+            MemoryChip(MemoryChip.Kind.MESSAGE, "WhatsApp", "$name: ${text.take(CHIP_TEXT)}", note = "Sent by Luna · you'll hear the answer"),
+            ready = "Sent to $name on WhatsApp. I'll tell you when they answer.",
         )
     }
 

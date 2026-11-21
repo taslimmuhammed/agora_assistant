@@ -1,5 +1,8 @@
 import { randomBytes } from 'node:crypto'
 
+/** A list of hers, as the phone shares it. */
+export interface ListContent { title: string; items: Array<{ text: string; done: boolean }> }
+
 /** A tool the phone declared, as ToolCatalog writes it: `{name, description, parameters}`. */
 export interface ToolDeclaration {
   name: string
@@ -24,7 +27,8 @@ export interface LiveContext {
   locked?: boolean
   /** The phone's prompt prefix: core facts, last summary, agenda, notes index. */
   memory?: string
-  lists?: Array<{ title: string; items: Array<{ text: string; done: boolean }> }>
+  /** Her lists in full; the phone sends them again after a tool changes one (bridge.ts). */
+  lists?: ListContent[]
   health?: string | null
   tool_rules?: string
   device_tools?: ToolDeclaration[]

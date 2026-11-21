@@ -102,8 +102,9 @@ object ToolCatalog {
      * phone with Health Connect (asking for access the first time it's used), files only with
      * All files access, and messages only while they are kept (Settings › Messages).
      */
-    fun declarations(web: Boolean, photos: Boolean = false, health: Boolean = false, files: Boolean = false, inbox: Boolean = false): List<String> =
-        declarations + listOfNotNull(
+    /** [luna]: WhatsApp goes from Luna's own number (live voice), not the phone's app. */
+    fun declarations(web: Boolean, photos: Boolean = false, health: Boolean = false, files: Boolean = false, inbox: Boolean = false, luna: Boolean = false): List<String> =
+        (if (luna) declarations.map { if (it == SEND_MESSAGE_DECLARATION) LUNA_SEND_MESSAGE_DECLARATION else it } else declarations) + listOfNotNull(
             WEB_DECLARATION.takeIf { web },
             PHOTOS_DECLARATION.takeIf { photos },
             HEALTH_DECLARATION.takeIf { health },
@@ -112,7 +113,8 @@ object ToolCatalog {
         )
 
     /** How to use the tools, appended to the instructions (section A) when tools are declared. */
-    fun rules(web: Boolean, photos: Boolean = false, health: Boolean = false, files: Boolean = false, inbox: Boolean = false): String = RULES
+    fun rules(web: Boolean, photos: Boolean = false, health: Boolean = false, files: Boolean = false, inbox: Boolean = false, luna: Boolean = false): String = RULES
+        .replace(HANDOFF_RULE, if (luna) LUNA_HANDOFF_RULE else HANDOFF_RULE)
         .replace(WEB_SLOT, if (web) WEB_RULE + "\n" else "")
         .replace(PHOTOS_SLOT, if (photos) PHOTOS_RULE + "\n" else "")
         .replace(HEALTH_SLOT, if (health) HEALTH_RULE + (if (web) HEALTH_OFFLINE else "") + "\n" else "")
@@ -193,6 +195,27 @@ object ToolCatalog {
     private const val WEB_SLOT = "{web}\n"
 
     /** The tools declared whatever is set up; see [declarations] for the full list. */
+    private val SEND_MESSAGE_DECLARATION = function(
+        SEND_MESSAGE,
+        "Use when the user asks you to text, WhatsApp or email someone now, or to send a message you wrote for them. It opens the app with the message written; the user taps send. to: name, relation, number or email; text: the message to send; app: sms, whatsapp or email, no other apps; screenshot: true to send the screenshot of their screen with it.",
+        required = listOf("to"),
+        "to" to "string",
+        "text" to "string",
+        "app" to "string",
+        "screenshot" to "boolean",
+    )
+
+    /** With live voice: a WhatsApp goes at once from Luna's number, to anyone, and the answer comes back. */
+    private val LUNA_SEND_MESSAGE_DECLARATION = function(
+        SEND_MESSAGE,
+        "Use when the user asks you to WhatsApp, message, text or email someone now, or to send a message you wrote for them. WhatsApp, the default, is sent at once from Luna's WhatsApp to anyone in their contacts or family, and their answer comes back to you to tell them. sms, email and screenshots open the app with the message written, and the user taps send. to: name, relation, number or email; text: the message, written as they'd want it read; app: whatsapp, sms or email, no other apps; screenshot: true to send the screenshot of their screen with it.",
+        required = listOf("to", "text"),
+        "to" to "string",
+        "text" to "string",
+        "app" to "string",
+        "screenshot" to "boolean",
+    )
+
     private val declarations: List<String> = listOf(
         function(
             ADD_TASK,
@@ -283,15 +306,7 @@ object ToolCatalog {
             required = listOf("who"),
             "who" to "string",
         ),
-        function(
-            SEND_MESSAGE,
-            "Use when the user asks you to text, WhatsApp or email someone now, or to send a message you wrote for them. It opens the app with the message written; the user taps send. to: name, relation, number or email; text: the message to send; app: sms, whatsapp or email, no other apps; screenshot: true to send the screenshot of their screen with it.",
-            required = listOf("to"),
-            "to" to "string",
-            "text" to "string",
-            "app" to "string",
-            "screenshot" to "boolean",
-        ),
+        SEND_MESSAGE_DECLARATION,
         function(
             TAKE_SCREENSHOT,
             "Use when the user asks you to take or save a screenshot. Saves the screen they were on when they called you to their gallery.",
@@ -325,6 +340,10 @@ object ToolCatalog {
             "expression" to "string",
         ),
     )
+
+    private const val HANDOFF_RULE = "Calls and messages only open the app: say it's ready to send, never that it was sent."
+    private const val LUNA_HANDOFF_RULE =
+        "Calls, SMS and email only open the app: say it's ready to send, never that it was sent. A WhatsApp goes from Luna's own number: say it was sent only when the result says sent, and that you'll tell them the answer when it comes."
 
     private val RULES = """
         Tools — call them rather than only saying you will:

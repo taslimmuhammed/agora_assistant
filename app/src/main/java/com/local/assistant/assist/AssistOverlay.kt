@@ -422,7 +422,7 @@ fun AssistOverlay(
     }
 }
 
-private enum class OrbMode { LISTENING, BUSY, IDLE }
+private typealias OrbMode = com.local.assistant.ui.theme.LunaOrbMode
 
 /** Without a call, what the panel can do on the phone. */
 private const val OFFLINE_HINT = "Offline, I can set alarms and timers and change phone settings."
@@ -814,84 +814,16 @@ private fun VoiceControls(
 
 /**
  * The one button: a mic when idle, send while listening (it swells with the voice), stop while
- * the assistant thinks or speaks. Rings ripple out of it whenever it is doing something, and a
- * light circles it while an answer is on its way.
+ * the assistant thinks or speaks ([com.local.assistant.ui.theme.LunaOrb]).
  */
 @Composable
 private fun Orb(mode: OrbMode, level: Float, onClick: () -> Unit) {
-    val transition = rememberInfiniteTransition(label = "orb")
-    val ripple = transition.animateFloat(
-        initialValue = 0f,
-        targetValue = 1f,
-        animationSpec = infiniteRepeatable(tween(durationMillis = 1800, easing = LinearEasing)),
-        label = "ripple",
-    )
-    val breath = transition.animateFloat(
-        initialValue = 0.97f,
-        targetValue = 1.03f,
-        animationSpec = infiniteRepeatable(tween(durationMillis = 1400, easing = FastOutSlowInEasing), RepeatMode.Reverse),
-        label = "breath",
-    )
-    val spin = transition.animateFloat(
-        initialValue = 0f,
-        targetValue = 360f,
-        animationSpec = infiniteRepeatable(tween(durationMillis = 1300, easing = LinearEasing)),
-        label = "spin",
-    )
-    val swell = animateFloatAsState(
-        targetValue = if (mode == OrbMode.LISTENING) 1f + 0.28f * level else 1f,
-        animationSpec = spring(dampingRatio = 0.55f, stiffness = Spring.StiffnessMedium),
-        label = "swell",
-    )
-
-    Box(Modifier.size(ORB_AREA), contentAlignment = Alignment.Center) {
-        Canvas(Modifier.size(ORB_AREA)) {
-            val core = ORB_SIZE.toPx() / 2
-            val reach = size.minDimension / 2
-            if (mode != OrbMode.IDLE) {
-                for (i in 0 until 2) {
-                    val t = (ripple.value + i * 0.5f) % 1f
-                    drawCircle(
-                        brush = Brush.sweepGradient(Iris, center),
-                        alpha = (1f - t) * 0.5f,
-                        radius = core + (reach - core) * t,
-                        style = Stroke(width = 1.5.dp.toPx()),
-                    )
-                }
-            }
-            if (mode == OrbMode.BUSY) {
-                rotate(spin.value) {
-                    drawCircle(
-                        brush = Brush.sweepGradient(listOf(Color.Transparent) + Iris.take(4), center),
-                        radius = core + 5.dp.toPx(),
-                        style = Stroke(width = 2.5.dp.toPx(), cap = StrokeCap.Round),
-                    )
-                }
-            }
-        }
-        Box(
-            Modifier
-                .size(ORB_SIZE)
-                .graphicsLayer {
-                    val scale = if (mode == OrbMode.IDLE) breath.value else swell.value
-                    scaleX = scale
-                    scaleY = scale
-                }
-                .clip(CircleShape)
-                .background(Brush.radialGradient(listOf(Color(0xFF3F3F46), AppColors.Accent), radius = 90f))
-                // Dark glass: lit from above, a bright rim.
-                .liquidGlass(CircleShape, Color.Transparent, sheen = 0.3f)
-                .clickable(onClick = onClick),
-            contentAlignment = Alignment.Center,
-        ) {
-            val (icon, label) = when (mode) {
-                OrbMode.LISTENING -> Icons.Outlined.ArrowUpward to "Send"
-                OrbMode.BUSY -> Icons.Outlined.Stop to "Stop"
-                OrbMode.IDLE -> Icons.Outlined.Mic to "Talk"
-            }
-            Icon(icon, contentDescription = label, tint = AppColors.OnAccent, modifier = Modifier.size(26.dp))
-        }
+    val (icon, label) = when (mode) {
+        OrbMode.LISTENING -> Icons.Outlined.ArrowUpward to "Send"
+        OrbMode.BUSY -> Icons.Outlined.Stop to "Stop"
+        OrbMode.IDLE -> Icons.Outlined.Mic to "Talk"
     }
+    com.local.assistant.ui.theme.LunaOrb(mode, level, icon, label, onClick, core = ORB_SIZE, area = ORB_AREA)
 }
 
 @Composable

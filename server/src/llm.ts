@@ -9,6 +9,7 @@ import { buildSystemPrompt } from './prompt.ts'
 import type { Session, Sessions, ToolDeclaration } from './sessions.ts'
 import type { WhatsApp } from './whatsapp.ts'
 import { SERVER_TOOLS, isServerTool, runServerTool } from './tools.ts'
+import { WEB_LOOKUP, WEB_LOOKUP_TOOL, type WebLookup } from './websearch.ts'
 
 /**
  * Agora's custom LLM: POST /v1/chat/completions?session=…, OpenAI's format, streamed as SSE.
@@ -61,6 +62,19 @@ export function openAiChat(config: Config, models = new ModelChoice(config.llm.m
   }
 }
 
+/** How long a started stream may go without a chunk. */
+const STALL_MS = 15_000
+
+/** [promise], or the error [stalled] gives once [ms] pass without it. */
+async function within<T>(promise: Promise<T>, ms: number, stalled: () => Error): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([promise, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(stalled()), ms) })])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 /** The stream, once its first chunk is in: a model that hangs without a word fails after [ms]. */
 async function streamStarted(client: OpenAI, params: Record<string, unknown>, signal: AbortSignal, ms: number): Promise<AsyncIterable<ChunkLike>> {
   const controller = new AbortController()
@@ -79,11 +93,16 @@ async function streamStarted(client: OpenAI, params: Record<string, unknown>, si
     const chunks = stream[Symbol.asyncIterator]()
     const first = await chunks.next()
     clearTimeout(timer)
+    // Once started, a stream that stops sending fails too, rather than leaving the call thinking.
+    const following = () => within(chunks.next(), STALL_MS, () => {
+      controller.abort()
+      return new SlowModelError(String(params.model), STALL_MS)
+    })
     return (async function* () {
       try {
         if (first.done) return
         yield first.value
-        for (let next = await chunks.next(); !next.done; next = await chunks.next()) yield next.value
+        for (let next = await following(); !next.done; next = await following()) yield next.value
       } finally {
         signal.removeEventListener('abort', stop)
       }
@@ -103,6 +122,8 @@ export interface LlmDeps {
   whatsapp: WhatsApp | null
   chat: ChatFn
   clock: () => Date
+  /** Looks things up on the web (websearch.ts), for a phone without a web_lookup of its own. */
+  webLookup?: WebLookup
 }
 
 interface Message {
@@ -135,6 +156,8 @@ export function chatCompletions(deps: LlmDeps) {
     // Agora drops the request when she talks over the reply: stop the model with it.
     res.on('close', () => { if (!res.writableEnded) controller.abort() })
     const out = new SseWriter(res, deps.config.llm.model)
+    const asked = (body.messages ?? []).filter(m => m.role === 'user' || m.role === 'assistant')
+    console.log(`[turn] ${session.id} asked: ${asked.length} messages, last ${String(asked.at(-1)?.role ?? 'none')}`)
     await runTurn(deps, session, body.messages ?? [], out, controller.signal)
     out.finish()
   }
@@ -146,22 +169,32 @@ export async function runTurn(deps: LlmDeps, session: Session, incoming: Array<R
   const lastUser = [...incoming].reverse().find(m => m.role === 'user')
   const userText = contentText(lastUser?.content)
   const turnId = lastUser?.turn_id === undefined ? undefined : String(lastUser.turn_id)
-  const messages: Message[] = [
-    { role: 'system', content: buildSystemPrompt(deps.hub, session, deps.clock()) },
-    ...incoming
-      .filter(m => m.role === 'user' || m.role === 'assistant')
-      .map(m => ({ role: m.role as 'user' | 'assistant', content: m.role === 'user' && hasImage(m.content) ? (m.content as Array<Record<string, unknown>>) : contentText(m.content) }))
-      .filter(m => m.content),
-  ]
+  const spoken = incoming.filter(m => m.role === 'user' || m.role === 'assistant')
+  const newest = spoken.at(-1)
+  // Agora files a noise it took for speech as her turn with no words: there is nothing to answer,
+  // and answering her words before it again would repeat Luna.
+  if (newest?.role === 'user' && !contentText(newest.content) && !hasImage(newest.content)) {
+    console.log(`[turn] ${session.id}: her turn had no words (${shorten(JSON.stringify(newest.content ?? null), 60)}); Luna stays quiet`)
+    return
+  }
+  const said = spoken
+    .map(m => ({ role: m.role as 'user' | 'assistant', content: m.role === 'user' && hasImage(m.content) ? (m.content as Array<Record<string, unknown>>) : contentText(m.content) }))
+    .filter(m => m.content)
+  const history = herWordsLast(said)
+  if (history !== said) console.warn(`[llm] ${session.id}: the history ended with Luna's words (${said.slice(-4).map(m => m.role).join(', ')}); her own words were put last`)
+  const messages: Message[] = [{ role: 'system', content: buildSystemPrompt(deps.hub, session, deps.clock()) }, ...history]
   // A typed chat shows every word: no "Okay." before a tool round, as a call says to fill the quiet.
   const fills = session.context.purpose !== 'chat'
   const deviceTools = (session.context.device_tools ?? []).filter(t => t?.name && !isServerTool(t.name))
   const deviceNames = new Set(deviceTools.map(t => t.name))
-  const tools = [...SERVER_TOOLS, ...deviceTools].map(asFunction)
+  const web = deps.webLookup?.ready() && !deviceNames.has(WEB_LOOKUP) ? deps.webLookup : null
+  const tools = [...SERVER_TOOLS, ...(web ? [WEB_LOOKUP_TOOL] : []), ...deviceTools].map(asFunction)
 
   let spoke = false
   let firstWordMs: number | null = null
   const ran: string[] = []
+  // Asked once more, for words only, when a round after the tools said nothing at all.
+  let wordsOnly = false
   try {
     for (let round = 0; round <= MAX_ROUNDS; round++) {
       const params: Record<string, unknown> = {
@@ -169,7 +202,7 @@ export async function runTurn(deps: LlmDeps, session: Session, incoming: Array<R
         messages,
         tools,
         // The last round must answer in words, whatever the model would still like to call.
-        tool_choice: round === MAX_ROUNDS ? 'none' : 'auto',
+        tool_choice: round === MAX_ROUNDS || wordsOnly ? 'none' : 'auto',
       }
       if (deps.config.llm.reasoningEffort) params.reasoning_effort = deps.config.llm.reasoningEffort
       const stream = await deps.chat(params, signal)
@@ -186,7 +219,15 @@ export async function runTurn(deps: LlmDeps, session: Session, incoming: Array<R
         if (delta?.tool_calls?.length) calls.add(delta.tool_calls)
       }
       const pending = calls.list()
-      if (!pending.length) break
+      if (!pending.length) {
+        // After a tool, a model can end with nothing to say: she'd hear only "Okay." Ask it for words.
+        if (!text.trim() && ran.length && !wordsOnly && round < MAX_ROUNDS) {
+          console.warn(`[llm] ${session.id}: nothing said after ${ran.join(', ')}; asking for words`)
+          wordsOnly = true
+          continue
+        }
+        break
+      }
       if (!spoke && fills) {
         out.text(FILLERS[session.fillers++ % FILLERS.length])
         spoke = true
@@ -195,7 +236,9 @@ export async function runTurn(deps: LlmDeps, session: Session, incoming: Array<R
       messages.push({ role: 'assistant', content: text || null, tool_calls: pending })
       for (const call of pending) {
         const args = parseArgs(call.function.arguments)
-        const result = await runTool(deps, session, call.function.name, args, deviceNames, turnId, userText)
+        const result = web && call.function.name === WEB_LOOKUP
+          ? await lookUp(deps, session, web, args, signal)
+          : await runTool(deps, session, call.function.name, args, deviceNames, turnId, userText)
         ran.push(call.function.name)
         messages.push({ role: 'tool', tool_call_id: call.id, content: result })
       }
@@ -217,11 +260,29 @@ async function runTool(deps: LlmDeps, session: Session, name: string, args: Reco
     return JSON.stringify(outcome.result)
   }
   if (deviceNames.has(name)) {
-    const { result, chip } = await deps.bridge.callDevice(session.id, { name, args, turnId, userText })
+    const { result, chip, lists } = await deps.bridge.callDevice(session.id, { name, args, turnId, userText })
+    if (lists) session.context.lists = lists
     session.actions.push(`${name}: ${chip?.title ? `${chip.title}${chip.detail ? ` (${chip.detail})` : ''}` : shorten(result, 160)}`)
     return result
   }
   return JSON.stringify({ ok: false, error: `There is no tool called ${name}.` })
+}
+
+/** The server's own web_lookup: the answer for the model, and a card for the phone. */
+async function lookUp(deps: LlmDeps, session: Session, web: WebLookup, args: Record<string, unknown>, signal: AbortSignal): Promise<string> {
+  const query = typeof args.query === 'string' ? args.query.trim() : ''
+  if (!query) return JSON.stringify({ ok: false, error: 'Say what to look up.' })
+  try {
+    const found = await web.find(query, signal)
+    const sites = found.sources.map(s => s.title)
+    session.actions.push(`${WEB_LOOKUP}: ${shorten(query, 80)}`)
+    deps.bridge.push(session.id, { type: 'action', tool: WEB_LOOKUP, ok: true, title: `Looked up: ${shorten(query, 60)}`, detail: sites.join(', ') || null })
+    return JSON.stringify({ ok: true, answer: found.answer, sites })
+  } catch (e) {
+    if (signal.aborted) throw e
+    console.warn(`[web] ${session.id}: "${shorten(query, 60)}" failed: ${(e as Error).message}`)
+    return JSON.stringify({ ok: false, error: "The web lookup didn't work just now." })
+  }
 }
 
 /** A tool call as it is built from streamed pieces, and sent back with its result. */
@@ -304,6 +365,17 @@ class SseWriter {
   private write(delta: Record<string, unknown>, finish: string | null = null) {
     this.res.write(`data: ${JSON.stringify({ id: this.id, object: 'chat.completion.chunk', created: this.created, model: this.model, choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`)
   }
+}
+
+/**
+ * [said] ending with her words, as Gemini requires. Agora can put Luna's words after hers: a line
+ * typed into the call interrupts Luna, and what Luna had said by then is filed after it. Those
+ * words were said first, so they go before her last words. Unchanged (the same array) otherwise.
+ */
+export function herWordsLast<T extends { role: string }>(said: T[]): T[] {
+  const last = said.findLastIndex(m => m.role === 'user')
+  if (last < 0 || last === said.length - 1) return said
+  return [...said.slice(0, last), ...said.slice(last + 1), said[last]]
 }
 
 function asFunction(tool: ToolDeclaration) {

@@ -54,6 +54,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -117,7 +118,7 @@ class LiveSession internal constructor(
     private val _level = MutableStateFlow(0f)
     val level: StateFlow<Float> = _level.asStateFlow()
 
-    private val bridge = LiveToolBridge(execute, transcript, locked)
+    private val bridge = LiveToolBridge(execute, transcript, locked, lists = if (locked) null else contexts::lists)
 
     /** What the call did: phone tools' chips, the server's actions, the family's news. */
     val events: SharedFlow<LiveToolBridge.Event> = bridge.events
@@ -144,9 +145,20 @@ class LiveSession internal constructor(
 
     private val agentUserId: String? get() = session?.agentUid?.toString()
 
+    /** Rings while the call connects, as a phone call does, until Luna picks up. */
+    private val ringback = Ringback()
+
     internal fun start() {
         _active.value = true
         appScope.launch { for (store in toStore) runCatching { store() }.onFailure { Log.w(TAG, "Could not store a transcript", it) } }
+        // Not for a check-in: she answered Luna's own ring, so there's nothing to ring out.
+        if (purpose != LiveContext.PURPOSE_CHECKIN) {
+            ringback.start()
+            scope.launch {
+                _state.first { it != State.CONNECTING }
+                ringback.stop()
+            }
+        }
         scope.launch { connect() }
     }
 
@@ -182,8 +194,10 @@ class LiveSession internal constructor(
     }
 
     private fun createEngine(appId: String): RtcEngine {
+        // Outside apply: inside it, `context` would be the config's own getContext(), still null.
+        val appContext = context.applicationContext
         val config = RtcEngineConfig().apply {
-            mContext = context.applicationContext
+            mContext = appContext
             mAppId = appId
             mChannelProfile = Constants.CHANNEL_PROFILE_LIVE_BROADCASTING
             mAudioScenario = Constants.AUDIO_SCENARIO_AI_CLIENT
@@ -276,6 +290,7 @@ class LiveSession internal constructor(
         released = true
         // The agent leaves on its own after idle_timeout too, should this never arrive.
         session?.let { call -> appScope.launch { runCatching { withTimeout(STOP_TIMEOUT_MS) { api.stop(call.sessionId) } } } }
+        ringback.stop()
         runCatching { socket?.close(1000, "call ended") }
         val channel = session?.channel
         ai?.let { api ->

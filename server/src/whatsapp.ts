@@ -26,8 +26,9 @@ import type { Hub, Member } from './hub.ts'
  * (a sentence, a voice note, a photo, a sticker, another reaction) goes to the model
  * (understand.ts), which says which choice it makes, if any, and what it says for her.
  *
- * Only the people in the seed are listened to: the account may be someone's own WhatsApp, and
- * nothing anyone else writes to it is read or answered.
+ * Only the hub's people are listened to: the seed's, those added in the app, and anyone she has
+ * WhatsApped through Luna (role contact). The account may be someone's own WhatsApp, and nothing
+ * anyone else writes to it is read or answered.
  */
 
 /** One numbered choice under a message: what it says, and what choosing it does ("task:3:yes"). */
@@ -332,7 +333,7 @@ export class WhatsApp {
     return member && this.account ? { jid: this.account, member } : null
   }
 
-  /** The member writing from [jid], by the number in the seed; null for anyone else. */
+  /** The member writing from [jid], by their number in the hub; null for anyone else. */
   private async personAt(jid: string | null | undefined): Promise<{ jid: string; member: Member } | null> {
     if (!jid) return null
     const pn = jidNormalizedUser(isLidUser(jid) ? ((await this.socket?.pnForLid(jid)) ?? jid) : jid)

@@ -47,7 +47,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.Send
 import androidx.compose.material.icons.automirrored.outlined.VolumeUp
 import androidx.compose.material.icons.outlined.Add
-import androidx.compose.material.icons.outlined.Call
+import androidx.compose.material.icons.filled.Call
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.DeleteOutline
 import androidx.compose.material.icons.outlined.Description
@@ -86,6 +86,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.PointerInputChange
 import androidx.compose.ui.input.pointer.pointerInput
@@ -450,6 +451,7 @@ fun ChatScreen(
                             onPick = sendWithTick,
                             status = null,
                             modifier = Modifier.fillMaxSize(),
+                            onCall = onCallLuna?.let { call -> { call(activeChatId) } },
                         )
                     } else {
                         LazyColumn(
@@ -579,7 +581,7 @@ private fun ChatTopBar(
             GlassIconButton(Icons.Outlined.Menu, "Chats", onOpenDrawer, Modifier.padding(start = 10.dp, end = 6.dp))
         },
         actions = {
-            onCall?.let { GlassIconButton(Icons.Outlined.Call, "Call ${com.local.assistant.wake.WakeWord.NAME}", it, Modifier.padding(end = if (showNewChat) 6.dp else 10.dp)) }
+            onCall?.let { CallPill(it, Modifier.padding(end = if (showNewChat) 6.dp else 10.dp)) }
             AnimatedVisibility(showNewChat, enter = fadeIn() + scaleIn(), exit = fadeOut() + scaleOut()) {
                 GlassIconButton(Icons.Outlined.Add, "New chat", onNewChat, Modifier.padding(end = 10.dp))
             }
@@ -591,6 +593,25 @@ private fun ChatTopBar(
             actionIconContentColor = AppColors.TextPrimary,
         ),
     )
+}
+
+/** Luna's call, plain to see in the bar: a filled pill with its name, not one more grey icon. */
+@Composable
+private fun CallPill(onClick: () -> Unit, modifier: Modifier = Modifier) {
+    val name = com.local.assistant.wake.WakeWord.NAME
+    Row(
+        modifier
+            .height(40.dp)
+            .clip(CircleShape)
+            .background(AppColors.Accent)
+            .clickable(role = androidx.compose.ui.semantics.Role.Button, onClickLabel = "Call $name", onClick = onClick)
+            .padding(start = 12.dp, end = 16.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(Icons.Filled.Call, contentDescription = null, tint = AppColors.OnAccent, modifier = Modifier.size(18.dp))
+        Spacer(Modifier.width(6.dp))
+        Text("Call $name", style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.SemiBold), color = AppColors.OnAccent)
+    }
 }
 
 /**

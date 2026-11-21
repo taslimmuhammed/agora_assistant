@@ -133,10 +133,28 @@ object NoPhone : PhoneActions {
 }
 
 /**
- * Luna's own WhatsApp on her server, for the people in the family hub. [send] gives who it went to
- * ("Filu"), or null when [to] isn't in the hub or the server can't send now: the phone's own
- * WhatsApp is opened instead.
+ * Luna's own WhatsApp on her server: a message of hers to anyone, whose answer comes back to her
+ * (in her call, or when she opens the app). [send] goes to someone in the family hub called [to],
+ * or, with [contact], to that number from her contacts, who joins the hub to be heard.
  */
 fun interface FamilyMessenger {
-    suspend fun send(to: String, text: String): String?
+    suspend fun send(to: String, text: String, contact: Contact?): LunaSent
+
+    /** Someone from her contacts: the name it's saved under and the number to WhatsApp. */
+    data class Contact(val name: String, val number: String)
+}
+
+/** What Luna's WhatsApp made of a message. */
+sealed interface LunaSent {
+    /** Gone, to [name]. */
+    data class To(val name: String) : LunaSent
+
+    /** No one in the hub is called that: look in her contacts and send again with the number. */
+    data object Unknown : LunaSent
+
+    /** Luna's server wouldn't send it, and [why] is fit to tell her ("Sita isn't on WhatsApp"). */
+    data class Refused(val why: String) : LunaSent
+
+    /** Luna's server isn't set up or can't be reached: the phone's own WhatsApp is opened instead. */
+    data object Off : LunaSent
 }

@@ -130,3 +130,17 @@ test('opening the app, she hears one message about what came, not each answer as
   const inApp = await (await call('POST', '/family/briefing', { after: alert.id, greet: false, audio: false })).json()
   assert.equal(inApp.text, 'Rahul says: Later than the phone asked for.', 'already in the app: no greeting')
 })
+
+test('the phone WhatsApps anyone through Luna: asked for the number when no one in the hub has that name', async () => {
+  const unknown = await call('POST', '/family/whatsapp', { to: 'Anil', text: 'Happy birthday!' })
+  assert.equal(unknown.status, 404)
+  assert.equal((await unknown.json()).unknown, true)
+  const res = await call('POST', '/family/whatsapp', { to: 'Anil', name: 'Anil Kumar', phone: '+91 98222 33344', text: 'Happy birthday!' })
+  assert.equal(res.status, 200)
+  const sent = await res.json()
+  assert.equal(sent.sent_to, 'Anil Kumar')
+  assert.equal(sent.card.title, 'WhatsApp to Anil Kumar')
+  assert.equal(socket.sent.at(-1)!.jid, '919822233344@s.whatsapp.net')
+  assert.ok(!(await family()).some(m => m.id === 'anil-kumar'), "contacts aren't listed with her family")
+  assert.equal((await call('POST', '/family/whatsapp', { to: 'Anil', text: '' })).status, 400)
+})

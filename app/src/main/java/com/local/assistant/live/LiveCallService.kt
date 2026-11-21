@@ -42,6 +42,15 @@ class LiveCallService : Service() {
         } catch (e: RuntimeException) {
             // Refused from the background; the call still runs while its screen is in front.
             Log.w(TAG, "Not allowed to keep the call in the foreground", e)
+            starting = false
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        starting = false
+        // The call ended (or failed) before the service got here: it was left to stop itself.
+        if (stopWhenStarted) {
+            stopWhenStarted = false
+            ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
             stopSelf()
         }
         // Not sticky: a call that died with the app is over; Agora ends the agent after its idle timeout.
@@ -88,13 +97,29 @@ class LiveCallService : Service() {
             0
         }
 
+        /**
+         * Asked to start and not yet in the foreground. Stopping a service then makes Android kill
+         * the app ("did not then call startForeground"), so a call that ends that quickly (it
+         * couldn't connect) leaves the service to stop itself once it is ([stopWhenStarted]).
+         */
+        @Volatile
+        private var starting = false
+
+        @Volatile
+        private var stopWhenStarted = false
+
         fun start(context: Context) {
+            stopWhenStarted = false
+            starting = true
             runCatching { ContextCompat.startForegroundService(context, Intent(context, LiveCallService::class.java)) }
-                .onFailure { Log.w(TAG, "Could not start the call's service", it) }
+                .onFailure {
+                    starting = false
+                    Log.w(TAG, "Could not start the call's service", it)
+                }
         }
 
         fun stop(context: Context) {
-            context.stopService(Intent(context, LiveCallService::class.java))
+            if (starting) stopWhenStarted = true else context.stopService(Intent(context, LiveCallService::class.java))
         }
 
         private fun createChannel(context: Context) {

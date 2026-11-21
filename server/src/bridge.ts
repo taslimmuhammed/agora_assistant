@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import type { ListContent } from './sessions.ts'
 
 /** What the bridge needs of a socket: ws's WebSocket, or a fake in tests. */
 export interface BridgeSocket {
@@ -12,6 +13,8 @@ export interface DeviceResult {
   /** The JSON the phone's ToolExecutor answered, as the model will read it. */
   result: string
   chip: { title?: string; detail?: string } | null
+  /** Her lists as they are now, when the tool changed one: the call's prompt takes them. */
+  lists?: ListContent[]
 }
 
 /**
@@ -76,7 +79,7 @@ export class Bridge {
   }
 
   private received(text: string) {
-    let message: { type?: string; call_id?: string; result?: unknown; chip?: DeviceResult['chip'] }
+    let message: { type?: string; call_id?: string; result?: unknown; chip?: DeviceResult['chip']; lists?: unknown }
     try {
       message = JSON.parse(text)
     } catch {
@@ -84,7 +87,7 @@ export class Bridge {
     }
     if (message.type !== 'tool_result' || !message.call_id) return
     const result = typeof message.result === 'string' ? message.result : JSON.stringify(message.result ?? { ok: false, error: 'no result' })
-    this.settle(message.call_id, { result, chip: message.chip ?? null })
+    this.settle(message.call_id, { result, chip: message.chip ?? null, ...(isLists(message.lists) ? { lists: message.lists } : {}) })
   }
 
   private settle(callId: string, result: DeviceResult) {
@@ -94,6 +97,10 @@ export class Bridge {
     clearTimeout(call.timer)
     call.resolve(result)
   }
+}
+
+function isLists(value: unknown): value is ListContent[] {
+  return Array.isArray(value) && value.every(l => typeof l?.title === 'string' && Array.isArray(l?.items))
 }
 
 function failed(error: string): DeviceResult {

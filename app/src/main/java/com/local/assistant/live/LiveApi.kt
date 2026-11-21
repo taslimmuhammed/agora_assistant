@@ -146,15 +146,19 @@ class LiveApi(
     private val speaking: OkHttpClient by lazy { http.newBuilder().callTimeout(15, TimeUnit.SECONDS).build() }
 
     /**
-     * [text] to [to] from Luna's WhatsApp, as a call sends it, so their answer comes back to her.
-     * Throws when [to] isn't in the family hub, or the server can't send: the chat then opens
-     * WhatsApp on the phone instead. Quick to give up, since the chat is waiting on it.
+     * [text] to [to] from Luna's WhatsApp: someone in the family hub by that name, or, with
+     * [phone], that number from her contacts (saved as [name]). Null when no one in the hub is
+     * called [to] and no [phone] came: look in the contacts. Quick to give up, since the call or
+     * chat is waiting on it; [LiveError.code] says why it wasn't sent.
      */
-    suspend fun messageFamily(to: String, text: String): Sent =
+    suspend fun whatsapp(to: String, text: String, name: String? = null, phone: String? = null): Sent? = try {
         parse(
-            call("POST", "/family/tool", gson.toJson(mapOf("name" to "message_family", "args" to mapOf("to" to to, "text" to text))), client = quick),
+            call("POST", "/family/whatsapp", gson.toJson(mapOf("to" to to, "text" to text, "name" to name, "phone" to phone)), client = quick),
             Sent::class.java,
         ).also { if (!it.ok) throw LiveError("Luna's server didn't send it.") }
+    } catch (e: LiveError) {
+        if (e.code == 404) null else throw e
+    }
 
     private val quick: OkHttpClient by lazy { http.newBuilder().callTimeout(8, TimeUnit.SECONDS).build() }
 
@@ -184,7 +188,7 @@ class LiveApi(
         when (code) {
             in 200..299 -> text
             401, 403 -> throw LiveError("Luna's server refused the app key.")
-            else -> throw LiveError(errorIn(text) ?: "Luna's server answered $code.")
+            else -> throw LiveError(errorIn(text) ?: "Luna's server answered $code.", code)
         }
     }
 
@@ -203,5 +207,5 @@ class LiveApi(
     }
 }
 
-/** A live call couldn't start or carry on; [message] is fit to show. */
-class LiveError(message: String) : Exception(message)
+/** A live call couldn't start or carry on; [message] is fit to show. [code]: the server's HTTP status, when it answered. */
+class LiveError(message: String, val code: Int? = null) : Exception(message)

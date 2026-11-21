@@ -25,6 +25,7 @@ const { Sessions } = await import('./sessions.ts')
 const { WhatsApp, connectWhatsApp } = await import('./whatsapp.ts')
 const { geminiUnderstand } = await import('./understand.ts')
 const { ModelChoice } = await import('./models.ts')
+const { geminiWebLookup } = await import('./websearch.ts')
 
 if (!existsSync(config.seedPath)) {
   console.error(`No family at ${config.seedPath}. Copy seed/family.json there and fill in everyone's WhatsApp number, or set SEED_PATH.`)
@@ -47,6 +48,8 @@ const { app, attachBridge, announce } = createApp({
   bridge: new Bridge(),
   agents: new AgoraAgents(config),
   chat: openAiChat(config, models),
+  // Google Search through Gemini, when the calls' model is Gemini.
+  webLookup: config.llm.apiKey && /generativelanguage\.googleapis\.com/.test(config.llm.baseUrl) ? geminiWebLookup(config, clock) : undefined,
   whatsapp,
   clock,
 })
