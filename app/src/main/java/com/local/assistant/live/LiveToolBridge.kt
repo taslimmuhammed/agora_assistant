@@ -13,10 +13,12 @@ import com.local.assistant.memory.tools.ToolContext
 import com.local.assistant.memory.tools.ToolExecutor
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
@@ -43,6 +45,8 @@ class LiveToolBridge(
     /** Her lists as they are now, sent back with a list tool's result so the call's prompt keeps up; null on the lock screen. */
     private val lists: (suspend () -> List<LiveContext.ListContent>)? = null,
     private val zone: () -> ZoneId = ZoneId::systemDefault,
+    /** A photo a tool found to answer from, as the server takes it ([ServerPhoto]); null if it can't be read. */
+    private val photo: (String) -> Map<String, String>? = { ServerPhoto.of(it, ServerPhoto.READ_PIXELS) },
 ) {
 
     /** What the call screen shows as cards. */
@@ -119,16 +123,27 @@ class LiveToolBridge(
                 null
             }
         }
-        return reply(callId, outcome.result, outcome.chip, fresh)
+        // A photo the tool found to answer from ("what's my PAN number?"): the server's model reads it.
+        val image = outcome.image?.let { path -> withContext(Dispatchers.IO) { photo(path) } }
+        return reply(callId, outcome.result, outcome.chip, fresh, image)
     }
 
-    private fun reply(callId: String, result: String, chip: MemoryChip?, lists: List<LiveContext.ListContent>? = null): String = gson.toJson(
+    private fun reply(
+        callId: String,
+        result: String,
+        chip: MemoryChip?,
+        lists: List<LiveContext.ListContent>? = null,
+        image: Map<String, String>? = null,
+    ): String = gson.toJson(
         linkedMapOf<String, Any?>(
             "type" to TOOL_RESULT,
             "call_id" to callId,
             "result" to result,
             "chip" to chip?.let { linkedMapOf("title" to it.label, "detail" to chipDetail(it, zone())) },
-        ).apply { if (lists != null) put("lists", lists) },
+        ).apply {
+            if (lists != null) put("lists", lists)
+            if (image != null) put("image", image)
+        },
     )
 
     /**

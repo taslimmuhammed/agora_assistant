@@ -208,7 +208,8 @@ class PhotoTools(
         // SSLC marks as the answer; said as "Your SSLC certificate shows…", the user can tell.
         notes += "The best-matching photo is attached. Say what document or photo it is, then answer \"$question\" from what it " +
             "shows, in a sentence or two, reading any numbers exactly. If it isn't what they asked about, or doesn't show the " +
-            "answer, say so and that the photos shown below may help."
+            "answer, say so and that the photos shown below may help. If no photo came with this, say you couldn't read it: " +
+            "never make up a number."
         return Read(image = file)
     }
 

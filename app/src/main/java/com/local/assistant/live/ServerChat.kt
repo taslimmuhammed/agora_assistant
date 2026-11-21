@@ -1,8 +1,5 @@
 package com.local.assistant.live
 
-import android.graphics.Bitmap
-import android.graphics.BitmapFactory
-import android.util.Base64
 import android.util.Log
 import com.google.gson.Gson
 import com.google.gson.JsonElement
@@ -30,7 +27,6 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
-import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.IOException
 import java.time.ZoneId
@@ -190,7 +186,8 @@ class ServerChat(
             return answer(callId, failure("$name failed on the phone."), null) to null
         }
         val memory = outcome.recordId?.let { id -> outcome.chip?.let { Event.Memory(id, it) } }
-        return answer(callId, withReply(outcome), outcome.chip) to memory
+        // A photo the tool found to answer from ("what's my PAN number?"): the server's model reads it.
+        return answer(callId, withReply(outcome), outcome.chip, outcome.image) to memory
     }
 
     /** The tool's result, with the words it wrote for the reply, when it wrote them, for the model to say. */
@@ -202,10 +199,11 @@ class ServerChat(
         return json.toString()
     }
 
-    private fun answer(callId: String, result: String, chip: MemoryChip?): Map<String, Any?> = linkedMapOf(
+    private suspend fun answer(callId: String, result: String, chip: MemoryChip?, image: String? = null): Map<String, Any?> = linkedMapOf(
         "call_id" to callId,
         "result" to result,
         "chip" to chip?.let { linkedMapOf("title" to it.label, "detail" to LiveToolBridge.chipDetail(it, zone())) },
+        "image" to image?.let { withContext(Dispatchers.IO) { ServerPhoto.of(it, ServerPhoto.READ_PIXELS) } },
     )
 
     private fun postResult(base: String, session: String?, answer: Map<String, Any?>) {
@@ -240,18 +238,7 @@ class ServerChat(
         return listOfNotNull(attached, text.takeIf { it.isNotEmpty() }).joinToString(" ")
     }
 
-    /** [path] as a JPEG no bigger than [PHOTO_PIXELS] a side, base64: the server's limit is 2 MB. */
-    private fun photo(path: String): Map<String, String>? = runCatching {
-        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        BitmapFactory.decodeFile(path, bounds)
-        var sample = 1
-        while (maxOf(bounds.outWidth, bounds.outHeight) / (sample * 2) >= PHOTO_PIXELS) sample *= 2
-        val decoded = BitmapFactory.decodeFile(path, BitmapFactory.Options().apply { inSampleSize = sample }) ?: return null
-        val scale = PHOTO_PIXELS.toFloat() / maxOf(decoded.width, decoded.height)
-        val bitmap = if (scale < 1f) Bitmap.createScaledBitmap(decoded, (decoded.width * scale).toInt(), (decoded.height * scale).toInt(), true) else decoded
-        val bytes = ByteArrayOutputStream().also { bitmap.compress(Bitmap.CompressFormat.JPEG, 85, it) }.toByteArray()
-        mapOf("mime" to "image/jpeg", "data" to Base64.encodeToString(bytes, Base64.NO_WRAP))
-    }.onFailure { Log.w(TAG, "Couldn't read the photo to send", it) }.getOrNull()
+    private fun photo(path: String): Map<String, String>? = ServerPhoto.of(path, PHOTO_PIXELS)
 
     private fun failure(error: String): String = gson.toJson(linkedMapOf("ok" to false, "error" to error))
 

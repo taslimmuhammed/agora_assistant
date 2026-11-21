@@ -1,7 +1,7 @@
 import { timingSafeEqual } from 'node:crypto'
 import type { Request, Response } from 'express'
 import OpenAI from 'openai'
-import type { Bridge } from './bridge.ts'
+import type { Bridge, ToolImage } from './bridge.ts'
 import type { Config } from './config.ts'
 import type { Hub } from './hub.ts'
 import { ModelChoice, SlowModelError, isBusy } from './models.ts'
@@ -126,7 +126,7 @@ export interface LlmDeps {
   webLookup?: WebLookup
 }
 
-interface Message {
+export interface Message {
   role: 'system' | 'user' | 'assistant' | 'tool'
   /** Parts only for a chat message with a photo (chat.ts). */
   content: string | null | Array<Record<string, unknown>>
@@ -234,14 +234,19 @@ export async function runTurn(deps: LlmDeps, session: Session, incoming: Array<R
         firstWordMs ??= Date.now() - started
       }
       messages.push({ role: 'assistant', content: text || null, tool_calls: pending })
+      const shown: Array<{ tool: string; image: ToolImage }> = []
       for (const call of pending) {
         const args = parseArgs(call.function.arguments)
-        const result = web && call.function.name === WEB_LOOKUP
-          ? await lookUp(deps, session, web, args, signal)
+        const { content, image } = web && call.function.name === WEB_LOOKUP
+          ? { content: await lookUp(deps, session, web, args, signal) }
           : await runTool(deps, session, call.function.name, args, deviceNames, turnId, userText)
         ran.push(call.function.name)
-        messages.push({ role: 'tool', tool_call_id: call.id, content: result })
+        messages.push({ role: 'tool', tool_call_id: call.id, content })
+        if (image) shown.push({ tool: call.function.name, image })
       }
+      // A tool's message can't carry a photo, so the photos a tool found to answer from come next,
+      // as hers: without them the model made up "ABCDE1234F" for her PAN number.
+      if (shown.length) messages.push(photosFound(shown))
     }
   } catch (e) {
     if (signal.aborted) return
@@ -252,20 +257,38 @@ export async function runTurn(deps: LlmDeps, session: Session, incoming: Array<R
   }
 }
 
-async function runTool(deps: LlmDeps, session: Session, name: string, args: Record<string, unknown>, deviceNames: Set<string>, turnId: string | undefined, userText: string): Promise<string> {
+/** What a tool gave the model: its result, and a photo to look at when it found one to answer from. */
+interface ToolAnswer { content: string; image?: ToolImage }
+
+async function runTool(deps: LlmDeps, session: Session, name: string, args: Record<string, unknown>, deviceNames: Set<string>, turnId: string | undefined, userText: string): Promise<ToolAnswer> {
   if (isServerTool(name)) {
     const outcome = await runServerTool(name, args, { hub: deps.hub, whatsapp: deps.whatsapp, session, now: deps.clock() })
     if (outcome.action) session.actions.push(outcome.action)
     if (outcome.card) deps.bridge.push(session.id, { type: 'action', tool: name, ok: outcome.result.ok !== false, ...outcome.card })
-    return JSON.stringify(outcome.result)
+    return { content: JSON.stringify(outcome.result) }
   }
   if (deviceNames.has(name)) {
-    const { result, chip, lists } = await deps.bridge.callDevice(session.id, { name, args, turnId, userText })
+    const { result, chip, lists, image } = await deps.bridge.callDevice(session.id, { name, args, turnId, userText })
     if (lists) session.context.lists = lists
     session.actions.push(`${name}: ${chip?.title ? `${chip.title}${chip.detail ? ` (${chip.detail})` : ''}` : shorten(result, 160)}`)
-    return result
+    return image ? { content: result, image } : { content: result }
   }
-  return JSON.stringify({ ok: false, error: `There is no tool called ${name}.` })
+  return { content: JSON.stringify({ ok: false, error: `There is no tool called ${name}.` }) }
+}
+
+/** The photos tools found to answer from, as a message the model can see them in. */
+export function photosFound(shown: Array<{ tool: string; image: ToolImage }>): Message {
+  return {
+    role: 'user',
+    content: [
+      {
+        type: 'text',
+        text: `[The photo${shown.length > 1 ? 's' : ''} ${[...new Set(shown.map(s => s.tool))].join(' and ')} found, from her own phone, to answer from. ` +
+          'Read any numbers or names on it exactly, character by character; if it is unclear or not what she asked about, say so. Never make up a number.]',
+      },
+      ...shown.map(({ image }) => ({ type: 'image_url', image_url: { url: `data:${image.mime};base64,${image.data}` } })),
+    ],
+  }
 }
 
 /** The server's own web_lookup: the answer for the model, and a card for the phone. */

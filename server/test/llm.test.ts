@@ -137,6 +137,33 @@ test('a list changed in the call is in the next turn as it is now', async () => 
   assert.match(system, /Shopping list: Bread, Milk/)
 })
 
+test("a photo the phone's tool found is shown to the model, after the tool's result", async () => {
+  const card = { mime: 'image/jpeg', data: 'UEFOIGNhcmQ=' }
+  const phone = new FakePhone(() => ({ ok: true, found: 1 }), call => (call.name === 'find_photos' ? { image: card } : {}))
+  const t = setup([[toolCall('find_photos', { query: 'PAN card', question: 'What is my PAN number?' })], [text('Your PAN card shows BQXPM4821K.')]], phone)
+  t.session.context.device_tools = [{ name: 'find_photos', description: 'Photos', parameters: { type: 'object', properties: {} } }]
+
+  await runTurn(t.deps, t.session, [{ role: 'user', content: 'What is my PAN number?' }], t.out, new AbortController().signal)
+
+  const sent = t.chat.requests[1].messages as Array<{ role: string; content: unknown }>
+  assert.deepEqual(sent.slice(-3).map(m => m.role), ['assistant', 'tool', 'user'])
+  const parts = sent.at(-1)!.content as Array<{ type: string; text?: string; image_url?: { url: string } }>
+  assert.match(parts[0].text!, /find_photos found/)
+  assert.match(parts[0].text!, /Never make up a number/)
+  assert.equal(parts[1].image_url!.url, 'data:image/jpeg;base64,UEFOIGNhcmQ=')
+})
+
+test('a tool result without a photo, or with something else under image, adds no message', async () => {
+  const phone = new FakePhone(() => ({ ok: true }), () => ({ image: { mime: 'text/plain', data: 'x' } }))
+  const t = setup([[toolCall('find_photos', { query: 'beach' })], [text('Here they are.')]], phone)
+  t.session.context.device_tools = [{ name: 'find_photos', description: 'Photos', parameters: { type: 'object', properties: {} } }]
+
+  await runTurn(t.deps, t.session, [{ role: 'user', content: 'Beach photos' }], t.out, new AbortController().signal)
+
+  const sent = t.chat.requests[1].messages as Array<{ role: string }>
+  assert.equal(sent.at(-1)!.role, 'tool')
+})
+
 test("without the phone's own web_lookup, the server looks it up with Google and shows a card", async () => {
   const t = setup([[toolCall('web_lookup', { query: 'weather in Kochi today' })], [text('It will rain this evening, says the IMD.')]])
   const asked: string[] = []

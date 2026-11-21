@@ -15,7 +15,12 @@ export interface DeviceResult {
   chip: { title?: string; detail?: string } | null
   /** Her lists as they are now, when the tool changed one: the call's prompt takes them. */
   lists?: ListContent[]
+  /** A photo the tool found to answer from ("what's my PAN number?"): the model is shown it (llm.ts). */
+  image?: ToolImage
 }
+
+/** A photo as the phone sends it: a base64 JPEG. */
+export interface ToolImage { mime: string; data: string }
 
 /**
  * The phone's end of a call (WebSocket /bridge?session=…), open while the call is. Tools that act
@@ -79,7 +84,7 @@ export class Bridge {
   }
 
   private received(text: string) {
-    let message: { type?: string; call_id?: string; result?: unknown; chip?: DeviceResult['chip']; lists?: unknown }
+    let message: { type?: string; call_id?: string; result?: unknown; chip?: DeviceResult['chip']; lists?: unknown; image?: unknown }
     try {
       message = JSON.parse(text)
     } catch {
@@ -87,7 +92,12 @@ export class Bridge {
     }
     if (message.type !== 'tool_result' || !message.call_id) return
     const result = typeof message.result === 'string' ? message.result : JSON.stringify(message.result ?? { ok: false, error: 'no result' })
-    this.settle(message.call_id, { result, chip: message.chip ?? null, ...(isLists(message.lists) ? { lists: message.lists } : {}) })
+    this.settle(message.call_id, {
+      result,
+      chip: message.chip ?? null,
+      ...(isLists(message.lists) ? { lists: message.lists } : {}),
+      ...(isImage(message.image) ? { image: message.image } : {}),
+    })
   }
 
   private settle(callId: string, result: DeviceResult) {
@@ -101,6 +111,11 @@ export class Bridge {
 
 function isLists(value: unknown): value is ListContent[] {
   return Array.isArray(value) && value.every(l => typeof l?.title === 'string' && Array.isArray(l?.items))
+}
+
+function isImage(value: unknown): value is ToolImage {
+  const image = value as Partial<ToolImage> | null | undefined
+  return typeof image?.mime === 'string' && image.mime.startsWith('image/') && typeof image.data === 'string' && image.data.length > 0
 }
 
 function failed(error: string): DeviceResult {

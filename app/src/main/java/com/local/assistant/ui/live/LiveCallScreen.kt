@@ -70,6 +70,8 @@ import com.local.assistant.ui.memory.MemoryViewModel
 import com.local.assistant.ui.memory.ReminderEditor
 import com.local.assistant.ui.notes.NotesScreen
 import com.local.assistant.ui.notes.NotesViewModel
+import com.local.assistant.ui.privacy.HiddenDetails
+import com.local.assistant.ui.privacy.rememberShown
 import com.local.assistant.ui.theme.LunaOrb
 import com.local.assistant.ui.theme.LunaOrbMode
 import com.local.assistant.wake.WakeWord
@@ -349,21 +351,26 @@ private fun Captions(captions: List<LiveSession.Caption>, modifier: Modifier) {
     LazyColumn(modifier, state = list, reverseLayout = true, verticalArrangement = Arrangement.spacedBy(14.dp, Alignment.Bottom)) {
         itemsIndexed(shown) { index, caption ->
             val latest = index == 0
-            Text(
-                caption.text,
-                modifier = Modifier.fillMaxWidth(),
-                style = if (caption.fromUser) {
-                    TextStyle(fontSize = 21.sp, lineHeight = 28.sp)
-                } else {
-                    TextStyle(fontSize = if (latest) 28.sp else 23.sp, lineHeight = if (latest) 36.sp else 30.sp, fontWeight = FontWeight.Medium)
-                },
-                color = when {
-                    caption.fromUser -> Dim
-                    caption.final || latest -> Bright
-                    else -> Bright.copy(alpha = 0.8f)
-                },
-                textAlign = if (caption.fromUser) TextAlign.End else TextAlign.Start,
-            )
+            // ID and card numbers hidden as in the chat, "•••• 234F" until her fingerprint shows them.
+            val words = rememberShown(caption.text, streaming = !caption.final)
+            Column(Modifier.fillMaxWidth(), horizontalAlignment = if (caption.fromUser) Alignment.End else Alignment.Start) {
+                Text(
+                    words.text,
+                    modifier = Modifier.fillMaxWidth(),
+                    style = if (caption.fromUser) {
+                        TextStyle(fontSize = 21.sp, lineHeight = 28.sp)
+                    } else {
+                        TextStyle(fontSize = if (latest) 28.sp else 23.sp, lineHeight = if (latest) 36.sp else 30.sp, fontWeight = FontWeight.Medium)
+                    },
+                    color = when {
+                        caption.fromUser -> Dim
+                        caption.final || latest -> Bright
+                        else -> Bright.copy(alpha = 0.8f)
+                    },
+                    textAlign = if (caption.fromUser) TextAlign.End else TextAlign.Start,
+                )
+                if (words.hidden) HiddenDetails(Modifier.padding(top = 4.dp))
+            }
         }
     }
 }

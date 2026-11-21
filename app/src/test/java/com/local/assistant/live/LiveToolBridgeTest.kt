@@ -38,6 +38,7 @@ class LiveToolBridgeTest {
     private fun bridge(
         locked: Boolean = false,
         lists: (suspend () -> List<LiveContext.ListContent>)? = null,
+        photo: (String) -> Map<String, String>? = { null },
         execute: suspend (ToolCall, ToolContext) -> ToolExecutor.Outcome = executor::execute,
     ) =
         LiveToolBridge(
@@ -49,6 +50,7 @@ class LiveToolBridgeTest {
             locked = locked,
             lists = lists,
             zone = { zone },
+            photo = photo,
         )
 
     private fun toolCall(name: String, args: String, turnId: String? = "12", userText: String = "") =
@@ -175,5 +177,28 @@ class LiveToolBridgeTest {
 
         assertEquals("Milk", edited["lists"].asJsonArray[0].asJsonObject["items"].asJsonArray[0].asJsonObject["text"].asString)
         assertNull(other["lists"])
+    }
+
+    @Test
+    fun `a photo a tool found to answer from goes to the server with its result`() = runBlocking {
+        val found = ToolExecutor.Outcome("""{"ok":true,"found":1}""", ok = true, recordId = null, chip = null, changedPrefix = false, image = "/photos/pan.jpg")
+        val sent = mutableListOf<String>()
+        val bridge = bridge(photo = { path -> sent += path; mapOf("mime" to "image/jpeg", "data" to "UEFO") }) { _, _ -> found }
+
+        val reply = json(bridge.handle(toolCall(ToolCatalog.FIND_PHOTOS, """{"query":"PAN card","question":"what is my PAN number?"}""")))
+
+        assertEquals(listOf("/photos/pan.jpg"), sent)
+        assertEquals("image/jpeg", reply["image"].asJsonObject["mime"].asString)
+        assertEquals("UEFO", reply["image"].asJsonObject["data"].asString)
+    }
+
+    @Test
+    fun `a result with no photo sends none`() = runBlocking {
+        val done = ToolExecutor.Outcome("""{"ok":true}""", ok = true, recordId = null, chip = null, changedPrefix = false)
+        val bridge = bridge(photo = { error("no photo to read") }) { _, _ -> done }
+
+        val reply = json(bridge.handle(toolCall(ToolCatalog.SET_TIMER, """{"minutes":5}""")))
+
+        assertNull(reply["image"])
     }
 }
