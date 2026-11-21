@@ -1508,7 +1508,8 @@ Call button and the Settings demo buttons that need the server stay hidden or gr
   then the tool bridge, then `POST /session/start`. The three libraries share
   `io.agora.infra:aosl`, so the APK has one `libaosl.so` and no `pickFirsts` are needed.
 - **What the call knows** (`LiveContext`, sent once in `/session/start`): the memory prefix
-  (`MemoryContext`: core facts, the last summary, the agenda, the notes index), pinned lists in full, today's steps and last night's sleep when
+  (`MemoryContext`: core facts, the last summary, the agenda, the notes index), her lists in full
+  ([Lists in a call](#lists-in-a-call)), today's steps and last night's sleep when
   already allowed (`HealthTools.briefing`, which never asks), the phone's time with its offset,
   and the phone's tool declarations and rules from `ToolCatalog`, without `remember_image` and
   `take_screenshot`. On the lock screen it is only `ToolCatalog.LOCKED`'s tools and nothing about
@@ -1539,6 +1540,167 @@ Call button and the Settings demo buttons that need the server stay hidden or gr
 The tests (`app/src/test/.../live/`) cover the bridge against the real `ToolExecutor`, the context
 and the transcript log; the call itself needs Agora and the server, so it is checked on a phone.
 
+### A call does what the chat does
+
+Since November 2026 a call is meant to be the main way to use Luna, so it does everything the
+chat does: lists, WhatsApp, photos, reminders, web look-ups, and the same cards under the words.
+
+#### Lists in a call
+
+- **Every list, not only pinned ones.** `LiveContext.lists(notes)` sends all of her lists at
+  `/session/start`, pinned first, then in the notes' own order, up to `MAX_LISTS` (12) lists of
+  `MAX_ITEMS` (60) items each, with each item's ticked state. "What's on my shopping list?" is
+  answered straight from the prompt, with no tool call. Notes that aren't lists are still read
+  only when asked about. On the lock screen no lists are sent.
+- **Kept up to date during the call.** After `edit_note`, `LiveToolBridge` reads the lists again
+  (`LiveContextBuilder.lists()`, passed in as `lists`, null when locked) and adds them to the
+  `tool_result` as `"lists"`. The server's bridge (`bridge.ts`, `isLists`) checks the shape and
+  `llm.ts` replaces `session.context.lists`, so the next turn's prompt has the list as it is now.
+  `prompt.ts` titles them "Her lists, as they are now (answer from these; edit_note changes
+  them)".
+
+#### Cards on the call screen
+
+`LiveCallScreen` shows the same cards as the chat, under the captions and above the buttons, in a
+scrolling area up to `CARDS_MAX` (300 dp) tall:
+
+- **The phone's tool cards** come from the call's chat: `LiveCallViewModel.chips` watches the
+  chat's messages and turns its TOOL rows into cards with `chipsByMessage`, the chat's own
+  function. Undo and Edit work, and an undone card reads as undone.
+- **Maps, lists and editors.** `CallCards` passes the call screen what the chat's `MemoryChips`
+  needs: place reminders by id (from `MemoryViewModel`) for the map preview and its editor, and
+  notes by id (from `NotesViewModel`) for the list preview, ticking items, and **Open**. Open shows
+  `NotesScreen` over the call, and Back returns to the call, which carries on behind it.
+  `ReminderEditor` and the delete confirmation open over the call too. When the call is locked,
+  both view models are left out, so the lock screen shows no maps, lists or editors.
+- **Photos.** `find_photos` cards are drawn by `PhotoResults`: a few photos inline, or a stack with
+  **View all** and Share for more. `PhotoResults` draws nothing without `LocalPhotoAccess`, which
+  each activity provides at its root. `LiveCallActivity` now provides it, along with
+  `LocalSensitive` for hidden documents. That is why it became a `FragmentActivity`:
+  `SensitiveAccess` needs one for the fingerprint prompt. As on the power-button panel, the photos
+  stay hidden while the phone is locked (`isKeyguardLocked`), and tapping them asks to unlock
+  (`requestDismissKeyguard`).
+- **The server's cards** (`ServerCard`): its own `action`s ("WhatsApp to Ravi", "Looked up: …")
+  and the family's `hub_update`s.
+
+#### WhatsApp to anyone
+
+With live voice on, `send_message` on WhatsApp goes from Luna's own WhatsApp number at once, to
+anyone, and the answer comes back to her, in the call or when she next opens the app. Before, it
+went only to people in the family hub. SMS, email and screenshots still open the phone's app.
+
+- **Phone.** With `luna = true`, `ToolCatalog` swaps in `LUNA_SEND_MESSAGE_DECLARATION` (WhatsApp is
+  the default, `text` is required) and `LUNA_HANDOFF_RULE` (say "sent" only when the result says
+  so). `DeviceTools.sendByLuna` first tries by name (`FamilyMessenger.send(to, text, null)`). If
+  the answer is `LunaSent.Unknown`, it finds the person's number in memory or her contacts
+  (`find(to, Need.PHONE)`) and sends again with that `Contact`. `LunaSent.Refused` (for example,
+  not on WhatsApp) becomes the tool's error. `LunaSent.Off` (no server, or WhatsApp signed out)
+  falls back to opening the phone's WhatsApp. `AssistantApplication.sendThroughLuna` calls
+  `LiveApi.whatsapp`, and `LiveError.code` carries the server's HTTP status.
+- **Server.** `POST /family/whatsapp` (`app.ts`) runs `whatsappSomeone` (`tools.ts`). It finds
+  someone in the hub by name, or by the number the phone sent. A new number is checked with
+  `hasWhatsApp` and added to the hub with the role **`contact`**. `whatsapp.ts` listens only to
+  the hub's people, so adding them is what lets their answer through. The message is signed "💬
+  *Name*, through Luna", and a contact is also told to "Reply here and Luna will tell …". The
+  server answers 404 `{unknown: true}` for no such person and no number, 400 with the reason it
+  refused, and 503 when WhatsApp isn't signed in. Contacts are left out of `/family`'s members
+  and the family list in the prompt. They get their own prompt section, "Others she has
+  WhatsApped through Luna".
+
+#### Looking things up on the web
+
+`server/src/websearch.ts` gives calls and chats a `web_lookup` tool backed by Gemini with Google
+Search (`generateContent` with `tools: [{google_search: {}}]`, temperature 0.2). It is offered only
+when the phone doesn't send a `web_lookup` of its own (a Tavily key in the phone's settings).
+
+- The answer is two or three plain sentences, plus up to three sources by title. `llm.ts`
+  (`lookUp`) pushes a "Looked up: …" card to the phone and returns `{ok, answer, sites}` to the
+  model.
+- It has its own `ModelChoice`, so a refused search doesn't send the call's replies to the
+  fallback models. The first model gets 7 s and the last 12 s.
+- After a 429 on every model, `ready()` is false for 15 minutes (`OFF_MS`) and a warning is
+  logged. Google Search needs billing on the Gemini key; without it every search is refused.
+  Otherwise, put a Tavily key on the phone.
+
+#### Turns the server handles more carefully (`llm.ts`)
+
+- **Empty turns.** Agora's recogniser sometimes files a noise as her turn with no words (`""`).
+  Answering it would repeat Luna's last answer. Worse, Gemini refuses a history that ends with a
+  model turn (a 400 error). Such a turn is now logged ("her turn had no words; Luna stays quiet")
+  and nothing is said.
+- **Her words last.** Typing into a call interrupts Luna, and Agora files what Luna had said by
+  then after the typed line. `herWordsLast` moves those words before her last message, as
+  Gemini requires.
+- **Words after a tool.** A model sometimes ends a round after a tool with no words, so she'd hear
+  only "Okay.". The server then asks once more with `tool_choice: 'none'` (`wordsOnly`).
+- **Stalls.** A stream that has started but sends nothing for 15 s (`STALL_MS`, `within()`)
+  fails as a slow model, so the fallback answers instead of the call sitting on "Thinking…".
+- Each request is logged as `[turn] <session> asked: N messages, last <role>`.
+
+#### Ringing while it connects
+
+`live/Ringback.kt` plays a ring while the call shows "Connecting…": the Indian and British double
+ring, 400 + 450 Hz, 0.4 s on, 0.2 s off, 0.4 s on, 2 s off.
+
+- It is made in code, not shipped as a file. One cycle (`cycle()`) is written into an
+  `AudioTrack` in `MODE_STATIC` at 22,050 Hz mono, 16-bit, and looped with `setLoopPoints`.
+  Each burst fades in and out over 10 ms so it doesn't click.
+- It plays at volume 0.5 with `USAGE_MEDIA` / `CONTENT_TYPE_SONIFICATION`.
+- `LiveSession.start()` starts it, except for check-in calls (`PURPOSE_CHECKIN`), which the phone
+  has already rung. It stops when the state first leaves `CONNECTING` (Luna answers, or the call
+  fails), and again at the start of `release()`.
+- On the phone, `dumpsys audio` shows the track as `state:started` with `sampleRate=22050` while
+  connecting, and gone once she answers.
+
+#### The call service on a call that ends at once
+
+A call that failed straight away used to crash the app. Android kills an app whose foreground
+service is stopped before it called `startForeground` ("did not then call startForeground").
+`LiveCallService` now tracks `starting`. A stop that arrives in that window sets
+`stopWhenStarted`, and the service stops itself once it is in the foreground.
+
+#### Captions
+
+The captions list (`Captions`) is a `LazyColumn` with `reverseLayout = true`, holding the
+captions newest first and scrolled to item 0 on every change. The reply growing as she speaks
+stays pinned above the cards with its latest line in view. Before this, scrolling to the last
+item left the end of a long streaming reply below the fold. The newest of Luna's lines is 28 sp,
+older ones 23 sp, and her own words 21 sp, dimmed and right-aligned.
+
+#### Calling Luna from the chat screen
+
+The app opens on the chat, as it did before; a separate home screen was tried and taken out.
+Calling is the main action there:
+
+- **`CallPill`** in the chat's top bar: a filled "Call Luna" button with a phone icon.
+- **The starter panel** (`Starters.kt`, `StarterPanel(onCall = …)`) opens with a **Call Luna**
+  card ("LIVE VOICE", the `LunaOrb` with a phone icon, "Just talk. She'll WhatsApp anyone for you,
+  keep your lists and reminders, and tell you the moment they reply.").
+- With live voice available (`Needs.CALLS`), the first `CALL_TILES` (2) tiles after the greeting
+  are things to say to Luna (`Kind.CALL`), such as "Ask 'What's on my shopping list?'". Tapping
+  one starts a call. Without live voice there are no call ideas.
+- `ui/theme/LunaOrb.kt` (`LunaOrb`, `LunaOrbMode`) is the one orb shared by the power-button
+  panel, the call screen and the Call Luna card. It has ripples while listening, a spinning light
+  while busy, and gentle breathing when idle.
+- `StartersTest` covers call tiles coming first with calls on, and no call ideas with them off.
+
+#### Checking it on a phone
+
+- The debug app's package is **`com.taslim.luna.dev`**. Its database is
+  `databases/assistant.db`, read with `adb exec-out "run-as com.taslim.luna.dev tar cf -
+  databases/assistant.db databases/assistant.db-wal"`. Copy the `-wal` too, since the newest
+  rows are there. A call's chat is titled "Call with Luna, h:mm AM", and its tool records are
+  the `TOOL` rows.
+- The server logs each call's turns in its terminal, and the tools a turn used
+  (`[turn] … tools: find_photos`).
+- Agora's recogniser (ARES) sometimes reports "speech recognition service failed", and that call
+  then hears nothing more. This is on Agora's side: end the call and call again.
+
+Tests: `LiveContextTest` (all lists, pinned first, limits), `LiveToolBridgeTest` (lists after
+`edit_note`), `ToolRoutingTest` (the WhatsApp declaration and rule with `luna`), `StartersTest`,
+and on the server `llm.test.ts` (reordering, list refresh, web lookup, the quiet empty turn,
+words after a tool) and `family.test.ts` / `family-numbers.test.ts` (contacts).
+
 ## Startup
 
 The chat opens straight away: there is no model to load. While a reply is worked on, the line
@@ -1557,6 +1719,11 @@ did stays as its chip.
 | What the server is told of the user, and its limits | `memory/prompt/MemoryContext.kt`, `PromptAssembler.kt`, `MemoryBudget.kt`; `live/LiveContext.kt` |
 | How replies sound | `voice/MurfVoice.kt`, `voice/Speaker.kt`; `server/src/briefing.ts` (`murfSpeech`) |
 | A new tool | `memory/tools/ToolCatalog.kt` (declaration + routing rule) and `ToolExecutor` |
+| What a call shows under the captions | `ui/live/LiveCallScreen.kt` (`Call`, `CallCards`), `ui/live/LiveCallViewModel.kt` (`chips`); the cards themselves are `ui/chat/MemoryChips.kt` |
+| The ring while a call connects | `live/Ringback.kt` (tones and timing), `LiveSession.start` (when it plays) |
+| Who Luna's WhatsApp can reach | `server/src/tools.ts` (`whatsappSomeone`), `server/src/whatsapp.ts`; on the phone `DeviceTools.sendByLuna` |
+| The server's web look-up | `server/src/websearch.ts` |
+| Call ideas on the chat screen | `ui/chat/Starters.kt` (`Kind.CALL`, `CALL_TILES`, `StarterPanel`) |
 | Time words the resolver misses | `memory/tools/WhenResolver.kt`, with a row in `WhenResolverTest` |
 | Photo search: model, cutoff, when it indexes | `gallery/GalleryModel.kt`, `gallery/PhotoRanking.kt`, `gallery/GalleryIndex.kt`; `GalleryEvalTest` on the phone |
 | Memory search's thresholds, or another embedding model | `memory/embed/PhotoModelEmbedder.kt` (thresholds), `EmbedderCatalog.kt` (imported ones); `TextEmbedderEvalTest`, then `EmbedderProbeTest` on the phone |
